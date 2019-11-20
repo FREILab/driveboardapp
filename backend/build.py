@@ -21,12 +21,12 @@ if sys.platform == "darwin":  # OSX
     AVRDUDECONFIG = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/etc/avrdude.conf"
 
 elif sys.platform == "win32": # Windows
-    AVRDUDEAPP    = "C:\\arduino\\hardware\\tools\\avr\\bin\\avrdude"
-    AVRGCCAPP     = "C:\\arduino\\hardware\\tools\\avr\\bin\\avr-gcc"
-    AVROBJCOPYAPP = "C:\\arduino\\hardware\\tools\\avr\\bin\\avr-objcopy"
-    AVRSIZEAPP    = "C:\\arduino\\hardware\\tools\\avr\\bin\\avr-size"
-    AVROBJDUMPAPP = "C:\\arduino\\hardware\\tools\\avr\\bin\\avr-objdump"
-    AVRDUDECONFIG = "C:\\arduino\\hardware\\tools\\avr\\etc\\avrdude.conf"
+    AVRDUDEAPP    = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avrdude"
+    AVRGCCAPP     = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avr-gcc"
+    AVROBJCOPYAPP = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avr-objcopy"
+    AVRSIZEAPP    = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avr-size"
+    AVROBJDUMPAPP = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avr-objdump"
+    AVRDUDECONFIG = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\etc\\avrdude.conf"
 
 elif sys.platform == "linux" or sys.platform == "linux2":  #Linux
     AVRDUDEAPP    = "avrdude"
@@ -62,7 +62,7 @@ def build_all():
         shutil.copy(config_file, 'config.h')
         try:
             firmware_name = "firmware.%s" % (hardware_designator)
-            print "INFO: building for %s" % (config_file)
+            print("INFO: building for %s" % (config_file))
             # buid
             r = build_firmware(firmware_name)
             if r != 0:
@@ -110,7 +110,7 @@ def build_firmware(firmware_name="DriveboardFirmware"):
     ret += subprocess.call(command, shell=True)
 
     # command = '%(size)s *.hex *.elf *.o' % {'size':AVRSIZEAPP}
-    command = '%(size)s --mcu=%(mcu)s --format=avr *.elf' % {'size':AVRSIZEAPP, 'mcu':DEVICE}
+    command = '%(size)s --mcu=%(mcu)s --format=avr main.elf' % {'size':AVRSIZEAPP, 'mcu':DEVICE}
     ret += subprocess.call(command, shell=True)
 
     # command = '%(objdump)s -t -j .bss main.elf' % {'objdump':AVROBJDUMPAPP}
@@ -121,7 +121,7 @@ def build_firmware(firmware_name="DriveboardFirmware"):
 
     try:
         ## clean after upload
-        print "Cleaning up build files."
+        print("Cleaning up build files.")
         for fileobj in OBJECTS:
             f = '%s.o' % (fileobj)
             if os.path.isfile(f):
@@ -130,11 +130,11 @@ def build_firmware(firmware_name="DriveboardFirmware"):
             os.remove('main.elf')
 
         ## move firmware hex file
-        print "Moving firmware to standard location."
+        print("Moving firmware to standard location.")
         firmware_src = firmware_name+'.hex'
         firmware_dst = os.path.join(firmware_dir, firmware_src)
         shutil.move(firmware_src, firmware_dst)
-        print firmware_dst
+        print(firmware_dst)
     finally:
         #restore previous cwd
         os.chdir(cwd_temp)

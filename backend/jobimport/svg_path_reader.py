@@ -310,7 +310,13 @@ class SVGPathReader:
             # protect from deep recursion cases
             # max 2**18 = 262144 segments
             return
-        
+        elif level == 0:
+            if (x1 == x2 and y1 == y2 and x2 == x3 and y2 == y3) or \
+               (x2 == x3 and y2 == y3 and x3 == x4 and y3 == y4):
+                # the tolerance would never reached, but it's a straight line
+                #subpath.append([x1, y1]) # probably not needed
+                subpath.append([x4, y4])
+                return        
         # Calculate all the mid-points of the line segments
         x12   = (x1 + x2) / 2.0
         y12   = (y1 + y2) / 2.0
@@ -377,6 +383,7 @@ class SVGPathReader:
         # plus some recursive sugar for incrementally refining the
         # arc resolution until the requested tolerance is met.
         # http://www.w3.org/TR/SVG/implnote.html#ArcImplementationNotes
+        phi = phi / 360.0 * 2*math.pi
         cp = math.cos(phi)
         sp = math.sin(phi)
         dx = 0.5 * (x1 - x2)

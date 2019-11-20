@@ -10,17 +10,16 @@ import threading
 import itertools
 import serial
 import serial.tools.list_ports
+import datetime
 from config import conf, write_config_fields
 
 if not conf['mill_mode']:
     try:
         from PIL import Image
     except ImportError:
-        print "Pillow module missing, raster mode will fail."
-
+        print("Pillow module missing, raster mode will fail.")
 
 __author__  = 'Stefan Hechenberger <stefan@nortd.com>'
-
 
 
 ################ SENDING PROTOCOL
@@ -113,7 +112,6 @@ INFO_PIXEL_WIDTH = 'j'
 ################
 
 
-
 # reverse lookup for commands, for debugging
 # NOTE: have to be in sync with above definitions
 markers_tx = {
@@ -158,6 +156,15 @@ markers_tx = {
 }
 
 markers_rx = {
+    chr(1): "CMD_STOP",
+    chr(2): "CMD_RESUME",
+    chr(3): "CMD_STATUS",
+    chr(4): "CMD_SUPERSTATUS",
+    chr(5): "CMD_CHUNK_PROCESSED",
+    chr(16): "CMD_RASTER_DATA_START",
+    chr(17): "CMD_RASTER_DATA_END",
+    chr(6): "STATUS_END",
+
     # status: error flags
     '!': "ERROR_SERIAL_STOP_REQUEST",
     '"': "ERROR_RX_BUFFER_OVERFLOW",
@@ -202,16 +209,16 @@ markers_rx = {
     'j': "INFO_PIXEL_WIDTH",
 }
 
-
-
-
 SerialLoop = None
 fallback_msg_thread = None
+
 
 class SerialLoopClass(threading.Thread):
 
     def __init__(self):
         threading.Thread.__init__(self)
+        
+        self.verbose = False
 
         self.device = None
         self.tx_buffer = []
@@ -238,7 +245,7 @@ class SerialLoopClass(threading.Thread):
         self.request_status = 2       # 0: no request, 1: normal request, 2: super request
 
         self.pdata_count = 0
-        self.pdata_chars = [None, None, None, None]
+        self.pdata_nums = [128, 128, 128, 192]
 
         threading.Thread.__init__(self)
         self.stop_processing = False
@@ -248,7 +255,6 @@ class SerialLoopClass(threading.Thread):
         # lock mechanism for chared data
         # see: http://effbot.org/zone/thread-synchronization.htm
         self.lock = threading.Lock()
-
 
 
     def reset_status(self):
@@ -285,7 +291,7 @@ class SerialLoopClass(threading.Thread):
 
 
     def send_command(self, command):
-        self.tx_buffer.append(command)
+        self.tx_buffer.append(ord(command))
         self.job_size += 1
 
 
@@ -293,28 +299,28 @@ class SerialLoopClass(threading.Thread):
         # num to be [-134217.728, 134217.727], [-2**27, 2**27-1]
         # three decimals are retained
         num = int(round(((val+134217.728)*1000)))
-        char0 = chr((num&127)+128)
-        char1 = chr(((num&(127<<7))>>7)+128)
-        char2 = chr(((num&(127<<14))>>14)+128)
-        char3 = chr(((num&(127<<21))>>21)+128)
+        char0 = (num&127)+128
+        char1 = ((num&(127<<7))>>7)+128
+        char2 = ((num&(127<<14))>>14)+128
+        char3 = ((num&(127<<21))>>21)+128
         self.tx_buffer.append(char0)
         self.tx_buffer.append(char1)
         self.tx_buffer.append(char2)
         self.tx_buffer.append(char3)
-        self.tx_buffer.append(param)
+        self.tx_buffer.append(ord(param))
         self.job_size += 5
 
 
     def send_data(self, data, start, end):
         count = 2
         with self.lock:
-            self.tx_buffer.append(CMD_RASTER_DATA_START)
+            self.tx_buffer.append(ord(CMD_RASTER_DATA_START))
         for val in itertools.islice(data, start, end):
             with self.lock:
-                self.tx_buffer.append(chr(int(0.5*(255-val))+128))
+                self.tx_buffer.append(int(0.5*(255-val))+128)
             count += 1
         with self.lock:
-            self.tx_buffer.append(CMD_RASTER_DATA_END)
+            self.tx_buffer.append(ord(CMD_RASTER_DATA_END))
             self.job_size += count
 
 
@@ -337,17 +343,17 @@ class SerialLoopClass(threading.Thread):
                         #     sys.stdout.write('~')
                         # last_write = time.time()
                     except OSError:
-                        print "ERROR: serial got disconnected 1."
+                        print("ERROR: serial got disconnected 1.")
                         self.stop_processing = True
                         self._status['serial'] = False
                         self._status['ready'] = False
                     except ValueError:
-                        print "ERROR: serial got disconnected 2."
+                        print("ERROR: serial got disconnected 2.")
                         self.stop_processing = True
                         self._status['serial'] = False
                         self._status['ready']  = False
                 else:
-                    print "ERROR: serial got disconnected 3."
+                    print("ERROR: serial got disconnected 3.")
                     self.stop_processing = True
                     self._status['serial'] = False
                     self._status['ready']  = False
@@ -363,16 +369,19 @@ class SerialLoopClass(threading.Thread):
             time.sleep(0.004)
 
 
-
     def _serial_read(self):
-        for char in self.device.read(self.RX_CHUNK_SIZE):
-            # sys.stdout.write('('+char+','+str(ord(char))+')')
-            if ord(char) < 32:  ### flow
-                if char == CMD_CHUNK_PROCESSED:
+        chunk = self.device.read(self.RX_CHUNK_SIZE)
+        if self.verbose and chunk != b'':
+            timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
+            print(timestamp + ' Receiving: ' + prettify_serial(chunk, markers=markers_rx))
+        for data_num in chunk:
+            data_char = chr(data_num)
+            if data_num < 32:  ### flow
+                if data_char == CMD_CHUNK_PROCESSED:
                     self.firmbuf_used -= self.TX_CHUNK_SIZE
                     if self.firmbuf_used < 0:
-                        print "ERROR: firmware buffer tracking to low"
-                elif char == STATUS_END:
+                        print("ERROR: firmware buffer tracking to low")
+                elif data_char == STATUS_END:
                     # status frame complete, compile status
                     self._status, self._s = self._s, self._status  # flip
                     self._status['paused'] = self._paused
@@ -387,68 +396,69 @@ class SerialLoopClass(threading.Thread):
                     self._s['ready'] = False
                     self._s['underruns'] = self._status['underruns']
                     self._s['stackclear'] = self._status['stackclear']
-            elif 31 < ord(char) < 65:  ### stop error markers
+            elif 31 < data_num < 65:  ### stop error markers
                 # chr is in [!-@], process flag
-                if char == ERROR_LIMIT_HIT_X1:
+                if data_char == ERROR_LIMIT_HIT_X1:
                     self._s['stops']['x1'] = True
                     # print "ERROR firmware: limit hit x1"
-                elif char == ERROR_LIMIT_HIT_X2:
+                elif data_char == ERROR_LIMIT_HIT_X2:
                     self._s['stops']['x2'] = True
                     # print "ERROR firmware: limit hit x2"
-                elif char == ERROR_LIMIT_HIT_Y1:
+                elif data_char == ERROR_LIMIT_HIT_Y1:
                     self._s['stops']['y1'] = True
                     # print "ERROR firmware: limit hit y1"
-                elif char == ERROR_LIMIT_HIT_Y2:
+                elif data_char == ERROR_LIMIT_HIT_Y2:
                     self._s['stops']['y2'] = True
                     # print "ERROR firmware: limit hit y2"
-                elif char == ERROR_LIMIT_HIT_Z1:
+                elif data_char == ERROR_LIMIT_HIT_Z1:
                     self._s['stops']['z1'] = True
                     # print "ERROR firmware: limit hit z1"
-                elif char == ERROR_LIMIT_HIT_Z2:
+                elif data_char == ERROR_LIMIT_HIT_Z2:
                     self._s['stops']['z2'] = True
                     # print "ERROR firmware: limit hit z2"
-                elif char == ERROR_SERIAL_STOP_REQUEST:
+                elif data_char == ERROR_SERIAL_STOP_REQUEST:
                     self._s['stops']['requested'] = True
                     # print "ERROR firmware: stop request"
-                    print "INFO firmware: stop request"
-                elif char == ERROR_RX_BUFFER_OVERFLOW:
+                    print("INFO firmware: stop request")
+                elif data_char == ERROR_RX_BUFFER_OVERFLOW:
                     self._s['stops']['buffer'] = True
-                    print "ERROR firmware: rx buffer overflow"
-                elif char == ERROR_INVALID_MARKER:
+                    print("ERROR firmware: rx buffer overflow")
+                elif data_char == ERROR_INVALID_MARKER:
                     self._s['stops']['marker'] = True
-                    print "ERROR firmware: invalid marker"
-                elif char == ERROR_INVALID_DATA:
+                    print("ERROR firmware: invalid marker")
+                elif data_char == ERROR_INVALID_DATA:
                     self._s['stops']['data'] = True
-                    print "ERROR firmware: invalid data"
-                elif char == ERROR_INVALID_COMMAND:
+                    print("ERROR firmware: invalid data")
+                elif data_char == ERROR_INVALID_COMMAND:
                     self._s['stops']['command'] = True
-                    print "ERROR firmware: invalid command"
-                elif char == ERROR_INVALID_PARAMETER:
+                    print("ERROR firmware: invalid command")
+                elif data_char == ERROR_INVALID_PARAMETER:
                     self._s['stops']['parameter'] = True
-                    print "ERROR firmware: invalid parameter"
-                elif char == ERROR_TRANSMISSION_ERROR:
+                    print("ERROR firmware: invalid parameter")
+                elif data_char == ERROR_TRANSMISSION_ERROR:
                     self._s['stops']['transmission'] = True
-                    print "ERROR firmware: transmission"
+                    print("ERROR firmware: transmission")
                 else:
-                    print "ERROR: invalid stop error marker"
+                    print("ERROR: invalid stop error marker")
                 # in stop mode, print recent transmission, unless stop request, or limit
-                if char != ERROR_SERIAL_STOP_REQUEST and \
-                          char != ERROR_LIMIT_HIT_X1 and \
-                          char != ERROR_LIMIT_HIT_X2 and \
-                          char != ERROR_LIMIT_HIT_Y1 and \
-                          char != ERROR_LIMIT_HIT_Y2 and \
-                          char != ERROR_LIMIT_HIT_Z1 and \
-                          char != ERROR_LIMIT_HIT_Z2:
-                    recent_chars = self.tx_buffer[max(0,self.tx_pos-128):self.tx_pos]
-                    print "RECENT TX BUFFER:"
-                    for char in recent_chars:
-                        if markers_tx.has_key(char):
-                            print "\t%s" % (markers_tx[char])
-                        elif 127 < ord(char) < 256:
-                            print "\t(data byte)"
+                if data_char != ERROR_SERIAL_STOP_REQUEST and \
+                          data_char != ERROR_LIMIT_HIT_X1 and \
+                          data_char != ERROR_LIMIT_HIT_X2 and \
+                          data_char != ERROR_LIMIT_HIT_Y1 and \
+                          data_char != ERROR_LIMIT_HIT_Y2 and \
+                          data_char != ERROR_LIMIT_HIT_Z1 and \
+                          data_char != ERROR_LIMIT_HIT_Z2:
+                    recent_data = self.tx_buffer[max(0,self.tx_pos-128):self.tx_pos]
+                    print("RECENT TX BUFFER:")
+                    for data_num in recent_data:
+                        data_char = chr(data_num)
+                        if data_char in markers_tx:
+                            print("\t%s" % (markers_tx[data_char]))
+                        elif 127 < data_num < 256:
+                            print("\t(data byte)")
                         else:
-                            print "\t(invalid)"
-                    print "----------------"
+                            print("\t(invalid)")
+                    print("----------------")
                 # stop mode housekeeping
                 self.tx_buffer = []
                 self.tx_pos = 0
@@ -457,70 +467,69 @@ class SerialLoopClass(threading.Thread):
                 self.device.flushOutput()
                 self.pdata_count = 0
                 self._s['ready'] = True # ready but in stop mode
-            elif 64 < ord(char) < 91:  # info flags
-                # chr is in [A-Z], info flag
-                if char == INFO_IDLE_YES:
+            elif 64 < data_num < 91:  # info flags
+                # data_char is in [A-Z], info flag
+                if data_char == INFO_IDLE_YES:
                     if not self.tx_buffer:
                         self._s['ready'] = True
-                elif char == INFO_DOOR_OPEN:
+                elif data_char == INFO_DOOR_OPEN:
                     self._s['info']['door'] = True
-                elif char == INFO_CHILLER_OFF:
+                elif data_char == INFO_CHILLER_OFF:
                     self._s['info']['chiller'] = True
                 else:
-                    print "ERROR: invalid info flag"
-                    sys.stdout.write('('+char+','+str(ord(char))+')')
+                    print("ERROR: invalid info flag")
+                    sys.stdout.write('(',data_char,',',data_num,')')
                 self.pdata_count = 0
-            elif 96 < ord(char) < 123:  # parameter
-                # char is in [a-z], process parameter
-                num = ((((ord(self.pdata_chars[3])-128)*2097152
-                       + (ord(self.pdata_chars[2])-128)*16384
-                       + (ord(self.pdata_chars[1])-128)*128
-                       + (ord(self.pdata_chars[0])-128) )- 134217728)/1000.0)
-                if char == INFO_POS_X:
+            elif 96 < data_num < 123:  # parameter
+                # data_char is in [a-z], process parameter
+                num = ((((self.pdata_nums[3]-128)*2097152
+                       + (self.pdata_nums[2]-128)*16384
+                       + (self.pdata_nums[1]-128)*128
+                       + (self.pdata_nums[0]-128) )- 134217728)/1000.0)
+                if data_char == INFO_POS_X:
                     self._s['pos'][0] = num
-                elif char == INFO_POS_Y:
+                elif data_char == INFO_POS_Y:
                     self._s['pos'][1] = num
-                elif char == INFO_POS_Z:
+                elif data_char == INFO_POS_Z:
                     self._s['pos'][2] = num
-                elif char == INFO_VERSION:
+                elif data_char == INFO_VERSION:
                     num = str(int(num)/100.0)
                     self._s['firmver'] = num
-                elif char == INFO_BUFFER_UNDERRUN:
+                elif data_char == INFO_BUFFER_UNDERRUN:
                     self._s['underruns'] = num
                 # super status
-                elif char == INFO_OFFSET_X:
+                elif data_char == INFO_OFFSET_X:
                     self._s['offset'][0] = num
-                elif char == INFO_OFFSET_Y:
+                elif data_char == INFO_OFFSET_Y:
                     self._s['offset'][1] = num
-                elif char == INFO_OFFSET_Z:
+                elif data_char == INFO_OFFSET_Z:
                     self._s['offset'][2] = num
-                elif char == INFO_FEEDRATE:
+                elif data_char == INFO_FEEDRATE:
                     self._s['feedrate'] = num
-                elif char == INFO_INTENSITY:
+                elif data_char == INFO_INTENSITY:
                     self._s['intensity'] = 100*num/255
-                elif char == INFO_DURATION:
+                elif data_char == INFO_DURATION:
                     self._s['duration'] = num
-                elif char == INFO_PIXEL_WIDTH:
+                elif data_char == INFO_PIXEL_WIDTH:
                     self._s['pixelwidth'] = num
-                elif char == INFO_STACK_CLEARANCE:
+                elif data_char == INFO_STACK_CLEARANCE:
                     self._s['stackclear'] = num
                 else:
-                    print "ERROR: invalid param"
+                    print("ERROR: invalid param")
                 self.pdata_count = 0
-            elif ord(char) > 127:  ### data
-                # char is in [128,255]
+                self.pdata_nums = [128, 128, 128, 192]
+            elif data_num > 127:  ### data
+                # data_char is in [128,255]
                 if self.pdata_count < 4:
-                    self.pdata_chars[self.pdata_count] = char
+                    self.pdata_nums[self.pdata_count] = data_num
                     self.pdata_count += 1
                 else:
-                    print "ERROR: invalid data"
+                    print("ERROR: invalid data")
             else:
-                print ord(char)
-                print char
-                print "ERROR: invalid marker"
+                print(data_num)
+                print(data_char)
+                print("ERROR: invalid marker")
                 self.pdata_count = 0
-
-
 
 
     def _serial_write(self):
@@ -550,28 +559,32 @@ class SerialLoopClass(threading.Thread):
                         # to_send = ''.join(islice(self.tx_buffer, 0, self.TX_CHUNK_SIZE))
                         to_send = self.tx_buffer[self.tx_pos:self.tx_pos+self.TX_CHUNK_SIZE]
                         expectedSent = len(to_send)
+                        if self.verbose:
+                            timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
+                            print(timestamp + ' Sending: ' + prettify_serial(to_send, markers=markers_tx))
+
                         # by protocol duplicate every char
                         to_send_double = []
-                        for c in to_send:
-                            to_send_double.append(c)
-                            to_send_double.append(c)
-                        to_send = ''.join(to_send_double)
+                        for n in to_send:
+                            to_send_double.append(n)
+                            to_send_double.append(n)
+                        to_send = to_send_double
                         #
                         t_prewrite = time.time()
                         actuallySent = self.device.write(to_send)
                         if actuallySent != expectedSent*2:
-                            print "ERROR: write did not complete"
+                            print("ERROR: write did not complete")
                             assumedSent = 0
                         else:
                             assumedSent = expectedSent
                             self.firmbuf_used += assumedSent
                             if self.firmbuf_used > self.FIRMBUF_SIZE:
-                                print "ERROR: firmware buffer tracking too high"
+                                print("ERROR: firmware buffer tracking too high")
                         if time.time() - t_prewrite > 0.1:
-                            print "WARN: write delay 1"
+                            print("WARN: write delay 1")
                     except serial.SerialTimeoutException:
                         assumedSent = 0
-                        print "ERROR: writeTimeoutError 2"
+                        print("ERROR: writeTimeoutError 2")
                     self.tx_pos += assumedSent
         else:
             if self.tx_buffer:  # job finished sending
@@ -580,58 +593,60 @@ class SerialLoopClass(threading.Thread):
                 self.tx_pos = 0
 
 
-
-
     def _send_char(self, char):
         try:
             t_prewrite = time.time()
             # self.device.write(char)
             # print "send_char: [%s,%s]" % (str(ord(char)),str(ord(char)))
-            self.device.write(char+char)  # by protocol send twice
+            if self.verbose:
+                timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
+                print(timestamp + ' Sending: ' + prettify_serial(ord(char), markers=markers_tx))
+            self.device.write([ord(char),ord(char)])  # by protocol send twice
             if time.time() - t_prewrite > 0.1:
                 pass
                 # print "WARN: write delay 2"
         except serial.SerialTimeoutException:
-            print "ERROR: writeTimeoutError 1"
-
-
-
+            print("ERROR: writeTimeoutError 1")
 
 
 ###########################################################################
 ### API ###################################################################
 ###########################################################################
 
+def prettify_serial(chunk, markers=markers_tx):
+    string = ''
+    pdata_count = 0
+    pdata_nums = [128, 128, 128, 192]
+    
+    if isinstance(chunk, int):
+        chunk = [chunk] # make intger inputs iterable
+    
+    for i in range(len(chunk)):
+        data = chunk[i]
+        if data >= 128:
+            string += str(data) + ' '
+            pdata_nums[pdata_count] = data
+            pdata_count += 1
+        if data < 128 or i+1 == len(chunk):
+            if pdata_count != 0:
+                num = ((((pdata_nums[3]-128)*2097152
+                         + (pdata_nums[2]-128)*16384
+                         + (pdata_nums[1]-128)*128
+                         + (pdata_nums[0]-128) )- 134217728)/1000.0)
+                string += '(' + str(num) + ') '
+                pdata_count = 0
+                pdata_nums = [128, 128, 128, 192]
+        if data < 128:
+            string += markers[chr(data)] + ', '
 
-# def find_controller(baudrate=conf['baudrate'], verbose=True):
-#     if os.name == 'posix':
-#         iterator = sorted(serial.tools.list_ports.grep('tty'))
-#         for port, desc, hwid in iterator:
-#             # print "Looking for controller on port: " + port
-#             try:
-#                 s = serial.Serial(port=port, baudrate=baudrate, timeout=2.0)
-#                 lasaur_hello = s.read(8)
-#                 if lasaur_hello.find(INFO_HELLO) > -1:
-#                     return port
-#                 s.close()
-#             except serial.SerialException:
-#                 pass
-#     else:
-#         # windows hack because pyserial does not enumerate USB-style com ports
-#         if verbose:
-#             print "Trying to find controller ..."
-#         for i in range(24):
-#             try:
-#                 s = serial.Serial(port=i, baudrate=baudrate, timeout=2.0)
-#                 lasaur_hello = s.read(8)
-#                 if lasaur_hello.find(INFO_HELLO) > -1:
-#                     return s.portstr
-#                 s.close()
-#             except serial.SerialException:
-#                 pass
-#     if verbose:
-#         print "ERROR: No controller found."
-#     return None
+    if len(string) >= 2 and string[-2] == ',':
+        string = string[:-2]
+    elif len(string) >= 1 and string[-1] == ' ':
+        string = string[:-1]
+
+    return string
+
+
 def find_controller(baudrate=conf['baudrate'], verbose=True):
     iterator = sorted(serial.tools.list_ports.comports())
     # look for Arduinos
@@ -644,7 +659,7 @@ def find_controller(baudrate=conf['baudrate'], verbose=True):
         try:
             s = serial.Serial(port=port, baudrate=baudrate, timeout=2.0)
             lasaur_hello = s.read(8)
-            if lasaur_hello.find(INFO_HELLO) > -1:
+            if lasaur_hello.find(ord(INFO_HELLO)) > -1:
                 s.close()
                 return port
             s.close()
@@ -655,7 +670,7 @@ def find_controller(baudrate=conf['baudrate'], verbose=True):
         try:
             s = serial.Serial(port=port, baudrate=baudrate, timeout=2.0)
             lasaur_hello = s.read(8)
-            if lasaur_hello.find(INFO_HELLO) > -1:
+            if lasaur_hello.find(ord(INFO_HELLO)) > -1:
                 s.close()
                 return port
             s.close()
@@ -666,7 +681,7 @@ def find_controller(baudrate=conf['baudrate'], verbose=True):
         return arduinos[0]
     # none found
     if verbose:
-        print "ERROR: No controller found."
+        print("ERROR: No controller found.")
     return None
 
 
@@ -708,22 +723,23 @@ def connect(port=conf['serial_port'], baudrate=conf['baudrate'], verbose=True):
             while True:
                 if time.time() - start > 2:
                     if verbose:
-                        print "ERROR: Cannot get 'hello' from controller"
+                        print("ERROR: Cannot get 'hello' from controller")
                     raise serial.SerialException
-                char = SerialLoop.device.read(1)
-                if char == INFO_HELLO:
+                data = SerialLoop.device.read(1)
+                if data.find(ord(INFO_HELLO)) > -1:
                     if verbose:
-                        print "Controller says Hello!"
+                        print("Controller says Hello!")
+                        print("Connected on serial port: %s" % (port))
                     break
 
             SerialLoop.start()  # this calls run() in a thread
         except serial.SerialException:
             SerialLoop = None
             if verbose:
-                print "ERROR: Cannot connect serial on port: %s" % (port)
+                print("ERROR: Cannot connect serial on port: %s" % (port))
     else:
         if verbose:
-            print "ERROR: disconnect first"
+            print("ERROR: disconnect first")
 
 
 def connect_withfind(port=conf['serial_port'], baudrate=conf['baudrate'], verbose=True):
@@ -731,30 +747,30 @@ def connect_withfind(port=conf['serial_port'], baudrate=conf['baudrate'], verbos
     if not connected():
         # try finding driveboard
         if verbose:
-            print "WARN: Cannot connect to configured serial port."
-            print "INFO: Trying to find port."
+            print("WARN: Cannot connect to configured serial port.")
+            print("INFO: Trying to find port.")
         serialfindresult = find_controller(verbose=verbose)
         if serialfindresult:
             if verbose:
-                print "INFO: Hardware found at %s." % serialfindresult
+                print("INFO: Hardware found at %s." % serialfindresult)
             connect(port=serialfindresult, baudrate=baudrate, verbose=verbose)
             if not connected():  # special case arduino found, but no firmware
-                yesno = raw_input("Firmware appears to be missing. Want to flash-upload it (Y/N)? ")
+                yesno = input("Firmware appears to be missing. Want to flash-upload it (Y/N)? ")
                 if yesno in ('Y', 'y'):
                     ret = flash(serial_port=serialfindresult)
                     if ret == 0:
                         connect(port=serialfindresult, baudrate=baudrate, verbose=verbose)
         if connected():
             if verbose:
-                print "INFO: Connected at %s." % serialfindresult
+                print("INFO: Connected at %s." % serialfindresult)
             conf['serial_port'] = serialfindresult
             write_config_fields({'serial_port':serialfindresult})
         else:
             if verbose:
-                print "-----------------------------------------------------------------------------"
-                print "How to configure:"
-                print "https://github.com/nortd/driveboardapp/blob/master/docs/configure.md"
-                print "-----------------------------------------------------------------------------"
+                print("-----------------------------------------------------------------------------")
+                print("How to configure:")
+                print("https://github.com/nortd/driveboardapp/blob/master/docs/configure.md")
+                print("-----------------------------------------------------------------------------")
 
 
 def connected():
@@ -780,7 +796,6 @@ def close():
     return ret
 
 
-
 def flash(serial_port=conf['serial_port'], firmware=conf['firmware']):
     import flash
     reconnect = False
@@ -791,7 +806,7 @@ def flash(serial_port=conf['serial_port'], firmware=conf['firmware']):
     if reconnect:
         connect()
     if ret != 0:
-        print "ERROR: flash failed"
+        print("ERROR: flash failed")
     return ret
 
 
@@ -799,7 +814,7 @@ def build():
     import build
     ret = build.build_all()
     if ret != 0:
-        print "ERROR: build_all failed"
+        print("ERROR: build_all failed")
     return ret
 
 
@@ -834,7 +849,7 @@ def homing():
             SerialLoop.request_resume = True  # to recover from a stop mode
             SerialLoop.send_command(CMD_HOMING)
         else:
-            print "WARN: ignoring homing command while job running"
+            print("WARN: ignoring homing command while job running")
 
 
 def feedrate(val):
@@ -842,31 +857,37 @@ def feedrate(val):
     with SerialLoop.lock:
         SerialLoop.send_param(PARAM_FEEDRATE, val)
 
+
 def intensity(val):
     global SerialLoop
     with SerialLoop.lock:
         val = max(min(255*val/100, 255), 0)
         SerialLoop.send_param(PARAM_INTENSITY, val)
 
+
 def duration(val):
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_param(PARAM_DURATION, val)
+
 
 def pixelwidth(val):
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_param(PARAM_PIXEL_WIDTH, val)
 
+
 def relative():
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_REF_RELATIVE)
 
+
 def absolute():
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_REF_ABSOLUTE)
+
 
 def move(x=None, y=None, z=None):
     global SerialLoop
@@ -878,6 +899,7 @@ def move(x=None, y=None, z=None):
         if z is not None:
             SerialLoop.send_param(PARAM_TARGET_Z, z)
         SerialLoop.send_command(CMD_LINE)
+
 
 def supermove(x=None, y=None, z=None):
     """Moves in machine coordinates bypassing any offsets."""
@@ -904,6 +926,7 @@ def supermove(x=None, y=None, z=None):
         SerialLoop.send_command(CMD_OFFSET_RESTORE)
         SerialLoop.send_command(CMD_LINE)
 
+
 def rastermove(x, y, z=0.0):
     global SerialLoop
     with SerialLoop.lock:
@@ -912,16 +935,19 @@ def rastermove(x, y, z=0.0):
         SerialLoop.send_param(PARAM_TARGET_Z, z)
         SerialLoop.send_command(CMD_RASTER)
 
+
 def rasterdata(data, start, end):
     # NOTE: no SerialLoop.lock
     # more granular locking in send_data
     SerialLoop.send_data(data, start, end)
+
 
 def pause():
     global SerialLoop
     with SerialLoop.lock:
         if SerialLoop.tx_buffer:
             SerialLoop._paused = True
+
 
 def unpause():
     global SerialLoop
@@ -951,20 +977,41 @@ def air_on():
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_AIR_ENABLE)
 
+
 def air_off():
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_AIR_DISABLE)
+
 
 def aux_on():
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_AUX_ENABLE)
 
+
 def aux_off():
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_AUX_DISABLE)
+
+def pulse():
+    print('pulse')
+    global SerialLoop
+    air_on()
+    # aux_on()
+    # turn the laser on for a short pulse
+    intensity(50.0)
+    duration(0.25)
+    with SerialLoop.lock:
+        SerialLoop.send_command(CMD_DWELL)
+    # keep air on for a bit longer
+    intensity(0.0)
+    duration(0.75)
+    with SerialLoop.lock:
+        SerialLoop.send_command(CMD_DWELL)
+    air_off()
+    # aux_off()
 
 
 def offset(x=None, y=None, z=None):
@@ -981,6 +1028,7 @@ def offset(x=None, y=None, z=None):
             SerialLoop.send_param(PARAM_OFFSET_Z, z)
         SerialLoop.send_command(CMD_REF_RESTORE)
 
+
 def absoffset(x=None, y=None, z=None):
     """Sets an offset in machine coordinates."""
     global SerialLoop
@@ -996,7 +1044,6 @@ def absoffset(x=None, y=None, z=None):
         SerialLoop.send_command(CMD_REF_RESTORE)
 
 
-
 def jobfile(filepath):
     jobdict = json.load(open(filepath))
     job(jobdict)
@@ -1009,7 +1056,7 @@ def job(jobdict):
         else:
             job_laser(jobdict)
     else:
-        print "INFO: not a valid job, 'head' entry missing"
+        print("INFO: not a valid job, 'head' entry missing")
 
 
 def job_laser(jobdict):
@@ -1051,14 +1098,14 @@ def job_laser(jobdict):
     """
 
     if not 'defs' in jobdict or not 'items' in jobdict:
-        print "ERROR: invalid job"
+        print("ERROR: invalid job")
         return
 
     if not 'passes' in jobdict:
-        print "NOTICE: no passes defined"
+        print("NOTICE: no passes defined")
         return
 
-    # reset vavles
+    # reset valves
     air_off()
     # aux_off()
 
@@ -1111,9 +1158,13 @@ def job_laser(jobdict):
                 data = def_["data"]  # in base64, format: jpg, png, gif
                 px_w = int(size[0]/pxsize_2)
                 px_h = int(size[1]/pxsize)
+                raster_mode = conf['raster_mode']
+                if raster_mode not in ['Forward', 'Bidirectional']:
+                    raster_mode = 'Bidirectional'
+                    print("WARN: raster_mode not recognized. Please check your config file.")
                 # create image obj, convert to grayscale, scale, loop through lines
                 # print "--- start of image processing ---"
-                imgobj = Image.open(io.BytesIO(base64.b64decode(data[22:].encode('utf-8'))))
+                imgobj = Image.open(io.BytesIO(base64.b64decode(data[22:])))
                 imgobj = imgobj.resize((px_w,px_h), resample=Image.BICUBIC)
                 if imgobj.mode == 'RGBA':
                     imgbg = Image.new('RGBA', imgobj.size, (255, 255, 255))
@@ -1128,11 +1179,11 @@ def job_laser(jobdict):
                 # calc leadin/out
                 leadinpos = posx - conf['raster_leadin']
                 if leadinpos < 0:
-                    print "WARN: not enough leadin space"
+                    print("WARN: not enough leadin space")
                     leadinpos = 0
                 leadoutpos = posx + size[0] + conf['raster_leadin']
                 if leadoutpos > conf['workspace'][0]:
-                    print "WARN: not enough leadout space"
+                    print("WARN: not enough leadout space")
                     leadoutpos = conf['workspace'][0]
                 # assists on, beginning of feed if set to 'feed'
                 if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
@@ -1140,40 +1191,79 @@ def job_laser(jobdict):
                 # if 'aux_assist' in pass_ and pass_['aux_assist'] == 'feed':
                 #     aux_on()
                 ### go through image lines ####
-                pxarray = imgobj.getdata()
+                pxarray = list(imgobj.getdata())
+                pxarray[:] = (value for value in pxarray if type(value) is not str)
+                pxarray_reversed = pxarray[::-1]
+                px_n = len(pxarray)
                 # if len(pxarray) % size[0] != 0:
-                #     print "ERROR: img length not divisable by width"
+                #     print("ERROR: img length not divisable by width")
                 start = end = 0
                 line_y = posy + 0.5*pxsize
                 posleft = posx + 0.5*pxsize
                 posright = posx + size[0] - 0.5*pxsize
-                # print "mm: %s|%s|%s  h:%s" % (posleft-leadinpos, size[0], leadoutpos-posright, size[1])
-                # print "px: |%s|  raster_size:%s" % (px_w, pxsize)
-                # print len(pxarray)
-                # print (px_w*px_h)
+                # print("mm: %s|%s|%s  h:%s" % (posleft-leadinpos, size[0], leadoutpos-posright, size[1]))
+                # print("px: |%s|  raster_size:%s" % (px_w, pxsize))
+                # print(len(pxarray))
+                # print((px_w*px_h))
                 line_count = int(size[1]/pxsize)
-                for l in xrange(line_count):
-                    end += px_w
-                    # move to start of line
-                    feedrate(seekrate)
-                    # intensity(0.0)
-                    move(leadinpos, line_y)
-                    # lead-in
-                    feedrate(feedrate_)
-                    move(posleft, line_y)
-                    # raster move
-                    intensity(intensity_)
-                    rastermove(posright, line_y)
-                    # lead-out
-                    intensity(0.0)
-                    move(leadoutpos, line_y)
-                    # stream raster data for previous rastermove
-                    rasterdata(pxarray, start, end)
-                    # prime for next line
-                    start = end
-                    line_y += pxsize
-                    # feedrate(200)
-                    # move(leadoutpos, line_y)
+                if raster_mode == 'Bidirectional':
+                    for l in range(line_count):
+                        if l == 0:
+                            # move to start of line
+                            feedrate(seekrate)
+                            move(leadinpos, line_y)                        
+                            feedrate(feedrate_)
+                        if l % 2 == 0: 
+                            end += px_w
+                            # lead-in
+                            move(posleft, line_y)
+                            # raster move
+                            intensity(intensity_)
+                            rastermove(posright, line_y)
+                            # lead-out
+                            intensity(0.0)
+                            move(leadoutpos, line_y)
+                            # stream raster data for above rastermove
+                            rasterdata(pxarray, start, end)
+                            # prime for next line
+                            start = end
+                            line_y += pxsize
+                        else:
+                            end += px_w
+                            # lead-in
+                            move(posright, line_y)
+                            # raster move
+                            intensity(intensity_)
+                            rastermove(posleft, line_y)
+                            # lead-out
+                            intensity(0.0)
+                            move(leadinpos, line_y)
+                            # stream raster data for above rastermove
+                            rasterdata(pxarray_reversed, px_n - end, px_n - start)
+                            # prime for next line
+                            start = end
+                            line_y += pxsize
+                elif raster_mode == 'Forward':
+                    for l in range(line_count):
+                        end += px_w
+                        # move to start of line
+                        feedrate(seekrate)
+                        # intensity(0.0)
+                        move(leadinpos, line_y)
+                        # lead-in
+                        feedrate(feedrate_)
+                        move(posleft, line_y)
+                        # raster move
+                        intensity(intensity_)
+                        rastermove(posright, line_y)
+                        # lead-out
+                        intensity(0.0)
+                        move(leadoutpos, line_y)
+                        # stream raster data for previous rastermove
+                        rasterdata(pxarray, start, end)
+                        # prime for next line
+                        start = end
+                        line_y += pxsize
                 # assists off, end of feed if set to 'feed'
                 if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
                     air_off()
@@ -1207,10 +1297,10 @@ def job_laser(jobdict):
                             #     aux_on()
                             # TODO dwell according to pierce time
                             if is_2d:
-                                for i in xrange(1, len(polyline)):
+                                for i in range(1, len(polyline)):
                                     move(polyline[i][0], polyline[i][1])
                             else:
-                                for i in xrange(1, len(polyline)):
+                                for i in range(1, len(polyline)):
                                     move(polyline[i][0], polyline[i][1], polyline[i][2])
                             # turn off assists if set to 'feed'
                             if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
@@ -1241,7 +1331,6 @@ def job_laser(jobdict):
         move(0, 0, 0)
 
 
-
 def job_mill(jobdict):
     """Queue a .dba mill job.
     A typical mill job dict looks like this:
@@ -1260,11 +1349,11 @@ def job_mill(jobdict):
     if (not 'head' in jobdict) or \
        (not 'kind' in jobdict['head']) or \
        (jobdict['head']['kind'] != 'mill'):
-        print "NOTICE: not a mill job"
+        print("NOTICE: not a mill job")
         return
 
     if not 'defs' in jobdict:
-        print "ERROR: invalid job"
+        print("ERROR: invalid job")
         return
     # prime job
     air_off()
@@ -1313,9 +1402,6 @@ def job_mill(jobdict):
     intensity(0.0)
     supermove(z=0)
     supermove(x=0, y=0)
-
-
-
 
 
 if __name__ == "__main__":

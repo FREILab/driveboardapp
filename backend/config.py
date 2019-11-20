@@ -30,14 +30,14 @@ conf = {
     'appname': 'driveboardapp',
     'version': '18.07',
     'company_name': 'com.nortd.labs',
-    'network_host': '',                    # '' for all nics
+    'network_host': '',                 # '' for all nics
     'network_port': 4444,
-    'serial_port': '',                     # set to '' for auto (req. firmware)
+    'serial_port': '',                  # set to '' for auto (req. firmware)
     'baudrate': 57600,
-    'rootdir': None,                       # defined further down (../)
-    'confdir': None,                       # defined further down
-    'hardware': None,                      # defined further down
-    'firmware': None,                      # defined further down
+    'rootdir': None,                    # defined further down (../)
+    'confdir': None,                    # defined further down
+    'hardware': None,                   # defined further down
+    'firmware': None,                   # defined further down
     'tolerance': 0.01,
     'workspace': [1220,610,0],
     'grid_mm': 100,
@@ -45,16 +45,19 @@ conf = {
     'feedrate': 2000,
     'intensity': 0,
     'kerf': 0.3,
-    'pxsize': 0.4,                 # size (mm) of beam for rastering
+    'pxsize': 0.2,                      # size (mm) of beam for rastering
     'max_jobs_in_list': 20,
     'usb_reset_hack': False,
+    'raster_mode': 'Bidirectional',     # 'Forward', 'Bidirectional'
+    'raster_leadin': 10,
+    'fill_mode': 'Bidirectional',       # 'Forward', 'Bidirectional', 'NearestNeighbor'
     'fill_leadin': 10,
-    'raster_leadin': 20,
     'max_segment_length': 5.0,
     'users': {
         'laser': 'laser',
     },
-    'enable_gzip': True,           # allow gzip upload of files / jobs
+    'enable_gzip': True,                # allow gzip upload of files / jobs
+    'home_on_startup': False,
     'mill_mode': False,
     'mill_max_rpm': 18000,
 }
@@ -71,14 +74,17 @@ userconfigurable = {
     'feedrate': "Default feed rate in mm/min.",
     'intensity': "Default intensity setting 0-100.",
     'kerf': "Typical kerf of a cut.",
-    'pxsize': "Default kerf setting for rastering.",
+    'pxsize': "Default kerf setting for rastering and filling.",
     'max_jobs_in_list': "Jobs to keep in the history list.",
-    'fill_leadin': "Leadin for vector fills in mm.",
+    'raster_mode': "Pathing to use when rastering: 'Forward', or 'Bidirectional'",
     'raster_leadin': "Leadin for raster fills in mm.",
+    'fill_mode': "Pathing to use when engraving a fill area: 'Forward', 'Bidirectional', or 'NearestNeighbor'",
+    'fill_leadin': "Leadin for vector fills in mm.",
     'users': "List of user cendentials for UI access.",
     'enable_gzip': "Enable gzip compression in job uploads.",
+    'home_on_startup': "Automatically perform a homing cycle when the machine first connects.",
     'mill_mode': "Activate CNC mill mode.",
-    'mill_max_rpm': "Maximum spindle RPM."
+    'mill_max_rpm': "Maximum spindle RPM.",
 }
 
 
@@ -297,20 +303,20 @@ def load(configname):
         with open(path) as fp:
             try:
                 userconf = json.load(fp)
-                for k in userconfigurable.keys():
+                for k in list(userconfigurable.keys()):
                     if k in userconf:
                         conf[k] = userconf[k]
             except ValueError:
-                print "ERROR: failed to read config file"
+                print("ERROR: failed to read config file")
     else:
         if not configname:
             # special case: default config not present, create
-            print "INFO: creating default config file"
+            print("INFO: creating default config file")
             with open(path, "w") as fp:
-                confout = {k:v for k,v in conf.items() if k in userconfigurable}
+                confout = {k:v for k,v in list(conf.items()) if k in userconfigurable}
                 json.dump(confout, fp, indent=4)
         else:
-            print "ERROR: invalid config specified"
+            print("ERROR: invalid config specified")
             sys.exit()
 
 
@@ -327,11 +333,11 @@ def write_config_fields(subconfigdict):
 
 
 def list_configs():
-    print "Config files in " + conf['confdir'] + ":"
+    print("Config files in " + conf['confdir'] + ":")
     tempdir = os.getcwd()
     os.chdir(conf['confdir'])
     cfiles = glob.glob('config.*.json')
     for cfile in cfiles:
         confname = cfile.split('.')[1]
-        print "%s - (%s)" % (confname, cfile)
+        print("%s - (%s)" % (confname, cfile))
     os.chdir(tempdir)

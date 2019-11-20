@@ -68,7 +68,7 @@ class Lasersaur(object):
 
         if not r.ok:
             if r.status_code == 400:
-                print "WEB ERROR: "+r.text[r.text.find('<pre>')+5:r.text.find('</pre>')]
+                print("WEB ERROR: "+r.text[r.text.find('<pre>')+5:r.text.find('</pre>')])
             r.raise_for_status()
 
         if ret:
@@ -135,7 +135,10 @@ class Lasersaur(object):
 
     def aux_off(self):
         self._request('/aux_off')
-
+    
+    def pulse(self):
+        self._request('/pulse')
+    
     def offset(self, x, y, z=0.0):
         self._request('/offset/%.4f/%.4f/%.4f' % (x,y,z))
 
@@ -158,6 +161,7 @@ class Lasersaur(object):
         Returns:
             A parsed .dba job.
         """
+
         import jobimport # dependancy only when actually needed
         name_f = os.path.basename(jobfile)
         with open(jobfile) as fp:
@@ -181,6 +185,7 @@ class Lasersaur(object):
         Output:
             A .dba file in the same directory called <name>.conv.dba
         """
+
         import jobimport # dependancy only when actually needed
         base, name = os.path.split(jobfile)
         name, ext = os.path.splitext(name)
@@ -189,7 +194,7 @@ class Lasersaur(object):
         outfile = os.path.join(base, "%s.conv.dba" % (name))
         with open(outfile,'w') as fp:
             fp.write(job)
-        print "INFO: job file written to: %s" % outfile
+        print("INFO: job file written to: %s" % outfile)
 
 
 
@@ -213,8 +218,11 @@ class Lasersaur(object):
             Unique name give to the job. This is either name or
             name_<numeral>.
         """
+
         if type(job) is dict:
             job =  json.dumps(job)
+        elif type(job) is bytes:
+            job = job.decode("utf-8")
         load_request = json.dumps({"job": job, "name":name, "optimize": optimize})
         return self._request('/load', postdict={'load_request':load_request}, ret=True)
 
@@ -231,6 +239,7 @@ class Lasersaur(object):
             Unique name give to the job. This is either name or
             name_<numeral>.
         """
+
         import jobimport # dependancy only when actually needed
         base, name = os.path.split(jobfile)
         name, ext = os.path.splitext(name)
@@ -244,6 +253,7 @@ class Lasersaur(object):
         [ [[x,y,z], ...], [[x,y,z], ...], ... ]
         and can be 2D or 3D.
         """
+
         job = {
             "vector":{
                 "passes":[
@@ -270,6 +280,7 @@ class Lasersaur(object):
             feedrate: raster speed
             intensity: raster intensity
         """
+
         with open(image,'rb') as fp:
             img = fp.read()
         img_b64 = base64.encodestring(img).decode("utf8")
@@ -345,20 +356,20 @@ class Lasersaur(object):
         """Send job from queue to the machine."""
         self._request('/run/%s' % jobname)
         if progress:
-            print 'Processing [                                        ]',
-            print '\b'*42,
+            print('Processing [                                        ]', end=' ')
+            print('\b'*42, end=' ')
             sys.stdout.flush()
             time.sleep(0.6)
             stat = self.status()
             level = 0.025
             while not stat['ready']:
                 while stat['progress'] > level:
-                    print '\b.',
+                    print('\b.', end=' ')
                     sys.stdout.flush()
                     level += 0.025
                 time.sleep(1)
                 stat = self.status()
-            print '\b]  Done!'
+            print('\b]  Done!')
 
 
     def run_file(self, jobfile, feedrate=None, intensity=0, progress=True, local=False):
@@ -371,7 +382,7 @@ class Lasersaur(object):
                 # file has no pass info | feedrate is specified
                 if feedrate is None: feedrate = 4000
                 job['vector']['passes'] = [{
-                        "paths":range(len(job['vector']['paths'])),  # apply to all path
+                        "paths":list(range(len(job['vector']['paths']))),  # apply to all path
                         "feedrate":feedrate,
                         "intensity":intensity
                     }]
@@ -451,6 +462,7 @@ air_on = lasersaur.air_on
 air_off = lasersaur.air_off
 aux_on = lasersaur.aux_on
 aux_off = lasersaur.aux_off
+pulse = lasersaur.pulse
 offset = lasersaur.offset
 clear_offset = lasersaur.clear_offset
 ### JOBS QUEUE
@@ -498,7 +510,7 @@ if __name__ == '__main__':
       lasersaur.run(jobname)
 
     while not lasersaur.ready():
-      print "%s done!" % (lasersaur.status()['progress'])
+      print("%s done!" % (lasersaur.status()['progress']))
       time.sleep(1)
 
-    print "job done"
+    print("job done")

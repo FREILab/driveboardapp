@@ -68,6 +68,7 @@ function controls_ready() {
 
   $("#flash_btn").tooltip({placement:'bottom', delay: {show:1000, hide:100}})
   $("#flash_btn").click(function(e){
+    $().uxmessage('notice', "Flashing firmware, may take several minutes...")
     request_get({
       url:'/flash',
       success: function (data) {
@@ -81,6 +82,7 @@ function controls_ready() {
 
   $("#rebuild_btn").tooltip({placement:'bottom', delay: {show:1000, hide:100}})
   $("#rebuild_btn").click(function(e){
+    $().uxmessage('notice', "Building firmware, may take several minutes...")
     request_get({
       url:'/build',
       success: function (data) {
