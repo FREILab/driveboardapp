@@ -698,10 +698,10 @@ inline void stepper_homing_cycle() {
     homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 4.0*zdir, 0.1*CONFIG_SEEKRATE);
   #endif
   // x-axis
-  homing_move(-999999*xdir, 0.0, 0.0, 10.0*xdir, 0.0, 0.0, 0.4*CONFIG_SEEKRATE);
+  homing_move(-999999*xdir, 0.0, 0.0, 8.0*xdir, 0.0, 0.0, 0.4*CONFIG_SEEKRATE);
   homing_move(-999999*xdir, 0.0, 0.0, 2.0*xdir, 0.0, 0.0, 0.1*CONFIG_SEEKRATE);
   // y-axis
-  homing_move(0.0, -999999*ydir, 0.0, 0.0, 10.0*ydir, 0.0, 0.4*CONFIG_SEEKRATE);
+  homing_move(0.0, -999999*ydir, 0.0, 0.0, 7.0*ydir, 0.0, 0.4*CONFIG_SEEKRATE);
   homing_move(0.0, -999999*ydir, 0.0, 0.0, 3.0*ydir, 0.0, 0.1*CONFIG_SEEKRATE);
 
   planner_set_position(0.0, 0.0, 0.0);
