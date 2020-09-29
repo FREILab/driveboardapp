@@ -50,7 +50,7 @@ conf = {
     'usb_reset_hack': False,
     'print_serial_data': False,
     'raster_invert': False,             # Set to True for materials which etch light on dark (eg slate, black marble)
-    'raster_mode': 'Bidirectional',     # 'Forward', 'Reverse', 'Bidirectional'
+    'raster_mode': 'Forward',     # 'Forward', 'Reverse', 'Bidirectional'
     'raster_leadin': 10,
     'fill_mode': 'Bidirectional',       # 'Forward', 'Reverse', 'Bidirectional', 'NearestNeighbor'
     'fill_leadin': 10,
