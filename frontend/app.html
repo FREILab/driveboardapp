@@ -90,6 +90,16 @@
             <input type="file" id="open_file_fld" name="data" style="visibility:hidden; position:fixed">
         </form>
 
+        <!-- open and align button -->
+        <div id="open_align_container" class="btn-group pull-left menu_btn">
+            <button id="open_align_btn" class="btn btn-default" type="submit"
+                    title="open with alignment" data-loading-text='<span class="glyphicon glyphicon-refresh spinning"></span>'>Open &amp; Align</button>
+        </div>
+        <form id="open_align_file_form" action="#" onsubmit="return false;">
+            <input type="file" id="open_align_file_fld" name="data" style="visibility:hidden; position:fixed">
+        </form>
+
+
         <!-- process buttons -->
         <div class="btn-group pull-left menu_btn">
           <button id="material_btn" class="btn btn-primary ladda-button" data-style="expand-right" style="min-width:90px">
@@ -118,11 +128,12 @@
 
         <!-- job info -->
         <div id="job_info" class="pull-left" style="font-size:1.2em; margin:13px; color:#666666">
-          <span id="job_info_name"></span><span id="job_info_length"></span>
+          <span id="job_info_name"></span>
           <a id="info_btn" style="display:none; margin-left:4px; position:relative; top:1px"
             href="#" data-toggle="modal" data-target="#info_modal">
             <span class="glyphicon glyphicon-info-sign" style="color:#888888"></span>
           </a>
+          <span id="job_info_length"></span><span id="job_info_duration"></span>
         </div>
         <!-- <div id="job_info" class="pull-left" style="">hello</div> -->
         

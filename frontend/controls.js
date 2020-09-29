@@ -117,6 +117,16 @@ function controls_ready() {
     return false
   })
 
+  if (app_config_main.alignment_host) {
+    $("#open_align_btn").tooltip({placement:'bottom', delay: {show:1000, hide:100}})
+    $("#open_align_btn").click(function(e){
+      $('#open_align_file_fld').trigger('click')
+      return false
+    })
+  } else {
+    $("#open_align_container").hide()
+  }
+  
   $("#boundary_btn").tooltip({placement:'bottom', delay: {show:1000, hide:100}})
   $("#boundary_btn").click(function(e){
     jobhandler.passes = passes_get_active()
@@ -352,6 +362,10 @@ function controls_ready() {
     // make sure 'value' is a float with at most one decimal point and always smaller than the workspace
 	value = document.getElementById("x_input").value;
 	x_mm = value.match(/[-+]?[0-9]+[\.|,]?[0-9]?/);
+	if (!x_mm) {
+	  // if no match is found, null is returned for which 0 should be the replacement
+	  x_mm = 0
+	}
 	// check for only minus sign as input. Otherwise, a single minus-sign without any following digit will quickly be removed, making it annoying to type negative values.
 	if (x_mm.toString().localeCompare('-') == 0) {
 		document.getElementById("x_input").value = x_mm
@@ -373,6 +387,10 @@ function controls_ready() {
     // make sure 'value' is a float with at most one decimal point and always smaller than the workspace
 	value = document.getElementById("y_input").value;
 	y_mm = value.match(/[-+]?[0-9]+[\.|,]?[0-9]?/);
+	if (!y_mm) {
+	  // if no match is found, null is returned for which 0 should be the replacement
+	  y_mm = 0
+	}
 	// check for only minus sign as input. Otherwise, a single minus-sign without any following digit will quickly be removed, making it annoying to type negative values.
 	if (y_mm.toString().localeCompare('-') == 0) {
 		document.getElementById("y_input").value = y_mm

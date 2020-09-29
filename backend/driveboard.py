@@ -217,8 +217,6 @@ class SerialLoopClass(threading.Thread):
 
     def __init__(self):
         threading.Thread.__init__(self)
-        
-        self.verbose = False
 
         self.device = None
         self.tx_buffer = []
@@ -311,7 +309,7 @@ class SerialLoopClass(threading.Thread):
         self.job_size += 5
 
 
-    def send_data(self, data, start, end):
+    def send_raster_data(self, data, start, end):
         count = 2
         with self.lock:
             self.tx_buffer.append(ord(CMD_RASTER_DATA_START))
@@ -371,7 +369,7 @@ class SerialLoopClass(threading.Thread):
 
     def _serial_read(self):
         chunk = self.device.read(self.RX_CHUNK_SIZE)
-        if self.verbose and chunk != b'':
+        if conf['print_serial_data'] and chunk != b'':
             timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
             print(timestamp + ' Receiving: ' + prettify_serial(chunk, markers=markers_rx))
         for data_num in chunk:
@@ -559,7 +557,7 @@ class SerialLoopClass(threading.Thread):
                         # to_send = ''.join(islice(self.tx_buffer, 0, self.TX_CHUNK_SIZE))
                         to_send = self.tx_buffer[self.tx_pos:self.tx_pos+self.TX_CHUNK_SIZE]
                         expectedSent = len(to_send)
-                        if self.verbose:
+                        if conf['print_serial_data']:
                             timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
                             print(timestamp + ' Sending: ' + prettify_serial(to_send, markers=markers_tx))
 
@@ -596,9 +594,7 @@ class SerialLoopClass(threading.Thread):
     def _send_char(self, char):
         try:
             t_prewrite = time.time()
-            # self.device.write(char)
-            # print "send_char: [%s,%s]" % (str(ord(char)),str(ord(char)))
-            if self.verbose:
+            if conf['print_serial_data']:
                 timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
                 print(timestamp + ' Sending: ' + prettify_serial(ord(char), markers=markers_tx))
             self.device.write([ord(char),ord(char)])  # by protocol send twice
@@ -615,29 +611,62 @@ class SerialLoopClass(threading.Thread):
 
 def prettify_serial(chunk, markers=markers_tx):
     string = ''
-    pdata_count = 0
-    pdata_nums = [128, 128, 128, 192]
+    if not hasattr(prettify_serial, "tx_pdata_nums"):
+        prettify_serial.rx_pdata_nums = [128, 128, 128, 192]
+        prettify_serial.rx_pdata_count = 0
+        prettify_serial.tx_pdata_nums = [128, 128, 128, 192]
+        prettify_serial.tx_pdata_count = 0
+        prettify_serial.tx_rasterstream = False
+        prettify_serial.tx_rastercount = 0
     
     if isinstance(chunk, int):
-        chunk = [chunk] # make intger inputs iterable
+        chunk = [chunk] # make integer inputs iterable
     
     for i in range(len(chunk)):
         data = chunk[i]
         if data >= 128:
             string += str(data) + ' '
-            pdata_nums[pdata_count] = data
-            pdata_count += 1
-        if data < 128 or i+1 == len(chunk):
-            if pdata_count != 0:
-                num = ((((pdata_nums[3]-128)*2097152
-                         + (pdata_nums[2]-128)*16384
-                         + (pdata_nums[1]-128)*128
-                         + (pdata_nums[0]-128) )- 134217728)/1000.0)
-                string += '(' + str(num) + ') '
-                pdata_count = 0
-                pdata_nums = [128, 128, 128, 192]
-        if data < 128:
+            if (markers == markers_tx) and prettify_serial.tx_rasterstream:
+                prettify_serial.tx_rastercount += 1
+            elif markers == markers_tx:
+                prettify_serial.tx_pdata_nums[prettify_serial.tx_pdata_count] = data
+                prettify_serial.tx_pdata_count += 1
+            elif markers == markers_rx:
+                prettify_serial.rx_pdata_nums[prettify_serial.rx_pdata_count] = data
+                prettify_serial.rx_pdata_count += 1
+        elif (data < 128):
+            if (markers == markers_tx) and (markers[chr(data)] not in ["CMD_STATUS", "CMD_SUPERSTATUS"]):
+                prettify_serial.tx_pdata_count = 0
+                prettify_serial.tx_pdata_nums = [128, 128, 128, 192]
+            else:
+                prettify_serial.rx_pdata_count = 0
+                prettify_serial.rx_pdata_nums = [128, 128, 128, 192]
+
+            if markers[chr(data)] == 'CMD_RASTER_DATA_START':
+                prettify_serial.tx_rasterstream = True
+                prettify_serial.tx_rastercount = 0
+            elif markers[chr(data)] == 'CMD_RASTER_DATA_END':
+                prettify_serial.tx_rasterstream = False
+                string += '(' + str(prettify_serial.tx_rastercount) + ') '
+
             string += markers[chr(data)] + ', '
+
+        if prettify_serial.tx_pdata_count == 4:
+            num = ((((prettify_serial.tx_pdata_nums[3]-128)*2097152
+                + (prettify_serial.tx_pdata_nums[2]-128)*16384
+                + (prettify_serial.tx_pdata_nums[1]-128)*128
+                + (prettify_serial.tx_pdata_nums[0]-128) )- 134217728)/1000.0)
+            prettify_serial.tx_pdata_count = 0
+            prettify_serial.tx_pdata_nums = [128, 128, 128, 192]
+            string += '(' + str(num) + ') '
+        elif prettify_serial.rx_pdata_count == 4:
+            num = ((((prettify_serial.rx_pdata_nums[3]-128)*2097152
+                + (prettify_serial.rx_pdata_nums[2]-128)*16384
+                + (prettify_serial.rx_pdata_nums[1]-128)*128
+                + (prettify_serial.rx_pdata_nums[0]-128) )- 134217728)/1000.0)
+            prettify_serial.rx_pdata_count = 0
+            prettify_serial.rx_pdata_nums = [128, 128, 128, 192]
+            string += '(' + str(num) + ') '
 
     if len(string) >= 2 and string[-2] == ',':
         string = string[:-2]
@@ -939,7 +968,7 @@ def rastermove(x, y, z=0.0):
 def rasterdata(data, start, end):
     # NOTE: no SerialLoop.lock
     # more granular locking in send_data
-    SerialLoop.send_data(data, start, end)
+    SerialLoop.send_raster_data(data, start, end)
 
 
 def pause():
@@ -1112,13 +1141,13 @@ def job_laser(jobdict):
     # loop passes
     for pass_ in jobdict['passes']:
         if 'pxsize' in pass_:
-            pxsize = float(pass_['pxsize'])
+            pxsize_y = float(pass_['pxsize'])
         else:
-            pxsize = float(conf['pxsize'])
-        pxsize = max(pxsize, 0.01)  # prevent div by 0
+            pxsize_y = float(conf['pxsize'])
+        pxsize_y = max(pxsize_y, 0.01)  # prevent div by 0
         intensity(0.0)
-        pxsize_2 = pxsize/2.0  # use 2x horiz resol.
-        pixelwidth(pxsize_2)
+        pxsize_x = pxsize_y/2.0  # use 2x horiz resol.
+        pixelwidth(pxsize_x)
         # assists on, beginning of pass if set to 'pass'
         if 'air_assist' in pass_:
             if pass_['air_assist'] == 'pass':
@@ -1156,14 +1185,14 @@ def job_laser(jobdict):
                 pos = def_["pos"]
                 size = def_["size"]
                 data = def_["data"]  # in base64, format: jpg, png, gif
-                px_w = int(size[0]/pxsize_2)
-                px_h = int(size[1]/pxsize)
+                px_w = int(size[0]/pxsize_x)
+                px_h = int(size[1]/pxsize_y)
                 raster_mode = conf['raster_mode']
-                if raster_mode not in ['Forward', 'Bidirectional']:
+                if raster_mode not in ['Forward', 'Reverse', 'Bidirectional']:
                     raster_mode = 'Bidirectional'
                     print("WARN: raster_mode not recognized. Please check your config file.")
+                
                 # create image obj, convert to grayscale, scale, loop through lines
-                # print "--- start of image processing ---"
                 imgobj = Image.open(io.BytesIO(base64.b64decode(data[22:])))
                 imgobj = imgobj.resize((px_w,px_h), resample=Image.BICUBIC)
                 if imgobj.mode == 'RGBA':
@@ -1172,98 +1201,132 @@ def job_laser(jobdict):
                     imgobj = imgbg.convert("L")
                 else:
                     imgobj = imgobj.convert("L")
-                # print "---- end of image processing ----"
-                # imgobj.show()
-                posx = pos[0]
-                posy = pos[1]
-                # calc leadin/out
-                leadinpos = posx - conf['raster_leadin']
-                if leadinpos < 0:
-                    print("WARN: not enough leadin space")
-                    leadinpos = 0
-                leadoutpos = posx + size[0] + conf['raster_leadin']
-                if leadoutpos > conf['workspace'][0]:
-                    print("WARN: not enough leadout space")
-                    leadoutpos = conf['workspace'][0]
+
                 # assists on, beginning of feed if set to 'feed'
                 if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
                     air_on()
                 # if 'aux_assist' in pass_ and pass_['aux_assist'] == 'feed':
                 #     aux_on()
-                ### go through image lines ####
+
+                # extract raw pixel data into one large list 
+                # 0 = black / full power
+                # 255 = white / transparent / no power
                 pxarray = list(imgobj.getdata())
                 pxarray[:] = (value for value in pxarray if type(value) is not str)
+                if conf['raster_invert']:
+                    pxarray = 255 - pxarray
                 pxarray_reversed = pxarray[::-1]
                 px_n = len(pxarray)
-                # if len(pxarray) % size[0] != 0:
-                #     print("ERROR: img length not divisable by width")
-                start = end = 0
-                line_y = posy + 0.5*pxsize
-                posleft = posx + 0.5*pxsize
-                posright = posx + size[0] - 0.5*pxsize
-                # print("mm: %s|%s|%s  h:%s" % (posleft-leadinpos, size[0], leadoutpos-posright, size[1]))
-                # print("px: |%s|  raster_size:%s" % (px_w, pxsize))
+
+                posx = pos[0] # left edge location [mm]
+                posy = pos[1] # top edge location [mm]
+                line_y = posy + 0.5*pxsize_y
+                line_count = int(size[1]/pxsize_y)
+                line_start = line_end = 0
+
+                # calc leadin/out
+                pos_leadin = posx - conf['raster_leadin']
+                if pos_leadin < 0:
+                    print("WARN: not enough leadin space")
+                    pos_leadin = 0
+                pos_leadout = posx + size[0] + conf['raster_leadin']
+                if pos_leadout > conf['workspace'][0]:
+                    print("WARN: not enough leadout space")
+                    pos_leadout = conf['workspace'][0]
+                
+                # print("mm: %s|%s|%s  h:%s" % ( posx + 0.5*pxsize_x - pos_leadin, size[0], pos_leadout - (posx + size[0] - 0.5*pxsize_x), size[1]))
+                # print("px: |%s|  raster_size:%s" % (px_w, pxsize_y))
                 # print(len(pxarray))
                 # print((px_w*px_h))
-                line_count = int(size[1]/pxsize)
-                if raster_mode == 'Bidirectional':
-                    for l in range(line_count):
-                        if l == 0:
-                            # move to start of line
-                            feedrate(seekrate)
-                            move(leadinpos, line_y)                        
-                            feedrate(feedrate_)
-                        if l % 2 == 0: 
-                            end += px_w
-                            # lead-in
-                            move(posleft, line_y)
-                            # raster move
-                            intensity(intensity_)
-                            rastermove(posright, line_y)
-                            # lead-out
-                            intensity(0.0)
-                            move(leadoutpos, line_y)
-                            # stream raster data for above rastermove
-                            rasterdata(pxarray, start, end)
-                            # prime for next line
-                            start = end
-                            line_y += pxsize
-                        else:
-                            end += px_w
-                            # lead-in
-                            move(posright, line_y)
-                            # raster move
-                            intensity(intensity_)
-                            rastermove(posleft, line_y)
-                            # lead-out
-                            intensity(0.0)
-                            move(leadinpos, line_y)
-                            # stream raster data for above rastermove
-                            rasterdata(pxarray_reversed, px_n - end, px_n - start)
-                            # prime for next line
-                            start = end
-                            line_y += pxsize
-                elif raster_mode == 'Forward':
-                    for l in range(line_count):
-                        end += px_w
-                        # move to start of line
-                        feedrate(seekrate)
-                        # intensity(0.0)
-                        move(leadinpos, line_y)
-                        # lead-in
-                        feedrate(feedrate_)
-                        move(posleft, line_y)
-                        # raster move
-                        intensity(intensity_)
-                        rastermove(posright, line_y)
-                        # lead-out
-                        intensity(0.0)
-                        move(leadoutpos, line_y)
-                        # stream raster data for previous rastermove
-                        rasterdata(pxarray, start, end)
-                        # prime for next line
-                        start = end
-                        line_y += pxsize
+
+                # set direction
+                if raster_mode == 'Reverse':
+                    direction = -1 # 1 is forward, -1 is reverse
+                else: # if 'Forward' or 'Bidirectional'
+                    direction = 1 
+
+                # we don't want to waste time at low speeds travelling over whitespace where there is no engraving going on
+                # so, chop off all whitespace at the beginning and end of each line
+                # additionally, break the line into segments so that large interior whitespaces can be travelled over quicker
+                # the threshold for a "large" interior whitespace is 2x the raster_leadin distance so we can still lead in/out properly
+                for i in range(line_count):
+                    line_end += px_w
+                    line = pxarray[line_start:line_end]
+                    if not all(px == 255 for px in line): # skip completely white raster lines
+                        whitespace_counter = 0
+                        on_starting_edge = True
+                        if direction == 1: # fwd
+                            segment_start = line_start
+                            segment_end = segment_start - 1 # will immediately increment
+                        elif direction == -1: # rev
+                            line = line[::-1]
+                            segment_start = line_end
+                            segment_end = segment_start + 1 # will immediately decrement
+
+                        for j in range(len(line)):
+                            segment_end += 1*direction
+                            if line[j] == 255:
+                                whitespace_counter += 1
+                            elif on_starting_edge: 
+                                # make the first non-white pixel our starting point
+                                segment_start = segment_end
+                                on_starting_edge = False
+                                whitespace_counter = 0
+                            elif whitespace_counter*pxsize_x <= 2*conf['raster_leadin']:
+                                # if the interior whitespace is too small, ignore it and travel at normal speeds
+                                whitespace_counter = 0
+                            
+                            segment_ended = False
+                            if j == (len(line) - 1):
+                                segment_ended = True
+                            elif (whitespace_counter*pxsize_x > 2*conf['raster_leadin']) and (line[j+1] != 255) and not (on_starting_edge):
+                                # we travel all the way to the end of the interior whitespace, and use whitespace_counter to figure out how far to backtrack
+                                segment_ended = True
+
+                            if segment_ended:
+                                # calculate the limits for engraving and leading in/out for this segment
+                                if direction == 1: # fwd
+                                    segment_end = segment_end - whitespace_counter + 1 # cut off the ending whitespace
+                                    pos_start = posx + (segment_start - line_start + 0.5)*pxsize_x
+                                    pos_end = posx + (segment_end - line_start - 0.5)*pxsize_x
+                                    pos_leadin = max(posx + (segment_start - line_start)*pxsize_x - conf['raster_leadin'], 0) # ensure we stay in the workspace
+                                    pos_leadout = min(posx + (segment_end - line_start)*pxsize_x + conf['raster_leadin'], conf['workspace'][0]) # ensure we stay in the workspace
+                                elif direction == -1: # rev
+                                    segment_end = segment_end + whitespace_counter - 1 # cut off the ending whitespace
+                                    pos_start = posx + (segment_start - line_start - 0.5)*pxsize_x
+                                    pos_end = posx + (segment_end - line_start + 0.5)*pxsize_x
+                                    pos_leadin = min(posx + (segment_start - line_start)*pxsize_x + conf['raster_leadin'], conf['workspace'][0]) # ensure we stay in the workspace
+                                    pos_leadout = max(posx + (segment_end - line_start)*pxsize_x - conf['raster_leadin'], 0) # ensure we stay in the workspace
+                                
+                                # write out the movement and engraving info for the segment
+                                intensity(0.0) # intensity for seek and lead-in
+                                feedrate(seekrate) # feedrate for seek
+                                move(pos_leadin, line_y) # seek to lead-in start              
+                                feedrate(feedrate_) # feedrate for lead-in, raster, and lead-out
+                                move(pos_start, line_y) # lead-in
+                                intensity(intensity_) # intensity for raster move
+                                rastermove(pos_end, line_y) # raster move
+                                if direction == 1: # fwd
+                                    rasterdata(pxarray, segment_start, segment_end) # stream raster data for above rastermove
+                                elif direction == -1: # rev
+                                    rasterdata(pxarray_reversed, px_n - segment_start, px_n - segment_end) # stream raster data for above rastermove
+                                intensity(0.0) # intensity for lead-out
+                                move(pos_leadout, line_y) # lead-out
+                                
+                                # prime for next segment
+                                segment_start = segment_end + whitespace_counter*direction
+                                segment_end = segment_start - 1*direction
+                                segment_ended = False
+                                whitespace_counter = 0
+
+                    # prime for next line
+                    if (raster_mode == 'Bidirectional') and (direction == 1): # fwd
+                        direction = -1 # switch to rev
+                    elif (raster_mode == 'Bidirectional') and (direction == -1): # rev
+                        direction = 1 # switch to fwd
+                    line_start = line_end
+                    line_y += pxsize_y
+
                 # assists off, end of feed if set to 'feed'
                 if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
                     air_off()
