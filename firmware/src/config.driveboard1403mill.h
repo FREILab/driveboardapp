@@ -23,7 +23,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 
-#define VERSION 1807               // int or float
+#define VERSION 26081              // version x10, 26081 reads 26.08.1
 #define BAUD_RATE 57600
 #define ENABLE_3AXES               // enable/disable 3-axis mode (vs 2-axis)
 #define ENABLE_INTERLOCKS          // enable/disable all interlocks
@@ -50,6 +50,8 @@
 #define CONFIG_FEEDRATE 800.0 // in millimeters per minute
 #define CONFIG_SEEKRATE 800.0
 #define CONFIG_HOMINGRATE 300  // ms/pulse
+// NOTE: acceleration and junction deviation are mirrored by the seek-time
+// model in backend/jobimport/pathoptimizer.py, keep them in sync
 #define CONFIG_ACCELERATION 100000.0 // mm/min^2, typically 1000000-8000000, divide by (60*60) to get mm/sec^2
 #define CONFIG_JUNCTION_DEVIATION 0.006 // mm
 #define CONFIG_X_ORIGIN_OFFSET -235.8   // mm, x-offset of table origin from physical home

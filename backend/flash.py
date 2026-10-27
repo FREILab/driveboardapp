@@ -4,61 +4,90 @@
 # Copyright (c) 2011 Nortd Labs
 # Open Source by the terms of the Gnu Public License (GPL3) or higher.
 
-import os, sys, time, subprocess, stat
-from config import conf
+import os
+import stat
+import subprocess
+import sys
+import time
+
+from config import AVR_BITRATE, AVR_DEVICE, AVR_PROGRAMMER, conf
 
 
-def flash_upload(serial_port=conf['serial_port'], resources_dir=conf['rootdir'], firmware=conf['firmware']):
+def flash_upload(
+    serial_port=None,
+    resources_dir=None,
+    firmware=None,
+):
+    # resolve config at call time, not import time (serial_port is only known
+    # after the app connects/auto-detects the port)
+    if serial_port is None:
+        serial_port = conf["serial_port"]
+    if resources_dir is None:
+        resources_dir = conf["rootdir"]
+    if firmware is None:
+        firmware = conf["firmware"]
     firmware = firmware.replace("/", "").replace("\\", "")  # make sure no evil injection
-    FIRMWARE = os.path.join(resources_dir, 'firmware', "firmware.%s.hex" % (firmware))
+    FIRMWARE = os.path.join(resources_dir, "firmware", f"firmware.{firmware}.hex")
 
     if not os.path.exists(FIRMWARE):
         print("ERROR: invalid firmware path")
         print(FIRMWARE)
         return
 
-    if not (conf['hardware'] == 'beaglebone' or conf['hardware'] == 'raspberrypi'):
-        DEVICE = "atmega328p"
-        CLOCK = "16000000"
-        PROGRAMMER = "arduino"
-        BITRATE = "115200"
+    if not (conf["hardware"] == "beaglebone" or conf["hardware"] == "raspberrypi"):
+        DEVICE = AVR_DEVICE
+        PROGRAMMER = AVR_PROGRAMMER
+        BITRATE = AVR_BITRATE
 
         if sys.platform == "darwin":  # OSX
-            AVRDUDEAPP    = os.path.join(resources_dir, "firmware/tools_osx/avrdude")
+            AVRDUDEAPP = os.path.join(resources_dir, "firmware/tools_osx/avrdude")
             AVRDUDECONFIG = os.path.join(resources_dir, "firmware/tools_osx/avrdude.conf")
             # chmod +x
             st = os.stat(AVRDUDEAPP)
             os.chmod(AVRDUDEAPP, st.st_mode | stat.S_IEXEC)
 
-        elif sys.platform == "win32": # Windows
-            AVRDUDEAPP    = os.path.join(resources_dir, 'firmware', "tools_win", "avrdude")
-            AVRDUDECONFIG = os.path.join(resources_dir, 'firmware', "tools_win", "avrdude.conf")
+        elif sys.platform == "win32":  # Windows
+            AVRDUDEAPP = os.path.join(resources_dir, "firmware", "tools_win", "avrdude")
+            AVRDUDECONFIG = os.path.join(resources_dir, "firmware", "tools_win", "avrdude.conf")
 
-        elif sys.platform == "linux" or sys.platform == "linux2":  #Linux
+        elif sys.platform == "linux" or sys.platform == "linux2":  # Linux
             # AVRDUDEAPP    = os.path.join(resources_dir, "/usr/bin/avrdude")
             # AVRDUDECONFIG = os.path.join(resources_dir, "/etc/avrdude.conf")
             # AVRDUDEAPP    = os.path.join(resources_dir, 'firmware', "tools_linux", "avrdude64")
-            AVRDUDEAPP    = os.path.join(resources_dir, 'firmware', "tools_linux", "avrdude")
-            AVRDUDECONFIG = os.path.join(resources_dir, 'firmware', "tools_linux", "avrdude.conf")
+            AVRDUDEAPP = os.path.join(resources_dir, "firmware", "tools_linux", "avrdude")
+            AVRDUDECONFIG = os.path.join(resources_dir, "firmware", "tools_linux", "avrdude.conf")
             # chmod +x
             # st = os.stat(AVRDUDEAPP)
             # os.chmod(AVRDUDEAPP, st.st_mode | stat.S_IEXEC)
 
         # call avrdude, returns 0 on success
-        command = ('%(dude)s -c %(programmer)s -b %(bps)s -P %(port)s -p %(device)s -C %(dudeconf)s -Uflash:w:"%(firmware)s":i'
-            % {'dude':AVRDUDEAPP, 'programmer':PROGRAMMER, 'bps':BITRATE, 'port':serial_port, 'device':DEVICE, 'dudeconf':AVRDUDECONFIG, 'firmware':FIRMWARE})
-
-        print(command)
-        return subprocess.call(command, shell=True)
+        # argv list + shell=False so the config-supplied serial_port/firmware
+        # cannot inject shell commands (and path spaces are handled natively)
+        command = [
+            AVRDUDEAPP,
+            "-c",
+            PROGRAMMER,
+            "-b",
+            BITRATE,
+            "-P",
+            serial_port,
+            "-p",
+            DEVICE,
+            "-C",
+            AVRDUDECONFIG,
+            f"-Uflash:w:{FIRMWARE}:i",
+        ]
+        print(" ".join(command))
+        return subprocess.call(command)
 
         # PROGRAMMER = "avrisp"  # old way, required pressing the reset button
         # os.system('%(dude)s -c %(programmer)s -b %(bps)s -P %(port)s -p %(device)s -C %(dudeconf)s -B 10 -F -U flash:w:%(firmware)s:i'
         #     % {'dude':AVRDUDEAPP, 'programmer':PROGRAMMER, 'bps':BITRATE, 'port':serial_port, 'device':DEVICE, 'dudeconf':AVRDUDECONFIG, 'firmware':FIRMWARE})
 
         # fuse setting taken over from Makefile for reference
-        #os.system('%(dude)s -U hfuse:w:0xd2:m -U lfuse:w:0xff:m' % {'dude':AVRDUDEAPP})
+        # os.system('%(dude)s -U hfuse:w:0xd2:m -U lfuse:w:0xff:m' % {'dude':AVRDUDEAPP})
 
-    elif conf['hardware'] == 'beaglebone' or conf['hardware'] == 'raspberrypi':
+    elif conf["hardware"] == "beaglebone" or conf["hardware"] == "raspberrypi":
         # Make sure you have avrdude installed:
         # beaglebone:
         # opkg install libreadline5_5.2-r8.9_armv4.ipk
@@ -67,62 +96,73 @@ def flash_upload(serial_port=conf['serial_port'], resources_dir=conf['rootdir'],
         # raspberrypi:
         # sudo apt-get install avrdude
 
-        AVRDUDEAPP    = "avrdude"
+        AVRDUDEAPP = "avrdude"
         AVRDUDECONFIG = "/etc/avrdude.conf"
         SERIAL_PORT = serial_port
-        DEVICE = "atmega328p"
-        PROGRAMMER = "arduino"    # use this for bootloader
-        SERIAL_OPTION = '-P %(port)s' % {'port':SERIAL_PORT}
-        BITRATE = "115200"
+        DEVICE = AVR_DEVICE
+        PROGRAMMER = AVR_PROGRAMMER  # use this for bootloader
+        BITRATE = AVR_BITRATE
 
-        command = ('"%(dude)s" -c %(programmer)s -b %(bps)s %(serial_option)s -p %(device)s -C "%(dudeconf)s" -Uflash:w:"%(product)s":i' %
-                  {'dude':AVRDUDEAPP, 'programmer':PROGRAMMER, 'bps':BITRATE, 'serial_option':SERIAL_OPTION, 'device':DEVICE, 'dudeconf':AVRDUDECONFIG, 'product':FIRMWARE})
+        command = [
+            AVRDUDEAPP,
+            "-c",
+            PROGRAMMER,
+            "-b",
+            BITRATE,
+            "-P",
+            SERIAL_PORT,
+            "-p",
+            DEVICE,
+            "-C",
+            AVRDUDECONFIG,
+            f"-Uflash:w:{FIRMWARE}:i",
+        ]
 
         ### Trigger the atmega328's reset pin to invoke bootloader
 
-        if conf['hardware'] == 'beaglebone':
+        if conf["hardware"] == "beaglebone":
             print("Flashing from BeagleBone ...")
             # The reset pin is connected to GPIO2_7 (2*32+7 = 71).
             # Setting it to low triggers a reset.
             # echo 71 > /sys/class/gpio/export
             try:
-                fw = file("/sys/class/gpio/export", "w")
-                fw.write("%d" % (71))
-                fw.close()
-                fwb = file("/sys/class/gpio/export", "w")
-                fwb.write("%d" % (73))
-                fwb.close()
-            except IOError:
+                with open("/sys/class/gpio/export", "w") as fw:
+                    fw.write(f"{71:d}")
+                with open("/sys/class/gpio/export", "w") as fwb:
+                    fwb.write(f"{73:d}")
+            except OSError:
                 # probably already exported
                 pass
             # set the gpio pin to output
             # echo out > /sys/class/gpio/gpio71/direction
-            fw = file("/sys/class/gpio/gpio71/direction", "w")
-            fw.write("out")
-            fw.close()
-            fwb = file("/sys/class/gpio/gpio73/direction", "w")
-            fwb.write("out")
-            fwb.close()
+            with open("/sys/class/gpio/gpio71/direction", "w") as fw:
+                fw.write("out")
+            with open("/sys/class/gpio/gpio73/direction", "w") as fwb:
+                fwb.write("out")
             # set the gpio pin low -> high
             # echo 1 > /sys/class/gpio/gpio71/value
-            fw = file("/sys/class/gpio/gpio71/value", "w")
-            fw.write("0")
-            fw.flush()
-            fwb = file("/sys/class/gpio/gpio73/value", "w")
-            fwb.write("0")
-            fwb.flush()
-            time.sleep(0.5)
-            fw.write("1")
-            fw.flush()
-            fw.close()
-            fwb.write("1")
-            fwb.flush()
-            fwb.close()
-            time.sleep(0.1)
-        elif conf['hardware'] == 'raspberrypi':
+            with (
+                open("/sys/class/gpio/gpio71/value", "w") as fw,
+                open("/sys/class/gpio/gpio73/value", "w") as fwb,
+            ):
+                fw.write("0")
+                fw.flush()
+                fwb.write("0")
+                fwb.flush()
+                time.sleep(0.5)
+
+                fw.write("1")
+                fw.flush()
+                fwb.write("1")
+                fwb.flush()
+                time.sleep(0.1)
+
+        elif conf["hardware"] == "raspberrypi":
             print("Flashing from Raspberry Pi ...")
             import _thread
+
             import RPi.GPIO as GPIO
+
             def trigger_reset():
                 GPIO.setmode(GPIO.BCM)  # use chip pin number
                 pinReset = 2
@@ -131,6 +171,7 @@ def flash_upload(serial_port=conf['serial_port'], resources_dir=conf['rootdir'],
                 time.sleep(0.8)
                 GPIO.output(pinReset, GPIO.HIGH)
                 time.sleep(0.1)
+
             _thread.start_new_thread(trigger_reset, ())
             # GPIO.setmode(GPIO.BCM)  # use chip pin number
             # pinReset = 2
@@ -140,43 +181,44 @@ def flash_upload(serial_port=conf['serial_port'], resources_dir=conf['rootdir'],
             # GPIO.output(pinReset, GPIO.HIGH)
             # time.sleep(0.1)
 
-        print(command)
-        return subprocess.call(command, shell=True)
+        print(" ".join(command))
+        return subprocess.call(command)
 
 
 def reset_atmega():
     print("Resetting Atmega ...")
-    if conf['hardware'] == 'beaglebone':
+    if conf["hardware"] == "beaglebone":
         try:
-            fw = file("/sys/class/gpio/export", "w")
-            fw.write("%d" % (71))
-            fw.close()
-            fwb = file("/sys/class/gpio/export", "w")
-            fwb.write("%d" % (73))
-            fwb.close()
-        except IOError:
+            with open("/sys/class/gpio/export", "w") as fw:
+                fw.write(f"{71:d}")
+            with open("/sys/class/gpio/export", "w") as fwb:
+                fwb.write(f"{73:d}")
+        except OSError:
             pass
-        fw = file("/sys/class/gpio/gpio71/direction", "w")
-        fw.write("out")
-        fw.close()
-        fwb = file("/sys/class/gpio/gpio73/direction", "w")
-        fwb.write("out")
-        fwb.close()
-        fw = file("/sys/class/gpio/gpio71/value", "w")
-        fw.write("0")
-        fw.flush()
-        fwb = file("/sys/class/gpio/gpio73/value", "w")
-        fwb.write("0")
-        fwb.flush()
-        time.sleep(0.2)
-        fw.write("1")
-        fw.flush()
-        fw.close()
-        fwb.write("1")
-        fwb.flush()
-        fwb.close()
-    elif conf['hardware'] == 'raspberrypi':
+
+        with open("/sys/class/gpio/gpio71/direction", "w") as fw:
+            fw.write("out")
+        with open("/sys/class/gpio/gpio73/direction", "w") as fwb:
+            fwb.write("out")
+
+        with (
+            open("/sys/class/gpio/gpio71/value", "w") as fw,
+            open("/sys/class/gpio/gpio73/value", "w") as fwb,
+        ):
+            fw.write("0")
+            fw.flush()
+            fwb.write("0")
+            fwb.flush()
+            time.sleep(0.2)
+
+            fw.write("1")
+            fw.flush()
+            fwb.write("1")
+            fwb.flush()
+
+    elif conf["hardware"] == "raspberrypi":
         import RPi.GPIO as GPIO
+
         GPIO.setmode(GPIO.BCM)  # use chip pin number
         pinReset = 2
         GPIO.setup(pinReset, GPIO.OUT)
@@ -185,7 +227,7 @@ def reset_atmega():
         GPIO.output(pinReset, GPIO.HIGH)
     else:
         print("ERROR: forced reset only possible on beaglebone and raspberrypi")
-        raise IOError
+        raise OSError
 
 
 def usb_reset_hack():
@@ -194,11 +236,23 @@ def usb_reset_hack():
     # fails after replugging the usb arduino. It seems strictly related
     # to the USB stack on the Linux dev machine (possibly also on OSX or Win).
     # Note: This should be irrelevant on the Lasersaur/BBB.
-    command = "avrdude -p atmega328p -P "+conf['serial_port']+" -c arduino -U flash:r:flash.bin:r -q -q"
-    return subprocess.call(command, shell=True)
+    command = [
+        "avrdude",
+        "-p",
+        AVR_DEVICE,
+        "-P",
+        conf["serial_port"],
+        "-c",
+        AVR_PROGRAMMER,
+        "-U",
+        "flash:r:flash.bin:r",
+        "-q",
+        "-q",
+    ]
+    return subprocess.call(command)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     ret = flash_upload()
     if ret != 0:
         print("ERROR: flash failed")

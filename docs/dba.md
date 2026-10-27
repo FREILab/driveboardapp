@@ -40,10 +40,10 @@ Complete File Description
           "feedrate": 2000,      # optional, rate to other vertices
           "intensity": 100,      # optional, default: 0 (in percent)
           "seekzero": False,     # optional, default: True
-          "pierce_time": 0,      # optional, default: 0
+          "pierce_time": 0,      # optional, default: conf pierce_time
           "pxsize": 0.4,         # optional
-          "air_assist": "pass",  # optional (feed, pass, off), default: pass
-          "aux_assist": "off",   # optional (feed, pass, off), default: off
+          "air_assist": "pass",  # optional (off, feed, pass, job), default: pass
+          "aux_assist": "off",   # optional (off, feed, pass, job), default: off
       }
   ],
  "items": [
@@ -52,8 +52,9 @@ Complete File Description
  "defs": [
     {"kind":"path", "data":[[[0,10,0]]]},               # data is a list of polylines
     {"kind":"fill", "data":[[[0,10,0]]], "pxsize":0.4},
-    {"kind":"image", "data":<data in base64>, "pos":[0,0], "size":[300,200]},
+    {"kind":"image", "data":<data in base64>, "pos":[0,0], "size":[300,200], "source":<hash of pre-clip data>},  # source is optional
  ],
+ "sources": {<hash>: <pre-clip data in base64>},   # optional, original data of clipped images for previews
  "stats":{"items":[{"bbox":[x1,y1,x2,y2], "len":100}], "all":{}}   # optional
 }
 ```

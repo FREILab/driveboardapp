@@ -68,6 +68,7 @@ have enough bandwidth. It beats checksums in our case.
 #include <stdint.h>
 #include <stdlib.h>
 #include <avr/pgmspace.h>
+#include <util/atomic.h>
 #include "protocol.h"
 #include "config.h"
 #include "serial.h"
@@ -173,11 +174,11 @@ inline void on_cmd(uint8_t command) {
       break;
     case CMD_LINE:
       planner_line( st.target[X_AXIS], st.target[Y_AXIS], st.target[Z_AXIS],
-        st.feedrate, st.intensity, 0.0 );
+                    st.feedrate, st.intensity, 0.0 );
       break;
     case CMD_RASTER:
-        planner_line( st.target[X_AXIS], st.target[Y_AXIS], st.target[Z_AXIS],
-                      st.feedrate, st.intensity, st.pixel_width );
+      planner_line( st.target[X_AXIS], st.target[Y_AXIS], st.target[Z_AXIS],
+                    st.feedrate, st.intensity, st.pixel_width );
       break;
     case CMD_DWELL:
       planner_dwell(st.duration, st.intensity);
@@ -233,7 +234,6 @@ inline void on_cmd(uint8_t command) {
 }
 
 
-
 inline void on_param(uint8_t parameter) {
   double val;
   if(pdata.count == PARAM_MAX_DATA_LENGTH) {
@@ -261,17 +261,28 @@ inline void on_param(uint8_t parameter) {
         }
         break;
       // def motion params
+      // Values arrive as a double spanning the whole 28bit wire range. Bound
+      // them before they reach the narrower types they are stored in, where
+      // an out of range value is undefined behavior rather than a wrap.
       case PARAM_FEEDRATE:
-        st.feedrate = get_curent_value();
+        val = get_curent_value();
+        if (val < MINIMUM_FEEDRATE) { val = MINIMUM_FEEDRATE; }
+        st.feedrate = val;
         break;
       case PARAM_INTENSITY:
-        st.intensity = get_curent_value();
+        val = get_curent_value();
+        if (val < 0.0) { val = 0.0; } else if (val > 255.0) { val = 255.0; }
+        st.intensity = (uint8_t)val;
         break;
       case PARAM_DURATION:
-        st.duration = get_curent_value();
+        val = get_curent_value();
+        if (val < 0.0) { val = 0.0; } else if (val > MAXIMUM_DWELL_SECONDS) { val = MAXIMUM_DWELL_SECONDS; }
+        st.duration = val;
         break;
       case PARAM_PIXEL_WIDTH:
-        st.pixel_width = get_curent_value();
+        val = get_curent_value();
+        if (val < 0.0) { val = 0.0; }
+        st.pixel_width = val;
         break;
       // def offset
       case PARAM_OFFSET_X:
@@ -320,8 +331,12 @@ inline void protocol_request_superstatus() {
 
 
 inline void protocol_mark_underrun() {
-  rx_buffer_underruns += 1;
-  rx_buffer_underruns_reported = false;
+  // called from both the stepper ISR and the main loop; the 16-bit increment
+  // is a read-modify-write, so guard it (RESTORESTATE: safe in ISR context)
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    rx_buffer_underruns += 1;
+    rx_buffer_underruns_reported = false;
+  }
 }
 
 
@@ -385,6 +400,9 @@ inline void protocol_idle() {
     }
     if (SENSE_CHILLER_OFF) {
       serial_write(INFO_CHILLER_OFF);
+    }
+    if (stepper_is_paused()) {
+      serial_write(INFO_PAUSED);
     }
 
     // Handle STOPERROR conditions
@@ -465,7 +483,7 @@ inline double get_curent_value() {
   //// char2 = ((num&(127<<14))>>14)+128
   //// char3 = ((num&(127<<21))>>21)+128
   return ((((pdata.chars[3]-128L)*2097152L +  // 2097152 = 128*128*128
-            (pdata.chars[2]-128L)*16384L +   //   16384 = 128*128
+            (pdata.chars[2]-128L)*16384L +    //   16384 = 128*128
             (pdata.chars[1]-128L)*128L +
             (pdata.chars[0]-128L))-134217728L ) / 1000.0);  // 134217728 = 2**27
 }

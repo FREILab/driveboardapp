@@ -1,5 +1,0 @@
-requests==2.32.3
-bottle==0.12.25
-Pillow==10.4.0
-PyInstaller==6.10.0
-pyserial==3.5

@@ -26,6 +26,8 @@
 #define CMD_STATUS 3
 #define CMD_SUPERSTATUS 4
 #define CMD_CHUNK_PROCESSED 5
+#define CMD_UNPAUSE 7
+#define CMD_PAUSE 8
 #define CMD_RASTER_DATA_START 16
 #define CMD_RASTER_DATA_END 17
 #define STATUS_END 6
@@ -62,6 +64,12 @@
 #define PARAM_OFFSET_Y 'i'
 #define PARAM_OFFSET_Z 'j'
 
+// Bounds applied to incoming motion params, matched by the host. A feed rate
+// at or below zero reaches the planner as a zero or wrapped step rate, and a
+// dwell holds the beam on in one spot for its whole duration.
+#define MINIMUM_FEEDRATE 0.1              // mm/min
+#define MAXIMUM_DWELL_SECONDS 10.0
+
 
 // status: error markers
 #define STOPERROR_OK ' '
@@ -81,12 +89,14 @@
 #define STOPERROR_INVALID_COMMAND '<'
 #define STOPERROR_INVALID_PARAMETER '>'
 #define STOPERROR_TRANSMISSION_ERROR '='
+#define STOPERROR_SERIAL_WATCHDOG ';'
 
 
 // status: info markers
 #define INFO_IDLE_YES 'A'
 #define INFO_DOOR_OPEN 'B'
 #define INFO_CHILLER_OFF 'C'
+#define INFO_PAUSED 'D'
 
 // status:  info params
 #define INFO_POS_X 'x'
@@ -106,7 +116,7 @@
 #define INFO_INTENSITY 'h'
 #define INFO_DURATION 'i'
 #define INFO_PIXEL_WIDTH 'j'
-
+#define INFO_DEBUG 'k'
 
 
 // Initialize the parser.

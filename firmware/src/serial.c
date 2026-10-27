@@ -24,11 +24,14 @@
 #include <util/atomic.h>
 #include <avr/sleep.h>
 #include <avr/pgmspace.h>
+#include <avr/wdt.h>
 #include <math.h>
 #include "serial.h"
 #include "config.h"
 #include "stepper.h"
+#include "sense_control.h"
 #include "protocol.h"
+#include "planner.h"
 
 
 
@@ -59,8 +62,8 @@ uint8_t data_prev = 0;
 bool buffer_underrun_marked = false;
 
 #define RX_CHUNK_SIZE 16
-volatile bool notify_chunk_processed = false;
-uint8_t rx_buffer_processed = 0;
+volatile uint8_t chunks_processed = 0;
+volatile uint8_t rx_buffer_processed = 0;
 
 volatile bool raster_mode = false;
 volatile bool consume_data = false;
@@ -92,6 +95,22 @@ void serial_init() {
 	// defaults to 8-bit, no parity, 1 stop bit
 
   serial_write(INFO_HELLO);
+
+  // Serial watchdog. If the host stops talking mid-job (process died, USB
+  // unplugged, host serial thread hung) the firmware would otherwise keep
+  // executing buffered motion with the beam firing. The watchdog timer is
+  // reset on every received byte (USART_RX_vect); the host polls status at
+  // least every 0.4s, so a 1s timeout leaves margin without false trips. On
+  // timeout ISR(WDT_vect) kills the beam, and stops the machine when it has
+  // motion in progress. We use INTERRUPT mode (not system-reset mode) so
+  // position is kept and the host can resume cleanly on reconnect.
+  cli();
+  wdt_reset();
+  MCUSR &= ~(1 << WDRF);              // clear any stale watchdog-reset flag
+  WDTCSR |= (1 << WDCE) | (1 << WDE); // open the timed configuration window
+  WDTCSR = (1 << WDIE)               // interrupt mode (WDE=0 -> no MCU reset)
+         | (1 << WDP2) | (1 << WDP1); // 1s timeout (WDP[3:0]=0b0110)
+  sei();
 }
 
 void serial_stop() {
@@ -135,9 +154,9 @@ inline void serial_write_param(uint8_t param, double val) {
 SIGNAL(USART_UDRE_vect) {
   uint8_t tail = tx_buffer_tail;  // optimize for volatile
 
-  if (notify_chunk_processed) {
+  if (chunks_processed > 0) {
     UDR0 = CMD_CHUNK_PROCESSED ;
-    notify_chunk_processed = false;
+    chunks_processed--;
   } else {                    // Send a byte from the buffer
     UDR0 = tx_buffer[tail];
     if (++tail == TX_BUFFER_SIZE) {tail = 0;}  // increment
@@ -153,20 +172,46 @@ inline uint8_t serial_read() {
   // return data, advance tail
   uint8_t data = rx_buffer[rx_buffer_tail];
   if (++rx_buffer_tail == RX_BUFFER_SIZE) {rx_buffer_tail = 0;}  // increment
-  // ATOMIC_BLOCK(ATOMIC_FORCEON) {
+  // Called from both the main loop and the stepper ISR (serial_raster_read),
+  // so this chunk counting must be atomic; otherwise the ISR drops a boundary
+  // mid-increment, fewer CMD_CHUNK_PROCESSED are sent than bytes consumed, and
+  // the host deadlocks mid raster. RESTORESTATE (not FORCEON) keeps interrupts
+  // disabled on exit when called from within the ISR.
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     rx_buffer_processed++;
-    if (rx_buffer_processed == RX_CHUNK_SIZE) {
-      notify_chunk_processed = true;
+    if (rx_buffer_processed >= RX_CHUNK_SIZE) {
+      chunks_processed++;
       UCSR0B |=  (1 << UDRIE0);  // enable tx interrupt
       rx_buffer_processed = 0;
     }
-  // }
+  }
   return data;
+}
+
+
+// serial watchdog timeout: the host has gone silent. Force a safe state.
+// Zero the beam directly (in static-PWM mode an idle machine can hold the beam
+// on and the stepper ISR may not be running to act). Re-arm WDIE to stay in
+// interrupt mode.
+// The stop is raised only when there is motion to halt: blocks queued, the
+// stepper running, unread rx data, or a raster stream open. This is the same
+// idle test protocol.c reports INFO_IDLE_YES on. An idle machine has nothing
+// to run away, and a host that is merely busy rather than gone would otherwise
+// cost the operator a stop and a re-home. The beam stays off either way, and
+// the check repeats every second for as long as the silence lasts.
+ISR(WDT_vect) {
+  control_laser_intensity(0);
+  if (stepper_processing() || planner_blocks_available()
+      || serial_data_available() || raster_mode) {
+    stepper_request_stop(STOPERROR_SERIAL_WATCHDOG);
+  }
+  WDTCSR |= (1 << WDIE);
 }
 
 
 // rx interrupt, called whenever a new byte is in UDR0
 SIGNAL(USART_RX_vect) {
+  wdt_reset();  // a byte arrived: host is alive, reset the watchdog timer
   uint8_t data = UDR0;
   // transmission error check
   if (first_transmission) {  // ignore data
@@ -177,6 +222,7 @@ SIGNAL(USART_RX_vect) {
     first_transmission = true;
     if (data != data_prev) {
       stepper_request_stop(STOPERROR_TRANSMISSION_ERROR);
+      return;  // discard the corrupt byte, don't act on it
     }
   }
   // handle char
@@ -191,6 +237,14 @@ SIGNAL(USART_RX_vect) {
       rx_buffer_head = rx_buffer_tail = 0;  // reset rx buffer
       rx_buffer_processed = 0;
       stepper_stop_resume();
+    } else if (data == CMD_PAUSE) {
+      // freeze immediately (beam off), retaining buffer/position; bypasses the
+      // rx buffer so it takes effect even while data is queued
+      stepper_request_pause();
+    } else if (data == CMD_UNPAUSE) {
+      // resume from a pause WITHOUT touching the rx buffer, so retained
+      // in-flight data (e.g. the rest of a raster line) keeps streaming
+      stepper_clear_pause();
     } else if (data == CMD_STATUS) {
       protocol_request_status();
     } else if (data == CMD_SUPERSTATUS) {
@@ -217,11 +271,19 @@ inline uint8_t serial_protocol_read() {
   // called from protocol loop
   while (raster_mode) {
     // Block while in raster mode.
-    // In this mode the serial inerrupt provides data
+    // In this mode the serial interrupt provides data
     // in the rx_buffer which get directly consumed
     // by the stepper interrupt.
     // sleep_mode();  // sleep a tiny bit
+    if (!consume_data && !stepper_processing() && !planner_blocks_available()) {
+      // No block will read this line. The planner drops any raster move
+      // shorter than a step, so the one that should have consumed it was
+      // never queued. Draining here keeps the rx buffer moving, which is
+      // what paces the host.
+      serial_consume_data();
+    }
     if (consume_data) {
+      // If the stepper reaches the end of a block, we consume/ignore all following raster data in the line
       // wait, buffer empty
       buffer_underrun_marked = false;
       while (rx_buffer_tail == rx_buffer_head) {
@@ -238,6 +300,7 @@ inline uint8_t serial_protocol_read() {
         raster_mode = false;
       }
     }
+
     protocol_idle();
   }
   // wait, buffer empty

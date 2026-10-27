@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "driveboardapp"
+version = "26.08.2"
+description = "Control software for Driveboard-based CNC machines like Lasersaur"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "bottle>=0.12.16",
+    "pillow>=9.1",
+    "pyserial>=3.4",
+    "dxfgrabber>=1.0",
+    "requests>=2.21.0",
+    "fonttools>=4.60.0",
+]
+
+[project.optional-dependencies]
+visualization = ["PyGObject>=3.42.0"]
+raspberrypi = ["RPi.GPIO>=0.7.0"]
+text = ["skia-pathops>=0.8.0"]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=3.5",
+    "pre-commit>=4.0.0",
+    "ruff>=0.8.0",
+    "pytest>=8.0.0",
+    "webtest>=3.0.0",
+    "coverage>=7.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["backend"]
+omit = [
+    "*/tests/*",
+    # vendored, not ours to cover
+    "*/jobimport/png.py",
+    "*/jobimport/webcolors.py",
+    "*/jobimport/dxfgrabber/*",
+]
+
+[tool.coverage.report]
+skip_empty = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["backend"]

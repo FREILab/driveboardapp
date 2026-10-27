@@ -4,8 +4,13 @@
 # Copyright (c) 2011 Nortd Labs
 # Open Source by the terms of the Gnu Public License (GPL3) or higher.
 
-import os, sys, subprocess, shutil, glob
-from config import conf
+import glob
+import os
+import shutil
+import subprocess
+import sys
+
+from config import AVR_CLOCK, AVR_DEVICE, conf
 
 # Make sure you have the Arduino IDE installed (we've tested this on 022 and newer).
 # While build.py does not use the IDE directly it makes use of its tool chain.
@@ -13,29 +18,29 @@ from config import conf
 # Please verify the following locations are correct for you platform:
 
 if sys.platform == "darwin":  # OSX
-    AVRDUDEAPP    = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/bin/avrdude"
-    AVRGCCAPP     = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/bin/avr-gcc"
+    AVRDUDEAPP = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/bin/avrdude"
+    AVRGCCAPP = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/bin/avr-gcc"
     AVROBJCOPYAPP = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/bin/avr-objcopy"
-    AVRSIZEAPP    = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/bin/avr-size"
+    AVRSIZEAPP = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/bin/avr-size"
     AVROBJDUMPAPP = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/bin/avr-objdump"
     AVRDUDECONFIG = "/Applications/Arduino.app/Contents/Java/hardware/tools/avr/etc/avrdude.conf"
 
-elif sys.platform == "win32": # Windows
-    AVRDUDEAPP    = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avrdude"
-    AVRGCCAPP     = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avr-gcc"
-    AVROBJCOPYAPP = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avr-objcopy"
-    AVRSIZEAPP    = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avr-size"
-    AVROBJDUMPAPP = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\bin\\avr-objdump"
-    AVRDUDECONFIG = "C:\\\"Program Files (x86)\"\\Arduino\\hardware\\tools\\avr\\etc\\avrdude.conf"
+elif sys.platform == "win32":  # Windows
+    _avrbin = "C:\\Program Files (x86)\\Arduino\\hardware\\tools\\avr\\bin"
+    AVRDUDEAPP = os.path.join(_avrbin, "avrdude")
+    AVRGCCAPP = os.path.join(_avrbin, "avr-gcc")
+    AVROBJCOPYAPP = os.path.join(_avrbin, "avr-objcopy")
+    AVRSIZEAPP = os.path.join(_avrbin, "avr-size")
+    AVROBJDUMPAPP = os.path.join(_avrbin, "avr-objdump")
+    AVRDUDECONFIG = "C:\\Program Files (x86)\\Arduino\\hardware\\tools\\avr\\etc\\avrdude.conf"
 
-elif sys.platform == "linux" or sys.platform == "linux2":  #Linux
-    AVRDUDEAPP    = "avrdude"
-    AVRGCCAPP     = "avr-gcc"
+elif sys.platform == "linux" or sys.platform == "linux2":  # Linux
+    AVRDUDEAPP = "avrdude"
+    AVRGCCAPP = "avr-gcc"
     AVROBJCOPYAPP = "avr-objcopy"
-    AVRSIZEAPP    = "avr-size"
+    AVRSIZEAPP = "avr-size"
     AVROBJDUMPAPP = "avr-objdump"
     AVRDUDECONFIG = "/etc/avrdude.conf"
-
 
 
 # =============================================================================
@@ -46,8 +51,8 @@ def build_all():
     """Build firmwares for all config files.
     Each config.*.h becomes a firmware called firmware.*.hex
     """
-    firmware_dir = os.path.join(conf['rootdir'], 'firmware')
-    source_dir = os.path.join(firmware_dir, 'src')
+    firmware_dir = os.path.join(conf["rootdir"], "firmware")
+    source_dir = os.path.join(firmware_dir, "src")
     # set cwd
     cwd_temp = os.getcwd()
     os.chdir(source_dir)
@@ -56,25 +61,24 @@ def build_all():
 
     ret = 0
     for config_file in config_files:
-        hardware_designator = config_file.split('.')[1:-1][0]
+        hardware_designator = config_file.split(".")[1:-1][0]
         # activate
-        shutil.copy('config.h', '~config.h')
-        shutil.copy(config_file, 'config.h')
+        shutil.copy("config.h", "~config.h")
+        shutil.copy(config_file, "config.h")
         try:
-            firmware_name = "firmware.%s" % (hardware_designator)
-            print("INFO: building for %s" % (config_file))
+            firmware_name = f"firmware.{hardware_designator}"
+            print(f"INFO: building for {config_file}")
             # buid
             r = build_firmware(firmware_name)
             if r != 0:
                 ret = 1
         finally:
             # revert config.h
-            if os.path.exists('~config.h'):
-                shutil.move('~config.h', 'config.h')
+            if os.path.exists("~config.h"):
+                shutil.move("~config.h", "config.h")
     # restore cwd
     os.chdir(cwd_temp)
     return ret
-
 
 
 def build_firmware(firmware_name="DriveboardFirmware"):
@@ -85,36 +89,39 @@ def build_firmware(firmware_name="DriveboardFirmware"):
     """
     ret = 0
 
-    firmware_dir = os.path.join(conf['rootdir'], 'firmware')
-    source_dir = os.path.join(firmware_dir, 'src')
+    firmware_dir = os.path.join(conf["rootdir"], "firmware")
+    source_dir = os.path.join(firmware_dir, "src")
 
     cwd_temp = os.getcwd()
     os.chdir(source_dir)
 
-    DEVICE = "atmega328p"
-    CLOCK = "16000000"
+    DEVICE = AVR_DEVICE
+    CLOCK = AVR_CLOCK
     BUILDNAME = firmware_name
-    OBJECTS  = ["main", "serial", "protocol", "planner", "sense_control", "stepper"]
+    OBJECTS = ["main", "serial", "protocol", "planner", "sense_control", "stepper"]
 
-    COMPILE = AVRGCCAPP + " -Wall -Os -DF_CPU=" + CLOCK + " -mmcu=" + DEVICE + " -I. -ffunction-sections" + " --std=c99"
-    # COMPILE = AVRGCCAPP + " -Wall -O3 -DF_CPU=" + CLOCK + " -mmcu=" + DEVICE + " -I. -ffunction-sections" + " --std=c99"
+    # argv lists + shell=False: paths with spaces work natively, no injection
+    COMPILE = [
+        AVRGCCAPP,
+        "-Wall",
+        "-Os",
+        f"-DF_CPU={CLOCK}",
+        f"-mmcu={DEVICE}",
+        "-I.",
+        "-ffunction-sections",
+        "--std=c99",
+    ]
 
     for fileobj in OBJECTS:
-        command = '%(compile)s -c %(obj)s.c -o %(obj)s.o' % {'compile': COMPILE, 'obj':fileobj}
-        ret += subprocess.call(command, shell=True)
+        ret += subprocess.call(COMPILE + ["-c", f"{fileobj}.c", "-o", f"{fileobj}.o"])
 
-    command = '%(compile)s -o main.elf %(alldoto)s  -lm' % {'compile': COMPILE, 'alldoto':".o ".join(OBJECTS)+'.o'}
-    ret += subprocess.call(command, shell=True)
+    ret += subprocess.call(COMPILE + ["-o", "main.elf"] + [f"{o}.o" for o in OBJECTS] + ["-lm"])
 
-    command = '%(objcopy)s -j .text -j .data -O ihex main.elf %(product)s.hex' % {'objcopy': AVROBJCOPYAPP, 'obj':fileobj, 'product':BUILDNAME}
-    ret += subprocess.call(command, shell=True)
+    ret += subprocess.call(
+        [AVROBJCOPYAPP, "-j", ".text", "-j", ".data", "-O", "ihex", "main.elf", f"{BUILDNAME}.hex"]
+    )
 
-    # command = '%(size)s *.hex *.elf *.o' % {'size':AVRSIZEAPP}
-    command = '%(size)s --mcu=%(mcu)s --format=avr main.elf' % {'size':AVRSIZEAPP, 'mcu':DEVICE}
-    ret += subprocess.call(command, shell=True)
-
-    # command = '%(objdump)s -t -j .bss main.elf' % {'objdump':AVROBJDUMPAPP}
-    # ret += subprocess.call(command, shell=True)
+    ret += subprocess.call([AVRSIZEAPP, f"--mcu={DEVICE}", "--format=avr", "main.elf"])
 
     if ret != 0:
         return "Error: failed to build"
@@ -123,24 +130,24 @@ def build_firmware(firmware_name="DriveboardFirmware"):
         ## clean after upload
         print("Cleaning up build files.")
         for fileobj in OBJECTS:
-            f = '%s.o' % (fileobj)
+            f = f"{fileobj}.o"
             if os.path.isfile(f):
                 os.remove(f)
-        if os.path.isfile('main.elf'):
-            os.remove('main.elf')
+        if os.path.isfile("main.elf"):
+            os.remove("main.elf")
 
         ## move firmware hex file
         print("Moving firmware to standard location.")
-        firmware_src = firmware_name+'.hex'
+        firmware_src = firmware_name + ".hex"
         firmware_dst = os.path.join(firmware_dir, firmware_src)
         shutil.move(firmware_src, firmware_dst)
         print(firmware_dst)
     finally:
-        #restore previous cwd
+        # restore previous cwd
         os.chdir(cwd_temp)
 
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     build_all()

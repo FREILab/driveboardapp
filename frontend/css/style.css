@@ -132,6 +132,11 @@ div.log_error {
   padding-bottom:2px;
 }
 
+.pass_entry_highlight {
+  outline: 2px solid #0084ff;
+  outline-offset: 1px;
+}
+
 .material {
   padding: 12px;  
 }

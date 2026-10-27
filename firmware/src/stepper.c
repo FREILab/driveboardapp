@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <util/delay.h>
 #include <avr/interrupt.h>
+#include <util/atomic.h>
 #include <string.h>
 #include "stepper.h"
 #include "config.h"
@@ -56,11 +57,17 @@
 
 
 #define CYCLES_PER_MINUTE (60*F_CPU)  // 960000000
+#define CYCLES_PER_SECOND (F_CPU)     // 16000000
 #define CYCLES_PER_MICROSECOND (F_CPU/1000000)  //16000000/1000000 = 16
 #define CYCLES_PER_ACCELERATION_TICK (F_CPU/ACCELERATION_TICKS_PER_SECOND)  // 16MHz/100 = 160000
 
+#define DWELL_RATE (1000*60L) // 60000 steps/min for 1 millisecond dwell resolution
+
 
 static int32_t stepper_position[3];  // real-time position in absolute steps
+// Updated byte-wise by the TIMER1 stepper ISR; the main loop accesses it only
+// via ATOMIC_BLOCK below (cli/sei + memory barrier gives a tear-free, fresh
+// read) so it doesn't need to be volatile and stays fast in the stepper ISR.
 static block_t *current_block;  // A pointer to the block currently being traced
 
 // Variables used by The Stepper Driver Interrupt
@@ -70,6 +77,7 @@ static int32_t counter_x,       // Counter variables for the bresenham line trac
                counter_z;
 static uint32_t step_events_completed; // The number of step events executed in the current block
 static uint32_t next_pixel_at_steps;
+static uint8_t raster_pixel_intensity; // last latched pixel, at nominal speed
 static volatile bool busy;  // true when stepper ISR is in already running
 
 // Variables used by the trapezoid generation
@@ -80,13 +88,20 @@ static uint32_t adjusted_rate;                // The current rate of step_events
 static volatile bool processing_flag;         // indicates if blocks are being processed
 static volatile bool stop_requested;          // when set to true stepper interrupt will go idle on next entry
 static volatile uint8_t stop_status;          // yields the reason for a stop request
+static volatile bool paused;                  // when set, stepping is frozen (beam off) but block buffer/position are retained, so motion can resume exactly
+static volatile uint8_t resume_state;         // 0 none, 1 ramp requested, 2 ramping. eases the speed back up after a pause
+static uint32_t resume_rate_target;           // rate to ramp back up to when resuming from a pause
 static volatile uint8_t disable_limits;       // option to disable limts for homing cycle
 
 #if PWM_MODE == SYNCED_FREQ
   static volatile uint8_t pwm_counter = 1;
 #endif
 
+static int32_t dwell_cycles;
+static uint32_t dwell_counter = 0;
+
 // prototypes for static functions (non-accesible from other files)
+static void adjust_laser_speed_beam_dynamics( uint32_t adjusted_rate );
 static bool acceleration_tick();
 static void adjust_speed( uint32_t steps_per_minute );
 static void adjust_beam_dynamics( uint32_t steps_per_minute );
@@ -152,6 +167,10 @@ void stepper_start_processing() {
 void stepper_stop_processing() {
   processing_flag = false;
   current_block = NULL;
+  // A dwell only clears its own progress when it runs to completion, so
+  // abandoning one part way would carry the remaining count into the next
+  // dwell, which would then burn for the wrong time at the wrong tick rate.
+  dwell_counter = 0;
   // Disable stepper driver interrupt
   TIMSK1 &= ~(1<<OCIE1A);
   control_laser_intensity(0);
@@ -167,6 +186,12 @@ void stepper_request_stop(uint8_t status) {
   if (!stop_requested) {  // prevent retriggering
     stop_status = status;
     stop_requested = true;
+    paused = false;  // a stop overrides a pause
+    // Assists are switched through the planner, so the queued disable block is
+    // thrown away with the rest of the buffer and they would stay energised
+    // for good. Drive them directly, the way the beam is.
+    control_air_assist(false);
+    control_aux_assist(false);
     serial_stop();
   }
 }
@@ -182,24 +207,50 @@ bool stepper_stop_requested() {
 void stepper_stop_resume() {
   stop_status = STOPERROR_OK;
   stop_requested = false;
+  paused = false;  // a full resume also clears a pause
+}
+
+void stepper_request_pause() {
+  paused = true;
+}
+
+void stepper_clear_pause() {
+  if (paused) {
+    resume_state = 1;  // ramp the speed back up on resume
+  }
+  paused = false;
+}
+
+bool stepper_is_paused() {
+  return paused;
 }
 
 
 
 
+// stepper_position is updated byte-wise by the TIMER1 stepper ISR, so a 32-bit
+// read/write from the main loop can tear; snapshot under ATOMIC_RESTORESTATE.
 double stepper_get_position_x() {
-  return stepper_position[X_AXIS]/CONFIG_X_STEPS_PER_MM;
+  int32_t pos;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { pos = stepper_position[X_AXIS]; }
+  return pos/CONFIG_X_STEPS_PER_MM;
 }
 double stepper_get_position_y() {
-  return stepper_position[Y_AXIS]/CONFIG_Y_STEPS_PER_MM;
+  int32_t pos;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { pos = stepper_position[Y_AXIS]; }
+  return pos/CONFIG_Y_STEPS_PER_MM;
 }
 double stepper_get_position_z() {
-  return stepper_position[Z_AXIS]/CONFIG_Z_STEPS_PER_MM;
+  int32_t pos;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { pos = stepper_position[Z_AXIS]; }
+  return pos/CONFIG_Z_STEPS_PER_MM;
 }
 void stepper_set_position(double x, double y, double z) {
-  stepper_position[X_AXIS] = lround(x*CONFIG_X_STEPS_PER_MM);
-  stepper_position[Y_AXIS] = lround(y*CONFIG_Y_STEPS_PER_MM);
-  stepper_position[Z_AXIS] = lround(z*CONFIG_Z_STEPS_PER_MM);
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    stepper_position[X_AXIS] = lround(x*CONFIG_X_STEPS_PER_MM);
+    stepper_position[Y_AXIS] = lround(y*CONFIG_Y_STEPS_PER_MM);
+    stepper_position[Z_AXIS] = lround(z*CONFIG_Z_STEPS_PER_MM);
+  }
 }
 
 
@@ -242,13 +293,22 @@ ISR(TIMER1_COMPA_vect) {
     return;
   }
 
+  if (paused) {
+    // freeze: hold position and force the beam off, but DON'T touch the block
+    // buffer, current-block progress, or position, so motion resumes exactly
+    // where it left off (e.g. mid raster line) once unpaused
+    control_laser_intensity(0);
+    busy = false;
+    return;
+  }
+
   #ifdef ENABLE_INTERLOCKS
+    // honor interlocks
+    // (for rastering or unlikely edge case the protocol loop stops)
+    if (SENSE_DOOR_OPEN || SENSE_CHILLER_OFF) {
+      control_laser_intensity(0);
+    }
     if (!disable_limits) {
-      // honor interlocks
-      // (for unlikely edge case the protocol loop stops)
-      if (SENSE_DOOR_OPEN || SENSE_CHILLER_OFF) {
-        control_laser_intensity(0);
-      }
       // stop program when any limit is hit
       if (SENSE_X1_LIMIT) {
         stepper_request_stop(STOPERROR_LIMIT_HIT_X1);
@@ -349,17 +409,17 @@ ISR(TIMER1_COMPA_vect) {
       // starting on new line block
       adjusted_rate = current_block->initial_rate;
       acceleration_tick_counter = CYCLES_PER_ACCELERATION_TICK/2; // start halfway, midpoint rule.
-      adjust_speed( adjusted_rate ); // initialize cycles_per_step_event
       if (current_block->type == TYPE_RASTER_LINE) {
-        control_laser_intensity(0);  // set only through raster data
+        // reset before the beam dynamics call below reads them
         next_pixel_at_steps = 0;
-      } else {
-        adjust_beam_dynamics(adjusted_rate);
+        raster_pixel_intensity = 0;
       }
+      adjust_laser_speed_beam_dynamics( adjusted_rate ); // initialize cycles_per_step_event
       counter_x = -(current_block->step_event_count >> 1);
       counter_y = counter_x;
       counter_z = counter_x;
       step_events_completed = 0;
+      resume_state = 0;  // new block starts at initial_rate, no resume ramp
     }
   }
 
@@ -411,19 +471,36 @@ ISR(TIMER1_COMPA_vect) {
       ////////// SPEED ADJUSTMENT
       if (step_events_completed < current_block->step_event_count) {  // block not finished
 
+        if (resume_state == 1) {
+          // resuming from a pause: drop to the block's start rate, then ramp
+          // back up to the pre-pause rate rather than jumping there directly
+          resume_rate_target = adjusted_rate;
+          adjusted_rate = current_block->initial_rate;
+          if (adjusted_rate > resume_rate_target) {
+            adjusted_rate = resume_rate_target;
+          }
+          acceleration_tick_counter = CYCLES_PER_ACCELERATION_TICK/2;
+          adjust_laser_speed_beam_dynamics( adjusted_rate );
+          resume_state = 2;
+        } else if (resume_state == 2) {
+          // ramping back up to the pre-pause rate
+          if ( acceleration_tick() ) {
+            adjusted_rate += current_block->rate_delta;
+            if (adjusted_rate >= resume_rate_target) {
+              adjusted_rate = resume_rate_target;
+              resume_state = 0;
+            }
+            adjust_laser_speed_beam_dynamics( adjusted_rate );
+          }
+
         // accelerating
-        if (step_events_completed < current_block->accelerate_until) {
+        } else if (step_events_completed < current_block->accelerate_until) {
           if ( acceleration_tick() ) {  // scheduled speed change
             adjusted_rate += current_block->rate_delta;
             if (adjusted_rate > current_block->nominal_rate) {  // overshot
               adjusted_rate = current_block->nominal_rate;
             }
-            adjust_speed( adjusted_rate );
-            if (current_block->type == TYPE_RASTER_LINE) {
-              control_laser_intensity(0);  // set only through raster data
-            } else {
-              adjust_beam_dynamics(adjusted_rate);
-            }
+            adjust_laser_speed_beam_dynamics( adjusted_rate );
           }
 
         // deceleration start
@@ -443,12 +520,7 @@ ISR(TIMER1_COMPA_vect) {
             if (adjusted_rate < current_block->final_rate) {  // overshot
               adjusted_rate = current_block->final_rate;
             }
-            adjust_speed( adjusted_rate );
-            if (current_block->type == TYPE_RASTER_LINE) {
-              control_laser_intensity(0);  // set only through raster data
-            } else {
-              adjust_beam_dynamics(adjusted_rate);
-            }
+            adjust_laser_speed_beam_dynamics( adjusted_rate );
           }
 
         // cruising
@@ -456,34 +528,39 @@ ISR(TIMER1_COMPA_vect) {
           // No accelerations. Make sure we cruise exactly at the nominal rate.
           if (adjusted_rate != current_block->nominal_rate) {
             adjusted_rate = current_block->nominal_rate;
-            adjust_speed( adjusted_rate );
+            adjust_laser_speed_beam_dynamics( adjusted_rate );
           }
-          // Special case raster line.
-          // Adjust intensity according raster buffer.
-          if (current_block->type == TYPE_RASTER_LINE) {
-            if (next_pixel_at_steps == 0) {  // starting raster_cruise
-              next_pixel_at_steps += (step_events_completed << 10);  // * 1024
-            }
-            if ((step_events_completed << 10) >= next_pixel_at_steps) {
-              next_pixel_at_steps += current_block->pixel_steps_x1024;
-              // for every pixel width get the next raster value
-              // disable nested interrupts
-              // this is to prevent race conditions with the serial interrupt
-              // over the rx_buffer variables.
-              cli();
-              uint8_t chr = serial_raster_read();
-              sei();
-              // map [128,255] -> [0, nominal_laser_intensity]
-              // (chr-128)*2 * (current_block->nominal_laser_intensity/255)
-              control_laser_intensity( (chr-128)*2*current_block->nominal_laser_intensity/255 );  // TODO: Maybe do this in preprocessing
-            }
-          // otherwise make sure intensity at nominal
-          } else {
+          if (current_block->type != TYPE_RASTER_LINE) {
             control_laser_intensity(current_block->nominal_laser_intensity);
+          }
+        }
+
+        // Latch raster pixels by distance: one per pixel width of travel,
+        // whatever part of the speed profile the block is in. Gating this on
+        // cruising would skip every run shorter than the acceleration
+        // distance, nominal_speed^2/(4*accel).
+        if (current_block->type == TYPE_RASTER_LINE) {
+          if (next_pixel_at_steps == 0) {  // first pixel of the line
+            next_pixel_at_steps += (step_events_completed << 10);  // * 1024
+          }
+          if ((step_events_completed << 10) >= next_pixel_at_steps) {
+            next_pixel_at_steps += current_block->pixel_steps_x1024;
+            // nested interrupts disabled to prevent races with the serial
+            // interrupt over the rx_buffer variables
+            cli();
+            uint8_t chr = serial_raster_read();
+            sei();
+            // map [128,255] -> [0, nominal_laser_intensity]
+            // Note: this goes from 0 - 254/255 = 0 - 99.6% of nominal_laser_intensity
+            // unsigned: the product reaches 64770 and would overflow a signed 16-bit int
+            raster_pixel_intensity = (unsigned)(chr-128)*2*current_block->nominal_laser_intensity/255;
+            // scaled with speed so energy per mm holds through the ramps
+            control_laser_intensity( (uint32_t)raster_pixel_intensity * adjusted_rate / current_block->nominal_rate );
           }
         }
       } else {  // block finished
         if (current_block->type == TYPE_RASTER_LINE) {
+          control_laser_intensity(0);  // beam dark for the lead-out
           // make sure all raster data is consumed
           serial_consume_data();
         }
@@ -492,6 +569,23 @@ ISR(TIMER1_COMPA_vect) {
       }
       ////////// END OF SPEED ADJUSTMENT
 
+      break;
+
+    case TYPE_DWELL:
+      if (dwell_counter == 0) {
+        dwell_cycles = lround(DWELL_RATE / 60.0 * current_block->dwell_time);
+        adjust_speed( DWELL_RATE ); // initialize cycles_per_step_event
+      }
+
+      if (dwell_counter < dwell_cycles) {
+        control_laser_intensity(current_block->nominal_laser_intensity);
+        dwell_counter++;
+      }
+      else {
+        dwell_counter = 0;
+        current_block = NULL;
+        planner_discard_current_block();
+      }
       break;
 
     case TYPE_AIR_ASSIST_ENABLE:
@@ -521,7 +615,6 @@ ISR(TIMER1_COMPA_vect) {
 
   busy = false;
 }
-
 
 
 
@@ -579,8 +672,20 @@ inline uint32_t config_step_timer(uint32_t cycles) {
 }
 
 
+static void adjust_laser_speed_beam_dynamics(uint32_t adjusted_rate) {
+  adjust_speed( adjusted_rate );
+  if (current_block->type == TYPE_RASTER_LINE) {
+    // the latched pixel, rescaled to the new speed so energy per mm holds
+    // through the ramps. Zero until the line's first pixel is latched.
+    control_laser_intensity( (uint32_t)raster_pixel_intensity * adjusted_rate / current_block->nominal_rate );
+  } else {
+    adjust_beam_dynamics(adjusted_rate);
+  }
+}
+
+
 inline void adjust_speed( uint32_t steps_per_minute ) {
-  // steps_per_minute is typicaly just adjusted_rate
+  // steps_per_minute is typically just adjusted_rate
   if (steps_per_minute < MINIMUM_STEPS_PER_MINUTE) { steps_per_minute = MINIMUM_STEPS_PER_MINUTE; }
   cycles_per_step_event = config_step_timer(CYCLES_PER_MINUTE/steps_per_minute);
 }
@@ -604,7 +709,6 @@ inline void adjust_beam_dynamics( uint32_t steps_per_minute ) {
   control_laser_intensity(current_block->nominal_laser_intensity);
   #endif
 }
-
 
 
 inline void homing_move(double xfar, double yfar, double zfar,

@@ -1,26 +1,30 @@
 # -*- coding: UTF-8 -*-
-import os
-import io
-import sys
-import time
-import json
-import copy
 import base64
-import threading
+import contextlib
+import copy
+import datetime
+import functools
+import io
 import itertools
+import json
+import math
+import platform
+import sys
+import threading
+import time
+
 import serial
 import serial.tools.list_ports
-import datetime
 from config import conf, write_config_fields
+from jobtime import JobTimer
 
-if not conf['mill_mode']:
+if not conf["mill_mode"]:
     try:
         from PIL import Image
     except ImportError:
         print("Pillow module missing, raster mode will fail.")
 
-__author__  = 'Stefan Hechenberger <stefan@nortd.com>'
-
+__author__ = "Stefan Hechenberger <stefan@nortd.com>"
 
 ################ SENDING PROTOCOL
 CMD_STOP = chr(1)
@@ -28,6 +32,8 @@ CMD_RESUME = chr(2)
 CMD_STATUS = chr(3)
 CMD_SUPERSTATUS = chr(4)
 CMD_CHUNK_PROCESSED = chr(5)
+CMD_UNPAUSE = chr(7)
+CMD_PAUSE = chr(8)
 CMD_RASTER_DATA_START = chr(16)
 CMD_RASTER_DATA_END = chr(17)
 STATUS_END = chr(6)
@@ -62,55 +68,89 @@ PARAM_OFFSET_X = "h"
 PARAM_OFFSET_Y = "i"
 PARAM_OFFSET_Z = "j"
 
+# Bounds for the motion parameters. MAX_PARAM_VALUE is what the 28-bit wire
+# encoding can carry, so anything beyond it is already meaningless. The feed
+# rate floor keeps the planner off a zero step rate, and the dwell ceiling
+# bounds how long the beam can sit burning in one spot.
+MAX_PARAM_VALUE = 134217.727
+MIN_FEEDRATE = 0.1  # mm/min
+MAX_FEEDRATE = MAX_PARAM_VALUE  # mm/min
+MAX_DWELL_SECONDS = 10.0
+
+# How long an assist output stays on: one burn, one pass, or the whole job.
+ASSIST_MODES = ("off", "feed", "pass", "job")
+
+# What the run-time model makes of the stream, see jobtime.JobTimer. Anything
+# left out of these maps takes no time and moves nothing.
+TIMED_COMMANDS = {
+    CMD_LINE: "line",
+    CMD_RASTER: "raster",
+    CMD_DWELL: "dwell",
+    CMD_REF_RELATIVE: "relative",
+    CMD_REF_ABSOLUTE: "absolute",
+    CMD_REF_STORE: "ref_store",
+    CMD_REF_RESTORE: "ref_restore",
+    CMD_HOMING: "homing",
+}
+TIMED_PARAMS = {
+    PARAM_TARGET_X: "x",
+    PARAM_TARGET_Y: "y",
+    PARAM_TARGET_Z: "z",
+    PARAM_FEEDRATE: "feedrate",
+    PARAM_DURATION: "duration",
+}
+
 ################
 
 
 ################ RECEIVING PROTOCOL
 
 # status: error flags
-ERROR_SERIAL_STOP_REQUEST = '!'
+ERROR_SERIAL_STOP_REQUEST = "!"
 ERROR_RX_BUFFER_OVERFLOW = '"'
 
-ERROR_LIMIT_HIT_X1 = '$'
-ERROR_LIMIT_HIT_X2 = '%'
-ERROR_LIMIT_HIT_Y1 = '&'
-ERROR_LIMIT_HIT_Y2 = '*'
-ERROR_LIMIT_HIT_Z1 = '+'
-ERROR_LIMIT_HIT_Z2 = '-'
+ERROR_LIMIT_HIT_X1 = "$"
+ERROR_LIMIT_HIT_X2 = "%"
+ERROR_LIMIT_HIT_Y1 = "&"
+ERROR_LIMIT_HIT_Y2 = "*"
+ERROR_LIMIT_HIT_Z1 = "+"
+ERROR_LIMIT_HIT_Z2 = "-"
 
-ERROR_INVALID_MARKER = '#'
-ERROR_INVALID_DATA = ':'
-ERROR_INVALID_COMMAND = '<'
-ERROR_INVALID_PARAMETER ='>'
-ERROR_TRANSMISSION_ERROR ='='
+ERROR_INVALID_MARKER = "#"
+ERROR_INVALID_DATA = ":"
+ERROR_INVALID_COMMAND = "<"
+ERROR_INVALID_PARAMETER = ">"
+ERROR_TRANSMISSION_ERROR = "="
+ERROR_SERIAL_WATCHDOG = ";"
 
 # status: info flags
-INFO_IDLE_YES = 'A'
-INFO_DOOR_OPEN = 'B'
-INFO_CHILLER_OFF = 'C'
+INFO_IDLE_YES = "A"
+INFO_DOOR_OPEN = "B"
+INFO_CHILLER_OFF = "C"
+INFO_PAUSED = "D"
 
 # status: info params
-INFO_POS_X = 'x'
-INFO_POS_Y = 'y'
-INFO_POS_Z = 'z'
-INFO_VERSION = 'v'
-INFO_BUFFER_UNDERRUN = 'w'
-INFO_STACK_CLEARANCE = 'u'
+INFO_POS_X = "x"
+INFO_POS_Y = "y"
+INFO_POS_Z = "z"
+INFO_VERSION = "v"
+INFO_BUFFER_UNDERRUN = "w"
+INFO_STACK_CLEARANCE = "u"
 
-INFO_HELLO = '~'
+INFO_HELLO = "~"
 
-INFO_OFFSET_X = 'a'
-INFO_OFFSET_Y = 'b'
-INFO_OFFSET_Z = 'c'
+INFO_OFFSET_X = "a"
+INFO_OFFSET_Y = "b"
+INFO_OFFSET_Z = "c"
 # INFO_TARGET_X = 'd'
 # INFO_TARGET_Y = 'e'
 # INFO_TARGET_Z = 'f'
-INFO_FEEDRATE = 'g'
-INFO_INTENSITY = 'h'
-INFO_DURATION = 'i'
-INFO_PIXEL_WIDTH = 'j'
+INFO_FEEDRATE = "g"
+INFO_INTENSITY = "h"
+INFO_DURATION = "i"
+INFO_PIXEL_WIDTH = "j"
+INFO_DEBUG = "k"
 ################
-
 
 # reverse lookup for commands, for debugging
 # NOTE: have to be in sync with above definitions
@@ -120,29 +160,26 @@ markers_tx = {
     chr(3): "CMD_STATUS",
     chr(4): "CMD_SUPERSTATUS",
     chr(5): "CMD_CHUNK_PROCESSED",
+    chr(7): "CMD_UNPAUSE",
+    chr(8): "CMD_PAUSE",
     chr(16): "CMD_RASTER_DATA_START",
     chr(17): "CMD_RASTER_DATA_END",
     chr(6): "STATUS_END",
-
     "A": "CMD_NONE",
     "B": "CMD_LINE",
     "C": "CMD_DWELL",
     "D": "CMD_RASTER",
-
     "E": "CMD_REF_RELATIVE",
     "F": "CMD_REF_ABSOLUTE",
     "G": "CMD_REF_STORE",
     "H": "CMD_REF_RESTORE",
-
     "I": "CMD_HOMING",
     "J": "CMD_OFFSET_STORE",
     "K": "CMD_OFFSET_RESTORE",
-
     "L": "CMD_AIR_ENABLE",
     "M": "CMD_AIR_DISABLE",
     "N": "CMD_AUX_ENABLE",
     "O": "CMD_AUX_DISABLE",
-
     "x": "PARAM_TARGET_X",
     "y": "PARAM_TARGET_Y",
     "z": "PARAM_TARGET_Z",
@@ -161,65 +198,104 @@ markers_rx = {
     chr(3): "CMD_STATUS",
     chr(4): "CMD_SUPERSTATUS",
     chr(5): "CMD_CHUNK_PROCESSED",
+    chr(7): "CMD_UNPAUSE",
+    chr(8): "CMD_PAUSE",
     chr(16): "CMD_RASTER_DATA_START",
     chr(17): "CMD_RASTER_DATA_END",
     chr(6): "STATUS_END",
-
     # status: error flags
-    '!': "ERROR_SERIAL_STOP_REQUEST",
+    "!": "ERROR_SERIAL_STOP_REQUEST",
     '"': "ERROR_RX_BUFFER_OVERFLOW",
-
-    '$': "ERROR_LIMIT_HIT_X1",
-    '%': "ERROR_LIMIT_HIT_X2",
-    '&': "ERROR_LIMIT_HIT_Y1",
-    '*': "ERROR_LIMIT_HIT_Y2",
-    '+': "ERROR_LIMIT_HIT_Z1",
-    '-': "ERROR_LIMIT_HIT_Z2",
-
-    '#': "ERROR_INVALID_MARKER",
-    ':': "ERROR_INVALID_DATA",
-    '<': "ERROR_INVALID_COMMAND",
-    '>': "ERROR_INVALID_PARAMETER",
-    '=': "ERROR_TRANSMISSION_ERROR",
-
+    "$": "ERROR_LIMIT_HIT_X1",
+    "%": "ERROR_LIMIT_HIT_X2",
+    "&": "ERROR_LIMIT_HIT_Y1",
+    "*": "ERROR_LIMIT_HIT_Y2",
+    "+": "ERROR_LIMIT_HIT_Z1",
+    "-": "ERROR_LIMIT_HIT_Z2",
+    "#": "ERROR_INVALID_MARKER",
+    ":": "ERROR_INVALID_DATA",
+    "<": "ERROR_INVALID_COMMAND",
+    ">": "ERROR_INVALID_PARAMETER",
+    "=": "ERROR_TRANSMISSION_ERROR",
+    ";": "ERROR_SERIAL_WATCHDOG",
     # status: info flags
-    'A': "INFO_IDLE_YES",
-    'B': "INFO_DOOR_OPEN",
-    'C': "INFO_CHILLER_OFF",
-
+    "A": "INFO_IDLE_YES",
+    "B": "INFO_DOOR_OPEN",
+    "C": "INFO_CHILLER_OFF",
+    "D": "INFO_PAUSED",
     # status: info params
-    'x': "INFO_POS_X",
-    'y': "INFO_POS_Y",
-    'z': "INFO_POS_Z",
-    'v': "INFO_VERSION",
-    'w': "INFO_BUFFER_UNDERRUN",
-    'u': "INFO_STACK_CLEARANCE",
-
-    '~': "INFO_HELLO",
-
-    'a': "INFO_OFFSET_X",
-    'b': "INFO_OFFSET_Y",
-    'c': "INFO_OFFSET_Z",
+    "x": "INFO_POS_X",
+    "y": "INFO_POS_Y",
+    "z": "INFO_POS_Z",
+    "v": "INFO_VERSION",
+    "w": "INFO_BUFFER_UNDERRUN",
+    "u": "INFO_STACK_CLEARANCE",
+    "~": "INFO_HELLO",
+    "a": "INFO_OFFSET_X",
+    "b": "INFO_OFFSET_Y",
+    "c": "INFO_OFFSET_Z",
     # 'd': "INFO_TARGET_X",
     # 'e': "INFO_TARGET_Y",
     # 'f': "INFO_TARGET_Z",
-    'g': "INFO_FEEDRATE",
-    'h': "INFO_INTENSITY",
-    'i': "INFO_DURATION",
-    'j': "INFO_PIXEL_WIDTH",
+    "g": "INFO_FEEDRATE",
+    "h": "INFO_INTENSITY",
+    "i": "INFO_DURATION",
+    "j": "INFO_PIXEL_WIDTH",
+    "k": "INFO_DEBUG",
 }
 
 SerialLoop = None
 fallback_msg_thread = None
+# One job goes onto the wire at a time, see job(). _dispatch_thread is the
+# thread queueing it, so anything arriving from another one can be told apart
+# from the job's own writes.
+_dispatch_lock = threading.Lock()
+_dispatch_thread = None
+# Serializes complete machine operations (including multi-command operations
+# such as a pulse or jog) against job admission. Stop/pause deliberately do
+# not take this lock, so they remain able to interrupt a long dispatch.
+_operation_lock = threading.RLock()
+
+
+class MachineBusy(ValueError):
+    """Raised when something asks the machine to move while a job is being
+    queued onto it."""
+
+
+def _dispatch_elsewhere():
+    """Whether another thread is part way through queueing a job."""
+    owner = _dispatch_thread
+    return owner is not None and owner != threading.get_ident()
+
+
+@contextlib.contextmanager
+def machine_operation():
+    """Keep a complete manual operation contiguous in the command stream."""
+    if not _operation_lock.acquire(blocking=False):
+        raise MachineBusy("another machine operation is in progress")
+    try:
+        yield
+    finally:
+        _operation_lock.release()
+
+
+def _serialized_operation(func):
+    """Serialize one public machine operation against jobs and its peers."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with machine_operation():
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 class SerialLoopClass(threading.Thread):
-
     def __init__(self):
         threading.Thread.__init__(self)
 
         self.device = None
-        self.tx_buffer = []
+        self.tx_buffer = bytearray()
         self.tx_pos = 0
 
         # TX_CHUNK_SIZE - this is the number of bytes to be
@@ -228,19 +304,50 @@ class SerialLoopClass(threading.Thread):
         self.RX_CHUNK_SIZE = 32
         self.FIRMBUF_SIZE = 256  # needs to match device firmware
         self.firmbuf_used = 0
+        # How long the sender may sit gated with no send or ack before looking
+        # for a lost-ack desync. Far longer than a chunk round-trip (~ms).
+        self.FIRMBUF_STALL_TIMEOUT = 2.0  # seconds
+        self.last_tx_progress = 0.0
+        # Idle is reported only with an empty rx buffer, the one proof the
+        # tally has drained.
+        self.last_firmware_idle = 0.0
+        # The controller stops itself when it hears nothing for this long
+        # (its serial watchdog, firmware/src/serial.c). A gap past the stall
+        # mark means it has stopped, or is about to.
+        self.FIRMWARE_WATCHDOG_TIMEOUT = 1.0  # seconds, matches the firmware
+        # A little under it, so the recovery is already on the wire by the
+        # time the controller acts. Still twice the 0.4s status cadence.
+        self.WATCHDOG_STALL_TIMEOUT = 0.8 * self.FIRMWARE_WATCHDOG_TIMEOUT
+        self.last_tx_time = time.time()
 
         # used for calculating percentage done
         self.job_size = 0
+        # True from job admission until firmware idle proves its rx buffer and
+        # planner have drained, or until a stop drops it. This distinguishes a
+        # job from manual writes arriving while its last moves still execute.
+        self.job_active = False
+        # A stop empties the buffer, but whatever was still queueing the job
+        # goes on emitting into it, and the resume that follows would run the
+        # remainder. Set by stop(), cleared by unstop() and by the next job.
+        self.discard_writes = False
+        # unstop may arrive while the cancelled dispatch is still producing.
+        # In that case writes stay discarded until that producer exits.
+        self.clear_discard_after_dispatch = False
+        # run time of the buffered stream, and where each move sits in it
+        self.timer = JobTimer(TIMED_COMMANDS, TIMED_PARAMS)
 
         # status flags
-        self._status = {}    # last complete status frame
-        self._s = {}         # status fram currently assembling
+        self._status = {}  # last complete status frame
+        self._s = {}  # status fram currently assembling
         self.reset_status()
         self._paused = False
 
         self.request_stop = False
         self.request_resume = False
-        self.request_status = 2       # 0: no request, 1: normal request, 2: super request
+        self.request_watchdog_resume = False
+        self.request_pause = False
+        self.request_unpause = False
+        self.request_status = 2  # 0: no request, 1: normal request, 2: super request
 
         self.pdata_count = 0
         self.pdata_nums = [128, 128, 128, 192]
@@ -248,86 +355,132 @@ class SerialLoopClass(threading.Thread):
         threading.Thread.__init__(self)
         self.stop_processing = False
 
-        self.deamon = True  # kill thread when main thread exits
+        self.daemon = True  # kill thread when main thread exits
 
         # lock mechanism for chared data
         # see: http://effbot.org/zone/thread-synchronization.htm
         self.lock = threading.Lock()
 
-
     def reset_status(self):
         self._status = {
-            'ready': False,                 # is hardware idle (and not stop mode)
-            'serial': False,                # is serial connected
-            'appver':conf['version'],
-            'firmver': None,
-            'paused': False,
-            'pos':[0.0, 0.0, 0.0],
-            'underruns': 0,                 # how many times machine is waiting for serial data
-            'stackclear': 999999,           # minimal stack clearance (must stay above 0)
-            'progress': 1.0,
-
+            "ready": False,  # is hardware idle (and not stop mode)
+            "serial": False,  # is serial connected
+            "appver": conf["version"],
+            "firmver": None,
+            "paused": False,
+            "pos": [0.0, 0.0, 0.0],
+            "underruns": 0,  # how many times machine is waiting for serial data
+            "stackclear": 999999,  # minimal stack clearance (must stay above 0)
+            "progress": 1.0,
+            # modelled seconds of run time left, [this pass, whole job]
+            "remaining": [0.0, 0.0],
             ### stop conditions
             # indicated when key present
-            'stops': {},
+            "stops": {},
             # possible keys:
             # x1, x2, y1, y2, z1, z2,
-            # requested, buffer, marker, data, command, parameter, transmission
-
-            'info':{},
+            # requested, buffer, marker, data, command, parameter, transmission,
+            # watchdog
+            "info": {},
             # possible keys: door, chiller
-
             ### super
-            'offset': [0.0, 0.0, 0.0],
+            "offset": [0.0, 0.0, 0.0],
             # 'pos_target': [0.0, 0.0, 0.0],
-            'feedrate': 0.0,
-            'intensity': 0.0,
-            'duration': 0.0,
-            'pixelwidth': 0.0
+            "feedrate": 0.0,
+            "intensity": 0.0,
+            "duration": 0.0,
+            "pixelwidth": 0.0,
         }
         self._s = copy.deepcopy(self._status)
 
+    def _guard_foreign_write(self):
+        """Refuse anything that is not part of the job on the wire.
+
+        Requests are served concurrently, so a jog, a pulse or a rate change
+        can arrive while a job is being queued, or while one is still
+        streaming. Queued mid-dispatch it would be spliced into the middle of
+        the job and run mid-cut; queued behind a streaming one it would run
+        the moment that job ended. Neither is what whoever pressed the button
+        meant, and both move the head unbidden.
+
+        The thread doing the queueing is writing the job itself, so it passes.
+        """
+        if _dispatch_elsewhere():
+            raise MachineBusy("a job is being sent to the machine")
+        if self.job_active and _dispatch_thread is None:
+            raise MachineBusy("a job is running on the machine")
+
+    def mark_pass(self):
+        self.timer.mark_pass(self.job_size)
 
     def send_command(self, command):
+        if self.discard_writes:
+            return  # stopped, see discard_writes
+        self._guard_foreign_write()
         self.tx_buffer.append(ord(command))
+        # Do not admit a job on the strength of a status frame from before
+        # this command was queued. Firmware idle will set ready again after
+        # both its receive buffer and motion planner have drained.
+        self._status["ready"] = False
+        self._s["ready"] = False
         self.job_size += 1
-
+        self.timer.command(command, self.job_size)
 
     def send_param(self, param, val):
+        if self.discard_writes:
+            return  # stopped, see discard_writes
+        self._guard_foreign_write()
         # num to be [-134217.728, 134217.727], [-2**27, 2**27-1]
         # three decimals are retained
-        num = int(round(((val+134217.728)*1000)))
-        char0 = (num&127)+128
-        char1 = ((num&(127<<7))>>7)+128
-        char2 = ((num&(127<<14))>>14)+128
-        char3 = ((num&(127<<21))>>21)+128
+        num = int(round((val + 134217.728) * 1000))
+        # saturate to the 28-bit protocol range; an out-of-range value would
+        # otherwise wrap and command a wildly wrong position/feedrate
+        if num < 0 or num > (1 << 28) - 1:
+            print(f"WARN: param {param} value {val} out of range, clamping")
+            num = max(0, min(num, (1 << 28) - 1))
+        char0 = (num & 127) + 128
+        char1 = ((num & (127 << 7)) >> 7) + 128
+        char2 = ((num & (127 << 14)) >> 14) + 128
+        char3 = ((num & (127 << 21)) >> 21) + 128
         self.tx_buffer.append(char0)
         self.tx_buffer.append(char1)
         self.tx_buffer.append(char2)
         self.tx_buffer.append(char3)
         self.tx_buffer.append(ord(param))
         self.job_size += 5
-
+        # the model wants the value the controller will decode, not the one
+        # asked for, so a clamped param is timed as it will actually run
+        self.timer.param(param, num / 1000.0 - 134217.728)
 
     def send_raster_data(self, data, start, end):
-        count = 2
-        with self.lock:
-            self.tx_buffer.append(ord(CMD_RASTER_DATA_START))
+        if self.discard_writes:
+            return  # stopped, see discard_writes
+        self._guard_foreign_write()
+        # Build the whole chunk first, then splice it in under a single lock.
+        # Locking per-pixel here meant thousands of acquire/release cycles per
+        # raster line on the hot path.
+        chunk = [ord(CMD_RASTER_DATA_START)]
         for val in itertools.islice(data, start, end):
-            with self.lock:
-                self.tx_buffer.append(int(0.5*(255-val))+128)
-            count += 1
+            chunk.append(int((255 - val) / 2) + 128)
+        chunk.append(ord(CMD_RASTER_DATA_END))
         with self.lock:
-            self.tx_buffer.append(ord(CMD_RASTER_DATA_END))
-            self.job_size += count
-
+            # Chunk construction is intentionally outside the lock and may
+            # take long enough for stop() to land. Recheck after acquiring it
+            # so an aborted raster cannot refill the purged queue.
+            if self.discard_writes:
+                return
+            self._guard_foreign_write()
+            self.tx_buffer.extend(chunk)
+            self.job_size += len(chunk)
 
     def run(self):
         """Main loop of the serial thread."""
-        last_write = 0
+        # last_write = 0
         last_status_request = 0
+        disable_computer_sleep()
         while True:
             if self.stop_processing:
+                enable_computer_sleep()
                 break
             with self.lock:
                 # read/write
@@ -340,178 +493,219 @@ class SerialLoopClass(threading.Thread):
                         # if time.time()-last_write > 0.01:
                         #     sys.stdout.write('~')
                         # last_write = time.time()
-                    except OSError:
-                        print("ERROR: serial got disconnected 1.")
+                    except BaseException as e:
                         self.stop_processing = True
-                        self._status['serial'] = False
-                        self._status['ready'] = False
-                    except ValueError:
-                        print("ERROR: serial got disconnected 2.")
-                        self.stop_processing = True
-                        self._status['serial'] = False
-                        self._status['ready']  = False
+                        self._status["serial"] = False
+                        self._status["ready"] = False
+                        if isinstance(e, OSError):
+                            print("ERROR: serial got disconnected 1.")
+                        elif isinstance(e, ValueError):
+                            print("ERROR: serial got disconnected 2.")
+                        else:
+                            print("ERROR: unknown serial error")
+                            print(str(e))
                 else:
-                    print("ERROR: serial got disconnected 3.")
                     self.stop_processing = True
-                    self._status['serial'] = False
-                    self._status['ready']  = False
+                    self._status["serial"] = False
+                    self._status["ready"] = False
+                    print("ERROR: serial got disconnected 3.")
                 # status request
-                if time.time()-last_status_request > 0.5:
-                    if self._status['ready']:
+                # Note: this also feeds the firmware serial watchdog (1s); at
+                # 0.4s even a paused/idle host keeps it fed with 2.5x margin.
+                if time.time() - last_status_request > 0.4:
+                    if self._status["ready"]:
                         self.request_status = 2  # ready -> super request
                     else:
                         self.request_status = 1  # processing -> normal request
                     last_status_request = time.time()
                 # flush stdout, so print shows up timely
                 sys.stdout.flush()
-            time.sleep(0.004)
-
+            time.sleep(0.004)  # 250 Hz
 
     def _serial_read(self):
         chunk = self.device.read(self.RX_CHUNK_SIZE)
-        if conf['print_serial_data'] and chunk != b'':
-            timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
-            print(timestamp + ' Receiving: ' + prettify_serial(chunk, markers=markers_rx))
+        if conf["print_serial_data"] and chunk != b"":
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
+            print(timestamp + " Receiving: " + prettify_serial(chunk, markers=markers_rx))
         for data_num in chunk:
             data_char = chr(data_num)
             if data_num < 32:  ### flow
                 if data_char == CMD_CHUNK_PROCESSED:
                     self.firmbuf_used -= self.TX_CHUNK_SIZE
+                    self.last_tx_progress = time.time()
                     if self.firmbuf_used < 0:
-                        print("ERROR: firmware buffer tracking to low")
+                        print("ERROR: firmware buffer tracking too low")
                 elif data_char == STATUS_END:
                     # status frame complete, compile status
                     self._status, self._s = self._s, self._status  # flip
-                    self._status['paused'] = self._paused
-                    self._status['serial'] = bool(self.device)
+                    self._status["paused"] = self._paused
+                    self._status["serial"] = bool(self.device)
                     if self.job_size == 0:
-                        self._status['progress'] = 1.0
+                        self._status["progress"] = 1.0
+                        self._status["remaining"] = [0.0, 0.0]
                     else:
-                        self._status['progress'] = \
-                          round(self.tx_pos/float(self.job_size),3)
-                    self._s['stops'].clear()
-                    self._s['info'].clear()
-                    self._s['ready'] = False
-                    self._s['underruns'] = self._status['underruns']
-                    self._s['stackclear'] = self._status['stackclear']
+                        self._status["progress"] = round(self.tx_pos / float(self.job_size), 3)
+                        # bytes sent lead the machine by whatever the firmware
+                        # is still holding, so the model is read at the byte
+                        # the controller has actually worked down to
+                        executed = max(0, self.tx_pos - self.firmbuf_used)
+                        self._status["remaining"] = [
+                            round(self.timer.remaining_in_pass(executed), 1),
+                            round(self.timer.remaining(executed), 1),
+                        ]
+                    self._s["stops"].clear()
+                    self._s["info"].clear()
+                    self._s["ready"] = False
+                    self._s["underruns"] = self._status["underruns"]
+                    self._s["stackclear"] = self._status["stackclear"]
             elif 31 < data_num < 65:  ### stop error markers
                 # chr is in [!-@], process flag
                 if data_char == ERROR_LIMIT_HIT_X1:
-                    self._s['stops']['x1'] = True
-                    # print "ERROR firmware: limit hit x1"
+                    self._s["stops"]["x1"] = True
                 elif data_char == ERROR_LIMIT_HIT_X2:
-                    self._s['stops']['x2'] = True
-                    # print "ERROR firmware: limit hit x2"
+                    self._s["stops"]["x2"] = True
                 elif data_char == ERROR_LIMIT_HIT_Y1:
-                    self._s['stops']['y1'] = True
-                    # print "ERROR firmware: limit hit y1"
+                    self._s["stops"]["y1"] = True
                 elif data_char == ERROR_LIMIT_HIT_Y2:
-                    self._s['stops']['y2'] = True
-                    # print "ERROR firmware: limit hit y2"
+                    self._s["stops"]["y2"] = True
                 elif data_char == ERROR_LIMIT_HIT_Z1:
-                    self._s['stops']['z1'] = True
-                    # print "ERROR firmware: limit hit z1"
+                    self._s["stops"]["z1"] = True
                 elif data_char == ERROR_LIMIT_HIT_Z2:
-                    self._s['stops']['z2'] = True
-                    # print "ERROR firmware: limit hit z2"
+                    self._s["stops"]["z2"] = True
                 elif data_char == ERROR_SERIAL_STOP_REQUEST:
-                    self._s['stops']['requested'] = True
-                    # print "ERROR firmware: stop request"
+                    self._s["stops"]["requested"] = True
                     print("INFO firmware: stop request")
                 elif data_char == ERROR_RX_BUFFER_OVERFLOW:
-                    self._s['stops']['buffer'] = True
+                    self._s["stops"]["buffer"] = True
                     print("ERROR firmware: rx buffer overflow")
                 elif data_char == ERROR_INVALID_MARKER:
-                    self._s['stops']['marker'] = True
+                    self._s["stops"]["marker"] = True
                     print("ERROR firmware: invalid marker")
                 elif data_char == ERROR_INVALID_DATA:
-                    self._s['stops']['data'] = True
+                    self._s["stops"]["data"] = True
                     print("ERROR firmware: invalid data")
                 elif data_char == ERROR_INVALID_COMMAND:
-                    self._s['stops']['command'] = True
+                    self._s["stops"]["command"] = True
                     print("ERROR firmware: invalid command")
                 elif data_char == ERROR_INVALID_PARAMETER:
-                    self._s['stops']['parameter'] = True
+                    self._s["stops"]["parameter"] = True
                     print("ERROR firmware: invalid parameter")
                 elif data_char == ERROR_TRANSMISSION_ERROR:
-                    self._s['stops']['transmission'] = True
+                    self._s["stops"]["transmission"] = True
                     print("ERROR firmware: transmission")
+                elif data_char == ERROR_SERIAL_WATCHDOG:
+                    self._s["stops"]["watchdog"] = True
+                    print("ERROR firmware: serial watchdog (host comms lost)")
                 else:
                     print("ERROR: invalid stop error marker")
                 # in stop mode, print recent transmission, unless stop request, or limit
-                if data_char != ERROR_SERIAL_STOP_REQUEST and \
-                          data_char != ERROR_LIMIT_HIT_X1 and \
-                          data_char != ERROR_LIMIT_HIT_X2 and \
-                          data_char != ERROR_LIMIT_HIT_Y1 and \
-                          data_char != ERROR_LIMIT_HIT_Y2 and \
-                          data_char != ERROR_LIMIT_HIT_Z1 and \
-                          data_char != ERROR_LIMIT_HIT_Z2:
-                    recent_data = self.tx_buffer[max(0,self.tx_pos-128):self.tx_pos]
+                if (
+                    data_char != ERROR_SERIAL_STOP_REQUEST
+                    and data_char != ERROR_LIMIT_HIT_X1
+                    and data_char != ERROR_LIMIT_HIT_X2
+                    and data_char != ERROR_LIMIT_HIT_Y1
+                    and data_char != ERROR_LIMIT_HIT_Y2
+                    and data_char != ERROR_LIMIT_HIT_Z1
+                    and data_char != ERROR_LIMIT_HIT_Z2
+                ):
+                    recent_data = self.tx_buffer[max(0, self.tx_pos - 128) : self.tx_pos]
                     print("RECENT TX BUFFER:")
                     for data_num in recent_data:
                         data_char = chr(data_num)
                         if data_char in markers_tx:
-                            print("\t%s" % (markers_tx[data_char]))
+                            print(f"\t{markers_tx[data_char]}")
                         elif 127 < data_num < 256:
                             print("\t(data byte)")
                         else:
                             print("\t(invalid)")
                     print("----------------")
                 # stop mode housekeeping
-                self.tx_buffer = []
+                self.tx_buffer = bytearray()
                 self.tx_pos = 0
                 self.job_size = 0
+                self.job_active = False
+                self.timer.reset()
                 self._paused = False
                 self.device.flushOutput()
                 self.pdata_count = 0
-                self._s['ready'] = True # ready but in stop mode
+                self._s["ready"] = True  # ready but in stop mode
             elif 64 < data_num < 91:  # info flags
                 # data_char is in [A-Z], info flag
                 if data_char == INFO_IDLE_YES:
+                    # only claimed with an empty rx buffer, so this proves the
+                    # firmware consumed everything sent
+                    self.last_firmware_idle = time.time()
                     if not self.tx_buffer:
-                        self._s['ready'] = True
+                        self._s["ready"] = True
+                        # Only firmware idle proves its rx buffer and planner
+                        # have both drained. Do not clear this during the tiny
+                        # window before an active dispatcher emits its first
+                        # command.
+                        if _dispatch_thread is None:
+                            self.job_active = False
                 elif data_char == INFO_DOOR_OPEN:
-                    self._s['info']['door'] = True
+                    self._s["info"]["door"] = True
                 elif data_char == INFO_CHILLER_OFF:
-                    self._s['info']['chiller'] = True
+                    self._s["info"]["chiller"] = True
+                elif data_char == INFO_PAUSED:
+                    # firmware froze (held position, beam off) — also proves it
+                    # did not reset since the pause, so a resume is safe
+                    self._s["info"]["paused"] = True
                 else:
                     print("ERROR: invalid info flag")
-                    sys.stdout.write('(',data_char,',',data_num,')')
+                    sys.stdout.write(f"({data_char},{data_num})")
                 self.pdata_count = 0
             elif 96 < data_num < 123:  # parameter
                 # data_char is in [a-z], process parameter
-                num = ((((self.pdata_nums[3]-128)*2097152
-                       + (self.pdata_nums[2]-128)*16384
-                       + (self.pdata_nums[1]-128)*128
-                       + (self.pdata_nums[0]-128) )- 134217728)/1000.0)
+                num = (
+                    (
+                        (self.pdata_nums[3] - 128) * 2097152
+                        + (self.pdata_nums[2] - 128) * 16384
+                        + (self.pdata_nums[1] - 128) * 128
+                        + (self.pdata_nums[0] - 128)
+                    )
+                    - 134217728
+                ) / 1000.0
                 if data_char == INFO_POS_X:
-                    self._s['pos'][0] = num
+                    self._s["pos"][0] = num
                 elif data_char == INFO_POS_Y:
-                    self._s['pos'][1] = num
+                    self._s["pos"][1] = num
                 elif data_char == INFO_POS_Z:
-                    self._s['pos'][2] = num
+                    self._s["pos"][2] = num
                 elif data_char == INFO_VERSION:
-                    num = str(int(num)/100.0)
-                    self._s['firmver'] = num
+                    # an integer, old firmware sends major.minor in
+                    # hundredths, values of 10000 and up are scaled by a
+                    # further 10 with a patch digit last, 26081 reads 26.08.1
+                    num = int(round(num))
+                    patch = 0
+                    if num >= 10000:
+                        num, patch = divmod(num, 10)
+                    num = str(num / 100.0)
+                    if patch:
+                        num += f".{patch}"
+                    self._s["firmver"] = num
                 elif data_char == INFO_BUFFER_UNDERRUN:
-                    self._s['underruns'] = num
+                    self._s["underruns"] = num
+                elif data_char == INFO_DEBUG:
+                    # available for custom debugging messaging
+                    pass
                 # super status
                 elif data_char == INFO_OFFSET_X:
-                    self._s['offset'][0] = num
+                    self._s["offset"][0] = num
                 elif data_char == INFO_OFFSET_Y:
-                    self._s['offset'][1] = num
+                    self._s["offset"][1] = num
                 elif data_char == INFO_OFFSET_Z:
-                    self._s['offset'][2] = num
+                    self._s["offset"][2] = num
                 elif data_char == INFO_FEEDRATE:
-                    self._s['feedrate'] = num
+                    self._s["feedrate"] = num
                 elif data_char == INFO_INTENSITY:
-                    self._s['intensity'] = 100*num/255
+                    self._s["intensity"] = 100 * num / 255
                 elif data_char == INFO_DURATION:
-                    self._s['duration'] = num
+                    self._s["duration"] = num
                 elif data_char == INFO_PIXEL_WIDTH:
-                    self._s['pixelwidth'] = num
+                    self._s["pixelwidth"] = num
                 elif data_char == INFO_STACK_CLEARANCE:
-                    self._s['stackclear'] = num
+                    self._s["stackclear"] = num
                 else:
                     print("ERROR: invalid param")
                 self.pdata_count = 0
@@ -529,8 +723,41 @@ class SerialLoopClass(threading.Thread):
                 print("ERROR: invalid marker")
                 self.pdata_count = 0
 
+    def _catch_watchdog_stall(self):
+        """Pre-empt a serial-watchdog stop this host provoked by going quiet.
+
+        The controller stops itself when it hears nothing for a second. Heavy
+        host work holds the interpreter that long (importing a large file runs
+        C parsers that never yield), and with the machine sitting idle there is
+        nothing for that stop to protect: it only leaves the operator a red
+        status and a re-home. Clearing it here, before the next status is
+        asked for, keeps the stop off the wire entirely.
+
+        Only when the machine was idle with nothing queued or paused. The last
+        status frame stays true across the stall because motion only starts
+        when this host sends it, and a host that went quiet sent none. Anything
+        in flight, paused, or already stopped is left alone: that stop is real.
+        """
+        if self.request_resume or self.request_watchdog_resume:
+            return  # a resume is already on its way
+        if self.request_stop or self.request_pause or self.request_unpause:
+            return  # deliberate host commands take precedence
+        if time.time() - self.last_tx_time < self.WATCHDOG_STALL_TIMEOUT:
+            return
+        if (
+            self._status["ready"]
+            and not self._status["stops"]
+            and not self.tx_buffer
+            and not self._paused
+        ):
+            print("WARN: host stalled past the controller serial watchdog, resuming")
+            self.request_watchdog_resume = True
+            # Hold off the status request so the resume goes out first and no
+            # frame can report the stop.
+            self.request_status = 0
 
     def _serial_write(self):
+        self._catch_watchdog_stall()
         ### sending super commands (handled in serial rx interrupt)
         if self.request_status == 1:
             self._send_char(CMD_STATUS)
@@ -549,17 +776,46 @@ class SerialLoopClass(threading.Thread):
             self.request_resume = False
             self.reset_status()
             self.request_status = 2  # super request
+
+        if self.request_watchdog_resume:
+            # Same command, but the machine kept position and settings through
+            # the watchdog stop, so the cached status stays valid and is left
+            # standing. Only the stop flag goes.
+            self._send_char(CMD_RESUME)
+            self.firmbuf_used = 0  # a resume resets the hardware's rx buffer
+            self.request_watchdog_resume = False
+            self._s["stops"].pop("watchdog", None)
+            self._status["stops"].pop("watchdog", None)
+            self.request_status = 2  # super request
+
+        # pause/unpause freeze the controller in place (beam off) without
+        # discarding its buffer, so motion resumes exactly where it left off.
+        # Sent above the _paused gate so they apply even while paused. Unlike
+        # CMD_RESUME, CMD_UNPAUSE does NOT reset the firmware rx buffer (retained
+        # in-flight data keeps streaming), so firmbuf_used is left intact.
+        if self.request_pause:
+            self._send_char(CMD_PAUSE)
+            self.request_pause = False
+        if self.request_unpause:
+            self._send_char(CMD_UNPAUSE)
+            self.request_unpause = False
         ### send buffer chunk
         if self.tx_buffer and len(self.tx_buffer) > self.tx_pos:
             if not self._paused:
                 if (self.FIRMBUF_SIZE - self.firmbuf_used) > self.TX_CHUNK_SIZE:
+                    self.last_tx_progress = time.time()
+                    assumedSent = 0  # bytes that made it out; stays 0 on failure
                     try:
                         # to_send = ''.join(islice(self.tx_buffer, 0, self.TX_CHUNK_SIZE))
-                        to_send = self.tx_buffer[self.tx_pos:self.tx_pos+self.TX_CHUNK_SIZE]
+                        to_send = self.tx_buffer[self.tx_pos : self.tx_pos + self.TX_CHUNK_SIZE]
                         expectedSent = len(to_send)
-                        if conf['print_serial_data']:
-                            timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
-                            print(timestamp + ' Sending: ' + prettify_serial(to_send, markers=markers_tx))
+                        if conf["print_serial_data"]:
+                            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
+                            print(
+                                timestamp
+                                + " Sending: "
+                                + prettify_serial(to_send, markers=markers_tx)
+                            )
 
                         # by protocol duplicate every char
                         to_send_double = []
@@ -569,10 +825,10 @@ class SerialLoopClass(threading.Thread):
                         to_send = to_send_double
                         #
                         t_prewrite = time.time()
+                        self.last_tx_time = t_prewrite  # feeds the firmware watchdog
                         actuallySent = self.device.write(to_send)
-                        if actuallySent != expectedSent*2:
+                        if actuallySent != expectedSent * 2:
                             print("ERROR: write did not complete")
-                            assumedSent = 0
                         else:
                             assumedSent = expectedSent
                             self.firmbuf_used += assumedSent
@@ -581,26 +837,39 @@ class SerialLoopClass(threading.Thread):
                         if time.time() - t_prewrite > 0.1:
                             print("WARN: write delay 1")
                     except serial.SerialTimeoutException:
-                        assumedSent = 0
+                        # transient: don't advance, the chunk is retried next loop
                         print("ERROR: writeTimeoutError 2")
+
+                    # only advance past bytes the device accepted; a genuine write
+                    # error propagates to run() which stops processing
                     self.tx_pos += assumedSent
+                elif time.time() - self.last_tx_progress > self.FIRMBUF_STALL_TIMEOUT:
+                    # Either an ack was lost and the tally is stale, or the
+                    # firmware is still chewing through what it has: a raster
+                    # line is consumed a pixel at a time. Only an idle report
+                    # tells the two apart, and resyncing on a guess overflows
+                    # the controller's rx buffer.
+                    if self.last_firmware_idle > self.last_tx_progress:
+                        print("WARN: firmbuf tally desync, resyncing to resume send")
+                        self.firmbuf_used = 0
+                    self.last_tx_progress = time.time()
         else:
             if self.tx_buffer:  # job finished sending
                 self.job_size = 0
-                self.tx_buffer = []
+                self.tx_buffer = bytearray()
                 self.tx_pos = 0
-
+                self.timer.reset()
 
     def _send_char(self, char):
         try:
             t_prewrite = time.time()
-            if conf['print_serial_data']:
-                timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-4]
-                print(timestamp + ' Sending: ' + prettify_serial(ord(char), markers=markers_tx))
-            self.device.write([ord(char),ord(char)])  # by protocol send twice
+            self.last_tx_time = t_prewrite  # feeds the firmware watchdog
+            if conf["print_serial_data"]:
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
+                print(timestamp + " Sending: " + prettify_serial(ord(char), markers=markers_tx))
+            self.device.write([ord(char), ord(char)])  # by protocol send twice
             if time.time() - t_prewrite > 0.1:
                 pass
-                # print "WARN: write delay 2"
         except serial.SerialTimeoutException:
             print("ERROR: writeTimeoutError 1")
 
@@ -609,8 +878,9 @@ class SerialLoopClass(threading.Thread):
 ### API ###################################################################
 ###########################################################################
 
+
 def prettify_serial(chunk, markers=markers_tx):
-    string = ''
+    string = ""
     if not hasattr(prettify_serial, "tx_pdata_nums"):
         prettify_serial.rx_pdata_nums = [128, 128, 128, 192]
         prettify_serial.rx_pdata_count = 0
@@ -618,14 +888,14 @@ def prettify_serial(chunk, markers=markers_tx):
         prettify_serial.tx_pdata_count = 0
         prettify_serial.tx_rasterstream = False
         prettify_serial.tx_rastercount = 0
-    
+
     if isinstance(chunk, int):
-        chunk = [chunk] # make integer inputs iterable
-    
+        chunk = [chunk]  # make integer inputs iterable
+
     for i in range(len(chunk)):
         data = chunk[i]
         if data >= 128:
-            string += str(data) + ' '
+            string += str(data) + " "
             if (markers == markers_tx) and prettify_serial.tx_rasterstream:
                 prettify_serial.tx_rastercount += 1
             elif markers == markers_tx:
@@ -634,75 +904,83 @@ def prettify_serial(chunk, markers=markers_tx):
             elif markers == markers_rx:
                 prettify_serial.rx_pdata_nums[prettify_serial.rx_pdata_count] = data
                 prettify_serial.rx_pdata_count += 1
-        elif (data < 128):
-            if (markers == markers_tx) and (markers[chr(data)] not in ["CMD_STATUS", "CMD_SUPERSTATUS"]):
+        elif data < 128:
+            if (markers == markers_tx) and (
+                markers[chr(data)] not in ["CMD_STATUS", "CMD_SUPERSTATUS"]
+            ):
                 prettify_serial.tx_pdata_count = 0
                 prettify_serial.tx_pdata_nums = [128, 128, 128, 192]
-            else:
+            elif markers[chr(data)] not in ["CMD_CHUNK_PROCESSED"]:
                 prettify_serial.rx_pdata_count = 0
                 prettify_serial.rx_pdata_nums = [128, 128, 128, 192]
 
-            if markers[chr(data)] == 'CMD_RASTER_DATA_START':
+            if markers[chr(data)] == "CMD_RASTER_DATA_START":
                 prettify_serial.tx_rasterstream = True
                 prettify_serial.tx_rastercount = 0
-            elif markers[chr(data)] == 'CMD_RASTER_DATA_END':
+            elif markers[chr(data)] == "CMD_RASTER_DATA_END":
                 prettify_serial.tx_rasterstream = False
-                string += '(' + str(prettify_serial.tx_rastercount) + ') '
+                string += "(" + str(prettify_serial.tx_rastercount) + ") "
 
-            string += markers[chr(data)] + ', '
+            string += markers[chr(data)] + ", "
 
         if prettify_serial.tx_pdata_count == 4:
-            num = ((((prettify_serial.tx_pdata_nums[3]-128)*2097152
-                + (prettify_serial.tx_pdata_nums[2]-128)*16384
-                + (prettify_serial.tx_pdata_nums[1]-128)*128
-                + (prettify_serial.tx_pdata_nums[0]-128) )- 134217728)/1000.0)
+            num = (
+                (
+                    (prettify_serial.tx_pdata_nums[3] - 128) * 2097152
+                    + (prettify_serial.tx_pdata_nums[2] - 128) * 16384
+                    + (prettify_serial.tx_pdata_nums[1] - 128) * 128
+                    + (prettify_serial.tx_pdata_nums[0] - 128)
+                )
+                - 134217728
+            ) / 1000.0
             prettify_serial.tx_pdata_count = 0
             prettify_serial.tx_pdata_nums = [128, 128, 128, 192]
-            string += '(' + str(num) + ') '
+            string += "(" + str(num) + ") "
         elif prettify_serial.rx_pdata_count == 4:
-            num = ((((prettify_serial.rx_pdata_nums[3]-128)*2097152
-                + (prettify_serial.rx_pdata_nums[2]-128)*16384
-                + (prettify_serial.rx_pdata_nums[1]-128)*128
-                + (prettify_serial.rx_pdata_nums[0]-128) )- 134217728)/1000.0)
+            num = (
+                (
+                    (prettify_serial.rx_pdata_nums[3] - 128) * 2097152
+                    + (prettify_serial.rx_pdata_nums[2] - 128) * 16384
+                    + (prettify_serial.rx_pdata_nums[1] - 128) * 128
+                    + (prettify_serial.rx_pdata_nums[0] - 128)
+                )
+                - 134217728
+            ) / 1000.0
             prettify_serial.rx_pdata_count = 0
             prettify_serial.rx_pdata_nums = [128, 128, 128, 192]
-            string += '(' + str(num) + ') '
+            string += "(" + str(num) + ") "
 
-    if len(string) >= 2 and string[-2] == ',':
+    if len(string) >= 2 and string[-2] == ",":
         string = string[:-2]
-    elif len(string) >= 1 and string[-1] == ' ':
+    elif len(string) >= 1 and string[-1] == " ":
         string = string[:-1]
 
     return string
 
 
-def find_controller(baudrate=conf['baudrate'], verbose=True):
+def find_controller(baudrate=conf["baudrate"], verbose=True):
     iterator = sorted(serial.tools.list_ports.comports())
     # look for Arduinos
     arduinos = []
-    for port, desc, hwid in iterator:
+    for port, desc, _ in iterator:
         if "uino" in desc:
             arduinos.append(port)
     # check these arduinos for driveboard firmware, take first
     for port in arduinos:
         try:
-            s = serial.Serial(port=port, baudrate=baudrate, timeout=2.0)
-            lasaur_hello = s.read(8)
-            if lasaur_hello.find(ord(INFO_HELLO)) > -1:
-                s.close()
-                return port
-            s.close()
+            with serial.Serial(port=port, baudrate=baudrate, timeout=2.0) as s:
+                lasaur_hello = s.read(8)
+                if lasaur_hello.find(ord(INFO_HELLO)) > -1:
+                    return port
         except serial.SerialException:
             pass
     # check all comports for driveboard firmware
-    for port, desc, hwid in iterator:
+    for port, _desc, _hwid in iterator:
         try:
-            s = serial.Serial(port=port, baudrate=baudrate, timeout=2.0)
-            lasaur_hello = s.read(8)
-            if lasaur_hello.find(ord(INFO_HELLO)) > -1:
-                s.close()
-                return port
-            s.close()
+            with serial.Serial(port=port, baudrate=baudrate, timeout=2.0) as s:
+                lasaur_hello = s.read(8)
+                if lasaur_hello.find(ord(INFO_HELLO)) > -1:
+                    return port
         except serial.SerialException:
             pass
     # handle the case Arduino without firmware
@@ -714,8 +992,15 @@ def find_controller(baudrate=conf['baudrate'], verbose=True):
     return None
 
 
-def connect(port=conf['serial_port'], baudrate=conf['baudrate'], verbose=True):
+@_serialized_operation
+def connect(port=None, baudrate=None, verbose=True):
     global SerialLoop
+    # resolve config at call time, not import time (serial_port is set after
+    # auto-detect on first connect)
+    if port is None:
+        port = conf["serial_port"]
+    if baudrate is None:
+        baudrate = conf["baudrate"]
     if not SerialLoop:
         SerialLoop = SerialLoopClass()
 
@@ -727,12 +1012,13 @@ def connect(port=conf['serial_port'], baudrate=conf['baudrate'], verbose=True):
         # many bytes were actually written if this is different from requested.
         # Work around: use a big enough timeout and a small enough chunk size.
         try:
-            if conf['usb_reset_hack']:
+            if conf["usb_reset_hack"]:
                 import flash
+
                 flash.usb_reset_hack()
-            # connect
+            # reset the controller and wait for its hello
             SerialLoop.device = serial.Serial(port, baudrate, timeout=0, writeTimeout=4)
-            if conf['hardware'] == 'standard':
+            if conf["hardware"] == "standard":
                 # clear throat
                 # Toggle DTR to reset Arduino
                 SerialLoop.device.setDTR(False)
@@ -743,6 +1029,7 @@ def connect(port=conf['serial_port'], baudrate=conf['baudrate'], verbose=True):
                 SerialLoop.device.flushOutput()
             else:
                 import flash
+
                 flash.reset_atmega()
                 time.sleep(0.5)
                 SerialLoop.device.flushInput()
@@ -758,20 +1045,32 @@ def connect(port=conf['serial_port'], baudrate=conf['baudrate'], verbose=True):
                 if data.find(ord(INFO_HELLO)) > -1:
                     if verbose:
                         print("Controller says Hello!")
-                        print("Connected on serial port: %s" % (port))
+                        print(f"Connected on serial port: {port}")
                     break
 
             SerialLoop.start()  # this calls run() in a thread
         except serial.SerialException:
+            # handshake/open failed: close the port if we opened it (the thread
+            # hasn't started yet) so we don't leak the OS serial handle
+            if SerialLoop and SerialLoop.device:
+                try:
+                    SerialLoop.device.close()
+                except Exception:
+                    pass
             SerialLoop = None
             if verbose:
-                print("ERROR: Cannot connect serial on port: %s" % (port))
+                print(f"ERROR: Cannot connect serial on port: {port}")
     else:
         if verbose:
             print("ERROR: disconnect first")
 
 
-def connect_withfind(port=conf['serial_port'], baudrate=conf['baudrate'], verbose=True):
+@_serialized_operation
+def connect_withfind(port=None, baudrate=None, verbose=True):
+    if port is None:
+        port = conf["serial_port"]
+    if baudrate is None:
+        baudrate = conf["baudrate"]
     connect(port=port, baudrate=baudrate, verbose=verbose)
     if not connected():
         # try finding driveboard
@@ -781,33 +1080,80 @@ def connect_withfind(port=conf['serial_port'], baudrate=conf['baudrate'], verbos
         serialfindresult = find_controller(verbose=verbose)
         if serialfindresult:
             if verbose:
-                print("INFO: Hardware found at %s." % serialfindresult)
+                print(f"INFO: Hardware found at {serialfindresult}.")
             connect(port=serialfindresult, baudrate=baudrate, verbose=verbose)
             if not connected():  # special case arduino found, but no firmware
                 yesno = input("Firmware appears to be missing. Want to flash-upload it (Y/N)? ")
-                if yesno in ('Y', 'y'):
+                if yesno in ("Y", "y"):
                     ret = flash(serial_port=serialfindresult)
                     if ret == 0:
                         connect(port=serialfindresult, baudrate=baudrate, verbose=verbose)
         if connected():
             if verbose:
-                print("INFO: Connected at %s." % serialfindresult)
-            conf['serial_port'] = serialfindresult
-            write_config_fields({'serial_port':serialfindresult})
+                print(f"INFO: Connected at {serialfindresult}.")
+            conf["serial_port"] = serialfindresult
+            write_config_fields({"serial_port": serialfindresult})
         else:
             if verbose:
-                print("-----------------------------------------------------------------------------")
+                print(
+                    "-----------------------------------------------------------------------------"
+                )
                 print("How to configure:")
-                print("https://github.com/nortd/driveboardapp/blob/master/docs/configure.md")
-                print("-----------------------------------------------------------------------------")
+                print("https://github.com/nortd/driveboardapp/blob/main/docs/configure.md")
+                print(
+                    "-----------------------------------------------------------------------------"
+                )
 
 
 def connected():
     global SerialLoop
-    return SerialLoop and bool(SerialLoop.device)
+    # a dead serial thread (e.g. after a disconnect) means we are NOT connected,
+    # even though the SerialLoop object and its (stale) device handle linger
+    return bool(
+        SerialLoop
+        and SerialLoop.device
+        and SerialLoop.is_alive()
+        and not SerialLoop.stop_processing
+    )
+
+
+@_serialized_operation
+def reconnect():
+    """Recover from a dropped serial link: tear down the dead serial loop (its
+    thread has exited and can't be restarted) and reconnect. The controller
+    resets on reconnect, so any in-flight job is lost and must be re-run.
+    No-op when already connected."""
+    global SerialLoop
+    if connected():
+        return
+    if SerialLoop is not None:
+        try:
+            if SerialLoop.device:
+                SerialLoop.device.close()
+        except Exception:
+            pass
+        if SerialLoop.is_alive():
+            SerialLoop.stop_processing = True
+            SerialLoop.join()
+        SerialLoop = None
+
+    print(f"INFO: serial disconnected, attempting reconnect on {conf['serial_port']}")
+    connect_withfind(verbose=False)
+    if connected():
+        print("INFO: serial reconnected")
+    else:
+        print("WARN: serial reconnect attempt failed")
 
 
 def close():
+    # Shutdown is not an interactive request that can sensibly return "busy".
+    # Wait for a producer holding the operation lock to leave the old loop,
+    # then tear it down. flash()/reset() already own this RLock and re-enter it.
+    with _operation_lock:
+        return _close_unlocked()
+
+
+def _close_unlocked():
     global SerialLoop
     if SerialLoop:
         if SerialLoop.device:
@@ -819,21 +1165,38 @@ def close():
         if SerialLoop.is_alive():
             SerialLoop.stop_processing = True
             SerialLoop.join()
+        if SerialLoop.device:
+            # close after the thread has stopped so it isn't using the port
+            try:
+                SerialLoop.device.close()
+            except Exception:
+                pass
     else:
         ret = False
     SerialLoop = None
     return ret
 
 
-def flash(serial_port=conf['serial_port'], firmware=conf['firmware']):
+@_serialized_operation
+def flash(serial_port=None, firmware=None):
     import flash
+
+    # read config at call time, not import time: the app only learns the serial
+    # port once it connects/auto-detects, well after this module is imported
+    if serial_port is None:
+        serial_port = conf["serial_port"]
+    if firmware is None:
+        firmware = conf["firmware"]
+    if not serial_port:
+        print("ERROR: no serial port set; connect to the machine first")
+        return 1
     reconnect = False
     if connected():
-        close()
+        close()  # release the port so avrdude can open it
         reconnect = True
     ret = flash.flash_upload(serial_port=serial_port, firmware=firmware)
     if reconnect:
-        connect()
+        connect(port=serial_port)
     if ret != 0:
         print("ERROR: flash failed")
     return ret
@@ -841,21 +1204,24 @@ def flash(serial_port=conf['serial_port'], firmware=conf['firmware']):
 
 def build():
     import build
+
     ret = build.build_all()
     if ret != 0:
         print("ERROR: build_all failed")
     return ret
 
 
+@_serialized_operation
 def reset():
     import flash
+
     reconnect = False
     if connected():
         close()
         reconnect = True
     flash.reset_atmega()
     if reconnect:
-        connect()
+        connect(port=conf["serial_port"])
 
 
 def status():
@@ -864,60 +1230,125 @@ def status():
         global SerialLoop
         with SerialLoop.lock:
             stats = copy.deepcopy(SerialLoop._status)
-            stats['serial'] = connected()  # make sure serial flag is up-to-date
+            stats["serial"] = connected()  # make sure serial flag is up-to-date
         return stats
     else:
-        return {'serial':False, 'ready':False}
+        return {"serial": False, "ready": False}
 
 
+@_serialized_operation
 def homing():
-    """Run homing cycle."""
+    """Run homing cycle.
+
+    A job on the machine holds this back, through the same guard the jogs go
+    by, which says so to whoever asked. Not yet knowing whether the machine is
+    idle is not a reason to refuse: a fresh connection has had no status frame
+    yet, and homing is exactly what it is for.
+    """
     global SerialLoop
     with SerialLoop.lock:
-        if SerialLoop._status['ready'] or SerialLoop._status['stops']:
-            SerialLoop.request_resume = True  # to recover from a stop mode
-            SerialLoop.send_command(CMD_HOMING)
-        else:
-            print("WARN: ignoring homing command while job running")
+        # the resume is only armed once the command is through the guard, and
+        # goes out ahead of it, to recover from a stop mode
+        SerialLoop.send_command(CMD_HOMING)
+        SerialLoop.request_resume = True
 
 
+def _clamp_param(name, val, lo, hi):
+    """Bound a motion parameter, reporting anything that had to be moved.
+
+    These are the last gate before the wire. Jobs are checked earlier with a
+    readable error, so a clamp here means something bypassed that check.
+    """
+    clamped = max(lo, min(val, hi))
+    if clamped != val:
+        print(f"WARN: {name} of {val} out of range [{lo}, {hi}], clamping to {clamped}")
+    return clamped
+
+
+@_serialized_operation
 def feedrate(val):
     global SerialLoop
     with SerialLoop.lock:
+        # zero or negative reaches the planner as a zero or wrapped step rate
+        val = _clamp_param("feedrate", val, MIN_FEEDRATE, MAX_FEEDRATE)
         SerialLoop.send_param(PARAM_FEEDRATE, val)
 
 
+@_serialized_operation
 def intensity(val):
     global SerialLoop
     with SerialLoop.lock:
-        val = max(min(255*val/100, 255), 0)
+        val = max(min(255 * val / 100, 255), 0)
         SerialLoop.send_param(PARAM_INTENSITY, val)
 
 
+@_serialized_operation
 def duration(val):
     global SerialLoop
     with SerialLoop.lock:
+        # a dwell holds the beam on in one spot for its whole duration
+        val = _clamp_param("duration", val, 0.0, MAX_DWELL_SECONDS)
         SerialLoop.send_param(PARAM_DURATION, val)
 
 
+@_serialized_operation
 def pixelwidth(val):
     global SerialLoop
     with SerialLoop.lock:
+        # zero selects a plain line, negative walks the raster pixel index back
+        val = _clamp_param("pixelwidth", val, 0.0, MAX_PARAM_VALUE)
         SerialLoop.send_param(PARAM_PIXEL_WIDTH, val)
 
 
+@_serialized_operation
+def mark_pass():
+    """Note the pass boundary the stream has reached, see jobtime.JobTimer.
+    Emits nothing, it only bookmarks where in the stream a pass starts."""
+    global SerialLoop
+    with SerialLoop.lock:
+        SerialLoop.mark_pass()
+
+
+@_serialized_operation
 def relative():
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_REF_RELATIVE)
 
 
+@_serialized_operation
 def absolute():
     global SerialLoop
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_REF_ABSOLUTE)
 
 
+def target_in_workarea(x=None, y=None, z=None, machine_coords=False):
+    """Whether an absolute move target stays within the work area.
+
+    Coordinates are in offset coordinates unless machine_coords is set (e.g.
+    supermove). None coordinates are ignored. Z is only bounded when the config
+    gives it a non-zero work area, since a machine with no Z axis configured
+    still has to be able to jog the focus.
+    """
+    global SerialLoop
+    if machine_coords:
+        x_off = y_off = z_off = 0.0
+    else:
+        with SerialLoop.lock:
+            x_off = SerialLoop._status["offset"][0]
+            y_off = SerialLoop._status["offset"][1]
+            z_off = SerialLoop._status["offset"][2]
+    if x is not None and not (-x_off <= x <= conf["workspace"][0] - x_off):
+        return False
+    if y is not None and not (-y_off <= y <= conf["workspace"][1] - y_off):
+        return False
+    if z is not None and conf["workspace"][2] and not (-z_off <= z <= conf["workspace"][2] - z_off):
+        return False
+    return True
+
+
+@_serialized_operation
 def move(x=None, y=None, z=None):
     global SerialLoop
     with SerialLoop.lock:
@@ -930,10 +1361,17 @@ def move(x=None, y=None, z=None):
         SerialLoop.send_command(CMD_LINE)
 
 
+@_serialized_operation
 def supermove(x=None, y=None, z=None):
-    """Moves in machine coordinates bypassing any offsets."""
+    """Moves in machine coordinates bypassing any offsets.
+
+    A positioning move, never a cut, so the beam goes off in the same locked
+    sequence. Intensity persists in the controller between commands. Sent
+    inline because intensity() would deadlock on the lock held here.
+    """
     global SerialLoop
     with SerialLoop.lock:
+        SerialLoop.send_param(PARAM_INTENSITY, 0)
         # clear offset
         SerialLoop.send_command(CMD_OFFSET_STORE)
         SerialLoop.send_command(CMD_REF_STORE)
@@ -956,15 +1394,25 @@ def supermove(x=None, y=None, z=None):
         SerialLoop.send_command(CMD_LINE)
 
 
-def rastermove(x, y, z=0.0):
+@_serialized_operation
+def rastermove(x, y, z=None):
+    """A raster move, like move() but latching pixel data along the way.
+
+    An axis left as None keeps the target the controller already holds, so a
+    raster does not disturb a focus the head was jogged to.
+    """
     global SerialLoop
     with SerialLoop.lock:
-        SerialLoop.send_param(PARAM_TARGET_X, x)
-        SerialLoop.send_param(PARAM_TARGET_Y, y)
-        SerialLoop.send_param(PARAM_TARGET_Z, z)
+        if x is not None:
+            SerialLoop.send_param(PARAM_TARGET_X, x)
+        if y is not None:
+            SerialLoop.send_param(PARAM_TARGET_Y, y)
+        if z is not None:
+            SerialLoop.send_param(PARAM_TARGET_Z, z)
         SerialLoop.send_command(CMD_RASTER)
 
 
+@_serialized_operation
 def rasterdata(data, start, end):
     # NOTE: no SerialLoop.lock
     # more granular locking in send_data
@@ -972,77 +1420,116 @@ def rasterdata(data, start, end):
 
 
 def pause():
+    """Freeze the machine in place, keeping its job.
+
+    An empty send buffer does not mean the machine has finished: the
+    controller holds an rx buffer and the planner up to BLOCK_BUFFER_SIZE
+    moves beyond it, which at the end of a job is real motion still to come.
+    So this goes by whether the controller reports itself idle, not by whether
+    there is anything left to send it.
+    """
     global SerialLoop
     with SerialLoop.lock:
-        if SerialLoop.tx_buffer:
-            SerialLoop._paused = True
+        if SerialLoop.tx_buffer or not SerialLoop._status["ready"]:
+            SerialLoop._paused = True  # stop feeding the buffer
+            SerialLoop.request_pause = True  # freeze the controller in place
 
 
 def unpause():
     global SerialLoop
     with SerialLoop.lock:
-        SerialLoop._paused = False
+        SerialLoop.request_unpause = True  # release the freeze, resume motion
+        SerialLoop._paused = False  # resume feeding the buffer
 
 
 def stop():
     """Force stop condition."""
     global SerialLoop
     with SerialLoop.lock:
-        SerialLoop.tx_buffer = []
+        SerialLoop.tx_buffer = bytearray()
         SerialLoop.tx_pos = 0
         SerialLoop.job_size = 0
+        SerialLoop.timer.reset()
+        SerialLoop.job_active = False
+        # a job still being queued would otherwise refill what was just emptied
+        SerialLoop.discard_writes = True
+        SerialLoop.clear_discard_after_dispatch = False
         SerialLoop.request_stop = True
+        SerialLoop._paused = False
 
 
 def unstop():
     """Resume from stop condition."""
     global SerialLoop
     with SerialLoop.lock:
+        if _dispatch_thread is None:
+            SerialLoop.discard_writes = False
+        else:
+            SerialLoop.clear_discard_after_dispatch = True
         SerialLoop.request_resume = True
 
 
+@_serialized_operation
+def dwell():
+    global SerialLoop
+    with SerialLoop.lock:
+        SerialLoop.send_command(CMD_DWELL)
+
+
+@_serialized_operation
 def air_on():
     global SerialLoop
+    if SerialLoop is None:
+        return
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_AIR_ENABLE)
 
 
+@_serialized_operation
 def air_off():
     global SerialLoop
+    if SerialLoop is None:
+        return
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_AIR_DISABLE)
 
 
+@_serialized_operation
 def aux_on():
     global SerialLoop
+    if SerialLoop is None:
+        return
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_AUX_ENABLE)
 
 
+@_serialized_operation
 def aux_off():
     global SerialLoop
+    if SerialLoop is None:
+        return
     with SerialLoop.lock:
         SerialLoop.send_command(CMD_AUX_DISABLE)
 
+
+@_serialized_operation
 def pulse():
-    print('pulse')
-    global SerialLoop
+    print("Pulsing laser")
     air_on()
-    # aux_on()
+
     # turn the laser on for a short pulse
-    intensity(50.0)
-    duration(0.25)
-    with SerialLoop.lock:
-        SerialLoop.send_command(CMD_DWELL)
-    # keep air on for a bit longer
+    intensity(float(conf["pulse_intensity"]))
+    duration(float(conf["pulse_duration"]))
+    dwell()
+    # dwell without firing for a second to keep air on
     intensity(0.0)
-    duration(0.75)
-    with SerialLoop.lock:
-        SerialLoop.send_command(CMD_DWELL)
+    duration(1)
+    dwell()
+
     air_off()
-    # aux_off()
 
 
+@_serialized_operation
 def offset(x=None, y=None, z=None):
     """Sets an offset relative to present pos."""
     global SerialLoop
@@ -1058,6 +1545,7 @@ def offset(x=None, y=None, z=None):
         SerialLoop.send_command(CMD_REF_RESTORE)
 
 
+@_serialized_operation
 def absoffset(x=None, y=None, z=None):
     """Sets an offset in machine coordinates."""
     global SerialLoop
@@ -1074,18 +1562,1114 @@ def absoffset(x=None, y=None, z=None):
 
 
 def jobfile(filepath):
-    jobdict = json.load(open(filepath))
+    with open(filepath) as fp:
+        jobdict = json.load(fp)
     job(jobdict)
 
 
 def job(jobdict):
-    if 'head' in jobdict:
-        if 'kind' in jobdict['head'] and jobdict['head']['kind'] == 'mill':
-            job_mill(jobdict)
+    """Queue a job for the machine.
+
+    Emitting a job is a long sequence of writes into one buffer, so two of
+    them at once would interleave into a stream that is neither. Requests are
+    served concurrently (so the stop button stays answerable while this runs),
+    hence the guard.
+
+    Raises ValueError if a job is already being queued.
+    """
+    from jobimport import resolve_image_data
+
+    global _dispatch_thread
+
+    if not _dispatch_lock.acquire(blocking=False):
+        raise MachineBusy("a job is already being queued")
+    if not _operation_lock.acquire(blocking=False):
+        _dispatch_lock.release()
+        raise MachineBusy("another machine operation is in progress")
+    _dispatch_thread = threading.get_ident()
+    started = False
+    try:
+        job_stop_guard()
+        # placements of one picture share its payload on disk, dispatch reads
+        # each def's own data
+        resolve_image_data(jobdict)
+        if "head" not in jobdict:
+            print("INFO: not a valid job, 'head' entry missing")
+            return
+
+        is_mill = jobdict["head"].get("kind") == "mill"
+        if is_mill:
+            if "defs" not in jobdict:
+                print("ERROR: invalid job")
+                return
+            job_mill_validate(jobdict)
         else:
-            job_laser(jobdict)
+            if "defs" not in jobdict or "items" not in jobdict:
+                print("ERROR: invalid job")
+                return
+            if "passes" not in jobdict:
+                print("NOTICE: no passes defined")
+                return
+            job_laser_validate(jobdict)
+
+        if SerialLoop is not None:
+            with SerialLoop.lock:
+                if SerialLoop.discard_writes or SerialLoop.request_stop:
+                    raise MachineBusy("the job dispatch was stopped")
+                if SerialLoop.job_active or not SerialLoop._status["ready"]:
+                    raise MachineBusy("the machine is not idle")
+                SerialLoop.discard_writes = False  # a new job starts clean
+                SerialLoop.clear_discard_after_dispatch = False
+                SerialLoop.job_active = True
+                SerialLoop._status["ready"] = False
+                started = True
+        try:
+            if is_mill:
+                job_mill(jobdict)
+            else:
+                job_laser(jobdict)
+        except Exception:
+            # A failure after admission may have left a partial program while
+            # the serial thread was already consuming it. Purging and stopping
+            # is the only safe recovery.
+            if started:
+                stop()
+            raise
+    finally:
+        if SerialLoop is not None:
+            with SerialLoop.lock:
+                _dispatch_thread = None
+                if SerialLoop.clear_discard_after_dispatch:
+                    SerialLoop.discard_writes = False
+                    SerialLoop.clear_discard_after_dispatch = False
+        else:
+            _dispatch_thread = None
+        _operation_lock.release()
+        _dispatch_lock.release()
+
+
+def job_stop_guard():
+    """Refuse to queue a job while the controller is in a stop condition.
+
+    A stop leaves the controller holding an rx buffer it only clears on resume,
+    so a job queued now would sit unsent behind a stale tally. Clearing the
+    stop is also where someone acknowledges why it happened.
+
+    Raises ValueError naming the active stops.
+    """
+    global SerialLoop
+
+    if SerialLoop is None:
+        return
+    with SerialLoop.lock:
+        stops = sorted(SerialLoop._status["stops"])
+    if stops:
+        raise ValueError(f"cannot start a job while stopped ({', '.join(stops)}), clear it first")
+
+
+def job_pass_params_validate(jobdict):
+    """Check each pass' motion parameters against the ranges the machine accepts.
+
+    A feed rate of zero or less gives the planner a zero or wrapped step rate,
+    and a long dwell holds the beam on in one spot, so both are rejected here
+    rather than silently clamped on the way to the wire.
+
+    Each pass takes its config default here rather than later, so a bad config
+    value is reported the same way a bad pass value is instead of reaching the
+    machine through the sender's silent clamp.
+
+    Raises a ValueError naming the offending pass and parameter.
+    """
+    bounds = {
+        "feedrate": (MIN_FEEDRATE, MAX_FEEDRATE),
+        "seekrate": (MIN_FEEDRATE, MAX_FEEDRATE),
+        "intensity": (0.0, 100.0),
+        "pxsize": (0.0, MAX_PARAM_VALUE),
+        "pierce_time": (0.0, MAX_DWELL_SECONDS),
+    }
+    defaults = {
+        "feedrate": conf["feedrate"],
+        "seekrate": conf["seekrate"],
+        "intensity": 0.0,
+        "pxsize": conf["pxsize"],
+        "pierce_time": conf["pierce_time"],
+    }
+    for passidx, pass_ in enumerate(jobdict["passes"]):
+        for key, (lo, hi) in bounds.items():
+            from_config = pass_.get(key) is None or pass_.get(key) == ""
+            if from_config:
+                # unset, or an svg cut setting tag that left the field empty,
+                # so take the default and hold it to the same bounds
+                pass_[key] = defaults[key]
+            # name the knob that actually holds the bad value
+            where = f"pass {passidx + 1}: {'config ' if from_config else ''}{key}"
+            try:
+                val = float(pass_[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"{where} of {pass_[key]!r} is not a number") from None
+            if not lo <= val <= hi:
+                raise ValueError(f"{where} of {val} outside [{lo}, {hi}]")
+            # store the coerced number, svg tags arrive as strings
+            pass_[key] = val
+        for key in ("air_assist", "aux_assist"):
+            # an unrecognised mode matches no branch and silently runs the job
+            # with that assist off, which for air is a fire risk
+            if key in pass_ and pass_[key] not in ASSIST_MODES:
+                raise ValueError(
+                    f"pass {passidx + 1}: {key} of {pass_[key]!r} is not one of {ASSIST_MODES}"
+                )
+
+
+def job_laser_validate(jobdict):
+    """
+    Validate that the defined passes stay within the work area.
+
+    Raises a ValueError with a descriptive message if the job is not valid.
+    """
+    global SerialLoop
+
+    job_pass_params_validate(jobdict)
+
+    with SerialLoop.lock:
+        offsets = list(SerialLoop._status["offset"])
+        # Firmware reports position in offset coordinates, the same coordinate
+        # system move() accepts. A relative pass begins wherever the head is
+        # now, not at the job origin.
+        current = list(SerialLoop._status["pos"])
+    while len(current) < 3:
+        current.append(0.0)
+
+    def check_point(point, passidx, kind):
+        if len(point) < 2:
+            raise ValueError(f"pass {passidx + 1}: malformed point in {kind}")
+        x, y = point[0], point[1]
+        x_off, y_off, z_off = offsets
+        x_lim = conf["workspace"][0] - x_off
+        y_lim = conf["workspace"][1] - y_off
+        err_str = ""
+        if y < -y_off:
+            err_str = "top "
+        elif y > y_lim:
+            err_str = "bottom "
+        if x < -x_off:
+            err_str += "left"
+        elif x > x_lim:
+            err_str += "right"
+        if err_str != "":
+            err_str = err_str.strip()
+            # the frontend displays the first pass as "pass 1" so use passidx+1
+            raise ValueError(f"pass {passidx + 1}: point in {kind} beyond {err_str} of work area")
+        if len(point) >= 3 and conf["workspace"][2]:
+            z = point[2]
+            if not -z_off <= z <= conf["workspace"][2] - z_off:
+                raise ValueError(f"pass {passidx + 1}: point in {kind} beyond Z of work area")
+
+    # loop passes
+    absolute_motion_seen = False
+    for passidx, pass_ in enumerate(jobdict["passes"]):
+        # set absolute/relative
+        is_relative = pass_.get("relative", False)
+
+        # loop pass' items
+        for itemidx in pass_["items"]:
+            item = jobdict["items"][itemidx]
+            def_ = jobdict["defs"][item["def"]]
+            kind = def_["kind"]
+
+            if kind == "image":
+                if is_relative:
+                    # Raster generation emits many absolute-looking segment
+                    # coordinates. In relative controller mode those become a
+                    # cumulative walk and cannot be bounded from the image box.
+                    raise ValueError(f"pass {passidx + 1}: relative image passes are unsafe")
+                # an all-white or transparent margin is skipped by the engraver,
+                # so only the part that actually burns has to fit
+                try:
+                    corners = _raster_engraved_box_mm(def_, pass_)
+                except Exception as e:
+                    # the engraver decodes the same bytes, so it would raise
+                    # part way through the job with the assists already on
+                    raise ValueError(
+                        f"pass {passidx + 1}: image data cannot be read ({e})"
+                    ) from None
+                if corners is None:
+                    continue  # nothing engraves, nothing to check
+
+                # the image is aligned with the axes, so two opposite corners
+                # are enough to tell whether it fits in the work area
+                check_point(corners[0], passidx, kind)
+                check_point(corners[1], passidx, kind)
+                absolute_motion_seen = True
+
+            elif kind == "fill" or kind == "path":
+                if is_relative and absolute_motion_seen:
+                    # Absolute path/raster emission may be reordered and its
+                    # exact final head position is not part of the job format.
+                    # Do not guess the start of subsequent relative motion.
+                    raise ValueError(
+                        f"pass {passidx + 1}: relative motion after absolute motion is unsafe"
+                    )
+                path = def_["data"]
+                for polyline in path:
+                    for pos in polyline:
+                        if is_relative:
+                            if len(pos) < 2:
+                                raise ValueError(f"pass {passidx + 1}: malformed point in {kind}")
+                            current[0] += pos[0]
+                            current[1] += pos[1]
+                            if len(pos) >= 3:
+                                current[2] += pos[2]
+                            check_point(current, passidx, kind)
+                        else:
+                            check_point(pos, passidx, kind)
+                            absolute_motion_seen = True
+
+
+def _emit_raster_segment(orientation, seekrate, feedrate_, intensity_, exit_y=None):
+    """Stream one raster segment: seek to lead-in, ramp in, raster move with
+    pixel data, ramp out. `orientation` describes one engraving direction of a
+    segment: absolute mm positions (leadin/start/end/leadout, line_y) and the
+    pixel slice (data/lo/hi).
+
+    start and end are the outer edges of the first and last pixel, so a run of
+    n pixels travels n pixel widths. The controller latches a pixel every pixel
+    width from the start of the move, so each pixel burns over its own extent,
+    and even a lone pixel gets a move long enough for the planner to keep.
+
+    exit_y ends the lead-out on the next segment's scanline instead of this
+    one, see _raster_exit_y. The beam is already off by then, so the tilt only
+    changes where the head comes to rest.
+    """
+    line_y = orientation["line_y"]
+    intensity(0.0)  # intensity for seek and lead-in
+    feedrate(seekrate)  # feedrate for seek
+    move(orientation["leadin"], line_y)  # seek to lead-in start
+    feedrate(feedrate_)  # feedrate for lead-in, raster, and lead-out
+    move(orientation["start"], line_y)  # lead-in
+    intensity(intensity_)  # intensity for raster move
+    rastermove(orientation["end"], line_y)  # raster move
+    rasterdata(orientation["data"], orientation["lo"], orientation["hi"])  # stream raster data
+    intensity(0.0)  # intensity for lead-out
+    move(orientation["leadout"], line_y if exit_y is None else exit_y)  # lead-out
+
+
+# How far off its own scanline a lead-out may finish, as a fraction of the x
+# travel it has to get there. The controller takes a junction at full speed
+# while the turn into it stays under about 18 degrees (a 0.32 slope), so this
+# keeps the tilt well inside the corner it will not brake for.
+_RASTER_TILT_MAX_SLOPE = 0.1
+
+
+def _raster_exit_y(orientation, next_orientation):
+    """The y to end `orientation`'s lead-out on, None to leave it on its own
+    scanline.
+
+    A scanline's y advance is otherwise a standalone hop of a fraction of a
+    millimetre: the whole gantry accelerates and stops for it, once per line,
+    always in the same direction within an image. Ending the lead-out on the
+    next scanline spreads that advance over the lead-out's x travel instead, so
+    y is only ever the minor axis of a long move and never starts and stops on
+    its own. Only a shallow tilt qualifies, so the corner out of the raster
+    move stays straight enough to take at full speed, which also rules out
+    tilting towards a scanline that is far away or a lead-out clamped to no x
+    travel at all.
+    """
+    if next_orientation is None:
+        return None
+    dy = next_orientation["line_y"] - orientation["line_y"]
+    if dy == 0.0:
+        return None
+    if abs(dy) > _RASTER_TILT_MAX_SLOPE * abs(orientation["leadout"] - orientation["end"]):
+        return None
+    return next_orientation["line_y"]
+
+
+def _emit_raster_run(orientations, seekrate, feedrate_, intensity_):
+    """Emit raster segments in the order given, each lead-out tilted onto the
+    next segment's scanline where it can be, see _raster_exit_y. Returns the
+    last orientation emitted, or None if there were none."""
+    prev = None
+    for orientation in orientations:
+        if prev is not None:
+            _emit_raster_segment(
+                prev, seekrate, feedrate_, intensity_, _raster_exit_y(prev, orientation)
+            )
+        prev = orientation
+    if prev is not None:
+        _emit_raster_segment(prev, seekrate, feedrate_, intensity_)  # nothing left to tilt onto
+    return prev
+
+
+def _raster_orientations(
+    lo,
+    hi,
+    line_start,
+    line_y,
+    posx,
+    pxsize_x,
+    leadin,
+    x_min,
+    x_max,
+    pxarray,
+    pxarray_reversed,
+    px_n,
+):
+    """Build the two engraving orientations (left-to-right and right-to-left)
+    for a canonical raster run spanning pixel indices [lo, hi).
+
+    start and end are pixel edges, see _emit_raster_segment.
+    """
+    left_x = posx + (lo - line_start) * pxsize_x
+    right_x = posx + (hi - line_start) * pxsize_x
+    leadin_left = max(left_x - leadin, x_min)
+    leadout_right = min(right_x + leadin, x_max)
+    fwd = {
+        "leadin": leadin_left,
+        "start": left_x,
+        "end": right_x,
+        "leadout": leadout_right,
+        "line_y": line_y,
+        "data": pxarray,
+        "lo": lo,
+        "hi": hi,
+    }
+    rev = {
+        "leadin": leadout_right,
+        "start": right_x,
+        "end": left_x,
+        "leadout": leadin_left,
+        "line_y": line_y,
+        "data": pxarray_reversed,
+        "lo": px_n - hi,
+        "hi": px_n - lo,
+    }
+    return fwd, rev
+
+
+def _order_raster_bidi(
+    orients, line_of, start, line_count, next_rect=None, seekrate=None, feedrate_=None
+):
+    """Bidirectional scanline order over collected raster segments, entering
+    at whichever of the four corner starts (top/bottom, first pass
+    left-to-right/right-to-left) costs the least planner-model seek time
+    from `start`.
+
+    Each variant replicates the emitter's parity: the pass direction flips on
+    every line of the image, engraved or not. Approach and interior seeks are
+    costed exactly, including the ramps a direction reversal forces. A corner
+    start that saves its approach can strand the exit on the far side of the
+    image from the next item, so when next_rect (the next item's extent) is
+    known, the seek towards it counts too.
+
+    orients ... (fwd, rev) orientation dicts per segment
+    line_of ... image line index per segment
+    Returns [(segment_index, direction), ...] in emission order.
+    """
+    from jobimport import pathoptimizer
+
+    if seekrate is None:
+        seekrate = pathoptimizer.DEFAULT_SEEKRATE
+    if feedrate_ is None:
+        feedrate_ = pathoptimizer.DEFAULT_FEEDRATE
+    by_line = {}
+    for i, li in enumerate(line_of):
+        by_line.setdefault(li, []).append(i)  # canonical order is left-to-right
+    best = None
+    for bottom_up in (False, True):
+        for d0 in (1, -1):
+            first_li = line_count - 1 if bottom_up else 0
+            order = []
+            for li in sorted(by_line, reverse=bottom_up):
+                d = d0 if (li - first_li) % 2 == 0 else -d0
+                idxs = by_line[li] if d == 1 else reversed(by_line[li])
+                order.extend((i, d) for i in idxs)
+            total = 0.0
+            pos = start
+            pdir = None
+            for i, d in order:
+                o = orients[i][0] if d == 1 else orients[i][1]
+                sdir = (1.0, 0.0) if d == 1 else (-1.0, 0.0)
+                total += pathoptimizer.seek_time(
+                    pos, pdir, [o["leadin"], o["line_y"]], sdir, seekrate, feedrate_
+                )
+                pos = [o["leadout"], o["line_y"]]
+                pdir = sdir
+            if next_rect is not None:
+                towards = [
+                    min(max(pos[0], next_rect[0]), next_rect[2]),
+                    min(max(pos[1], next_rect[1]), next_rect[3]),
+                ]
+                total += pathoptimizer.seek_time(pos, pdir, towards, None, seekrate, feedrate_)
+            if best is None or total < best[0]:
+                best = (total, order)
+    return best[1]
+
+
+def _emit_raster_bidi(
+    segments,
+    start,
+    next_rect,
+    px_w,
+    line_count,
+    posx,
+    pxsize_x,
+    leadin,
+    x_min,
+    x_max,
+    pxarray,
+    pxarray_reversed,
+    px_n,
+    seekrate,
+    feedrate_,
+    intensity_,
+):
+    """Emit collected raster segments in the cheapest of the four bidirectional
+    corner starts, see _order_raster_bidi. Returns the head position after the
+    last segment, or None if there were none."""
+    if not segments:
+        return None
+    orients = []
+    line_of = []
+    for lo, hi, line_start, line_y in segments:
+        orients.append(
+            _raster_orientations(
+                lo,
+                hi,
+                line_start,
+                line_y,
+                posx,
+                pxsize_x,
+                leadin,
+                x_min,
+                x_max,
+                pxarray,
+                pxarray_reversed,
+                px_n,
+            )
+        )
+        line_of.append(line_start // px_w)
+    last = _emit_raster_run(
+        (
+            orients[i][0] if d == 1 else orients[i][1]
+            for i, d in _order_raster_bidi(
+                orients, line_of, start, line_count, next_rect, seekrate, feedrate_
+            )
+        ),
+        seekrate,
+        feedrate_,
+        intensity_,
+    )
+    return [last["leadout"], last["line_y"]] if last else None
+
+
+def _emit_raster_nn(
+    segments,
+    start,
+    next_rect,
+    posx,
+    pxsize_x,
+    leadin,
+    x_min,
+    x_max,
+    pxarray,
+    pxarray_reversed,
+    px_n,
+    seekrate,
+    feedrate_,
+    intensity_,
+):
+    """Emit collected raster segments ordered for minimal seek travel from
+    `start`, choosing each segment's orientation by whichever end the head
+    enters. A greedy nearest-neighbor tour is built first, then a 2-opt pass
+    untangles the crossings greedy leaves behind (useful for sparse /
+    large-whitespace images). Returns the head position after the last
+    segment, or None if there were none."""
+    from jobimport import kdtree, pathoptimizer
+
+    if not segments:
+        return None
+    orients = []
+    tree = kdtree.Tree(2)
+    for idx, (lo, hi, line_start, line_y) in enumerate(segments):
+        fwd, rev = _raster_orientations(
+            lo,
+            hi,
+            line_start,
+            line_y,
+            posx,
+            pxsize_x,
+            leadin,
+            x_min,
+            x_max,
+            pxarray,
+            pxarray_reversed,
+            px_n,
+        )
+        nodes = (
+            tree.insert([fwd["leadin"], line_y], (idx, 0)),
+            tree.insert([rev["leadin"], line_y], (idx, 1)),
+        )
+        orients.append(((fwd, rev), nodes))
+    current = list(start)
+    tour = []
+    for _ in range(len(segments)):
+        node, _distsq = tree.nearest(current, checkempty=True)
+        if node is None:
+            break
+        idx, which = node.data
+        (fwd, rev), (node_fwd, node_rev) = orients[idx]
+        node_fwd.data = None  # consume both orientations of this segment
+        node_rev.data = None
+        orientation = fwd if which == 0 else rev
+        tour.append([idx, which == 1])
+        current = [orientation["leadout"], orientation["line_y"]]
+
+    # a segment's two lead-in points are where a seek can enter or leave it,
+    # and every unreversed segment burns left to right. Scanline endpoints
+    # stack in near-identical columns, so rasters get deeper candidate lists
+    n_segs = len(orients)
+    pathoptimizer.improve_seek_order(
+        [[o[0][0]["leadin"], o[0][0]["line_y"]] for o in orients],
+        [[o[0][1]["leadin"], o[0][1]["line_y"]] for o in orients],
+        tour,
+        list(start),
+        k=min(n_segs, 256),
+        dirs=([(1.0, 0.0)] * n_segs, [(1.0, 0.0)] * n_segs),
+        seekrate=seekrate,
+        feedrate=feedrate_,
+        end_rect=next_rect,
+    )
+
+    last = _emit_raster_run(
+        (orients[idx][0][1] if reverse else orients[idx][0][0] for idx, reverse in tour),
+        seekrate,
+        feedrate_,
+        intensity_,
+    )
+    return [last["leadout"], last["line_y"]] if last else None
+
+
+def _pass_pxsize(pass_):
+    """The (x, y) raster pixel size of a pass in mm, with 2x horizontal
+    resolution. Clamped to 0.01 mm so it can never divide by zero."""
+    pxsize_y = max(float(pass_.get("pxsize", conf["pxsize"])), 0.01)
+    return pxsize_y / 2.0, pxsize_y
+
+
+def _reachable_x_range():
+    """The x travel limits in offset coordinates, which is what move() sends.
+
+    The controller adds the table offset to every target, so clamping a raster
+    lead-in or lead-out against the raw machine width would let it run past the
+    end of travel by as much as the offset. With no machine there is no offset
+    to add, which is the case the job preview asks from.
+    """
+    global SerialLoop
+
+    if SerialLoop is None:
+        return 0.0, conf["workspace"][0]
+    with SerialLoop.lock:
+        x_off = SerialLoop._status["offset"][0]
+    return -x_off, conf["workspace"][0] - x_off
+
+
+def _raster_grayscale(data, px_w, px_h):
+    """Decode the base64 image to a px_w x px_h grayscale PIL image, with
+    transparency composited onto white and invert applied.
+    0=black/full power, 255=white/no power."""
+    # everything after the comma is the payload, so this works whatever the
+    # mime type is, and a bare base64 string with no data URI prefix works too
+    imgobj = Image.open(io.BytesIO(base64.b64decode(data.split(",", 1)[-1])))
+    imgobj = imgobj.resize((px_w, px_h), resample=Image.BICUBIC)
+    if imgobj.mode in ["PA", "LA", "RGBA", "La", "RBGa"]:
+        imgobj = imgobj.convert("RGBA")
+        imgbg = Image.new("RGBA", imgobj.size, (255, 255, 255))
+        imgbg.paste(imgobj, imgobj)
+        imgobj = imgbg.convert("L")
     else:
-        print("INFO: not a valid job, 'head' entry missing")
+        imgobj = imgobj.convert("L")
+
+    if conf["raster_invert"]:
+        imgobj = imgobj.point(lambda px: 255 - px)
+    return imgobj
+
+
+def _raster_engraved_box(imgobj, px_w, px_h):
+    """Pixel box (x0, y0, x1, y1) of what a grayscale raster will actually burn.
+
+    The engraver skips pure white (255), both whole scanlines and the
+    whitespace at either end of a line, so an all-white margin never moves the
+    head and must not count towards the job's extent. The box is grown by a
+    pixel on each side to cover dithering error diffused into that margin.
+    Returns None if nothing will be engraved at all.
+    """
+    # getbbox() reports the extent of the non-zero pixels, so map white to zero
+    box = imgobj.point(lambda px: 0 if px == 255 else 255).getbbox()
+    if box is None:
+        return None
+    return (
+        max(box[0] - 1, 0),
+        max(box[1] - 1, 0),
+        min(box[2] + 1, px_w),
+        min(box[3] + 1, px_h),
+    )
+
+
+def _raster_engraved_box_mm(def_, pass_):
+    """Absolute mm corners [[x0,y0], [x1,y1]] of the part of an image def that
+    will actually be engraved in `pass_`, or None if nothing will be."""
+    pos = def_["pos"]
+    size = def_["size"]
+    pxsize_x, pxsize_y = _pass_pxsize(pass_)
+    px_w = int(size[0] / pxsize_x)
+    px_h = int(size[1] / pxsize_y)
+    if px_w <= 0 or px_h <= 0:
+        return None
+    box = _raster_engraved_box(_raster_grayscale(def_["data"], px_w, px_h), px_w, px_h)
+    if box is None:
+        return None
+    return [
+        [pos[0] + box[0] / px_w * size[0], pos[1] + box[1] / px_h * size[1]],
+        [pos[0] + box[2] / px_w * size[0], pos[1] + box[3] / px_h * size[1]],
+    ]
+
+
+def _raster_load_pixels(data, px_w, px_h, n_raster_levels):
+    """Decode the base64 image to a flat grayscale pixel list (0=black/full
+    power, 255=white/no power), applying invert and dithering. Returns
+    (pxarray, pxarray_reversed, px_n, engraved_box)."""
+    imgobj = _raster_grayscale(data, px_w, px_h)
+    engraved_box = _raster_engraved_box(imgobj, px_w, px_h)
+
+    pxarray = list(imgobj.getdata())
+    pxarray[:] = (value for value in pxarray if type(value) is not str)
+    if n_raster_levels < 128:  # skip dithering if max resolution
+        pxarray = raster_dither(px_w, px_h, pxarray, n_raster_levels)
+    pxarray_reversed = pxarray[::-1]
+
+    return pxarray, pxarray_reversed, len(pxarray), engraved_box
+
+
+def _raster_line_segments(line, line_start, line_end, direction, pxsize_x, raster_leadin):
+    """Walk one scanline and yield the (segment_start, segment_end) index pairs
+    of engraved runs: trim leading/trailing whitespace and split on interior
+    whitespace wider than 2*raster_leadin (so the head can fast-seek the gaps).
+    Indices follow the direction convention; segment_end is already trimmed."""
+    whitespace_counter = 0
+    on_starting_edge = True
+    if direction == 1:  # fwd
+        segment_start = line_start
+        segment_end = segment_start - 1  # will immediately increment
+    else:  # rev
+        line = line[::-1]
+        segment_start = line_end
+        segment_end = segment_start + 1  # will immediately decrement
+
+    for j in range(len(line)):
+        segment_end += 1 * direction
+        if line[j] == 255:
+            whitespace_counter += 1
+        elif on_starting_edge:
+            # make the first non-white pixel our starting point
+            segment_start = segment_end
+            on_starting_edge = False
+            whitespace_counter = 0
+        elif whitespace_counter * pxsize_x <= 2 * raster_leadin:
+            # if the interior whitespace is too small, ignore it and travel at normal speeds
+            whitespace_counter = 0
+
+        segment_ended = False
+        if j == (len(line) - 1):
+            segment_ended = True
+        elif (
+            (whitespace_counter * pxsize_x > 2 * raster_leadin)
+            and (line[j + 1] != 255)
+            and not (on_starting_edge)
+        ):
+            # travel to the end of the interior whitespace, backtrack via whitespace_counter
+            segment_ended = True
+
+        if segment_ended:
+            if direction == 1:  # fwd
+                segment_end = segment_end - whitespace_counter + 1  # cut off ending whitespace
+            else:  # rev
+                segment_end = segment_end + whitespace_counter - 1  # cut off ending whitespace
+            yield segment_start, segment_end
+            # prime for next segment
+            segment_start = segment_end + whitespace_counter * direction
+            segment_end = segment_start - 1 * direction
+            whitespace_counter = 0
+
+
+def _job_laser_image(
+    def_, pass_, pxsize_x, pxsize_y, seekrate, feedrate_, intensity_, head_pos=None, next_rect=None
+):
+    """Engrave one image def. head_pos is the planar head position on entry
+    (used to anchor seek-optimized ordering), the image corner if unknown.
+    next_rect is the extent of the item that follows, letting the corner
+    choice keep the exit near it. Returns the head position after the last
+    emitted segment, or head_pos if nothing engraves."""
+    pos = def_["pos"]
+    size = def_["size"]
+    data = def_["data"]  # in base64, format: jpg, png, gif
+    px_w = int(size[0] / pxsize_x)
+    px_h = int(size[1] / pxsize_y)
+
+    # note that 0-255 pixel data is halved for serial protocol, so we only get 128 levels max
+    n_raster_levels = max(min(round(conf["raster_levels"]), 128), 2)
+    if n_raster_levels != conf["raster_levels"]:
+        print(
+            f"WARN: config raster_levels={conf['raster_levels']} invalid, set to {n_raster_levels}"
+        )
+    raster_mode = conf["raster_mode"]
+    if raster_mode not in ["Forward", "Reverse", "Bidirectional", "NearestNeighbor"]:
+        raster_mode = "Bidirectional"
+        print("WARN: raster_mode not recognized. Please check your config file.")
+
+    pxarray, pxarray_reversed, px_n, engraved_box = _raster_load_pixels(
+        data, px_w, px_h, n_raster_levels
+    )
+
+    # assists on, beginning of feed if set to 'feed'
+    _feed_assists(pass_, True)
+
+    posx = pos[0]  # left edge location [mm]
+    posy = pos[1]  # top edge location [mm]
+    line_count = int(size[1] / pxsize_y)
+    x_min, x_max = _reachable_x_range()
+
+    # warn if there isn't room for the lead-in / lead-out moves. Only the
+    # engraved columns matter, as the head never enters an all-white margin.
+    if engraved_box is not None:
+        engraved_left = posx + engraved_box[0] * pxsize_x
+        engraved_right = posx + engraved_box[2] * pxsize_x
+        if engraved_left - conf["raster_leadin"] < x_min:
+            print("WARN: not enough leadin space")
+        if engraved_right + conf["raster_leadin"] > x_max:
+            print("WARN: not enough leadout space")
+
+    # set direction
+    if raster_mode == "Reverse":
+        direction = -1  # 1 is forward, -1 is reverse
+    else:  # 'Forward', 'Bidirectional', or 'NearestNeighbor'
+        direction = 1
+
+    # Bidirectional with a known head position picks the cheapest of the four
+    # corner starts after collecting, like NearestNeighbor it collects
+    # canonical forward segments and reorders after the scanline loop
+    pick_corner = raster_mode == "Bidirectional" and head_pos is not None
+    collect = raster_mode == "NearestNeighbor" or pick_corner
+    collected = []
+    last = None
+
+    for li in range(line_count):
+        line_start = li * px_w
+        line_end = line_start + px_w
+        line_y = posy + (li + 0.5) * pxsize_y
+        line = pxarray[line_start:line_end]
+        if not all(px == 255 for px in line):  # skip completely white raster lines
+            for segment_start, segment_end in _raster_line_segments(
+                line, line_start, line_end, direction, pxsize_x, conf["raster_leadin"]
+            ):
+                # limits for engraving and leading in/out for this segment.
+                # Both ends are pixel edges, and reverse indices count down, so
+                # one expression gives the leading edge in either direction.
+                pos_start = posx + (segment_start - line_start) * pxsize_x
+                pos_end = posx + (segment_end - line_start) * pxsize_x
+                if direction == 1:  # fwd
+                    pos_leadin = max(pos_start - conf["raster_leadin"], x_min)
+                    pos_leadout = min(pos_end + conf["raster_leadin"], x_max)
+                    orientation = {
+                        "leadin": pos_leadin,
+                        "start": pos_start,
+                        "end": pos_end,
+                        "leadout": pos_leadout,
+                        "line_y": line_y,
+                        "data": pxarray,
+                        "lo": segment_start,
+                        "hi": segment_end,
+                    }
+                else:  # rev
+                    pos_leadin = min(pos_start + conf["raster_leadin"], x_max)
+                    pos_leadout = max(pos_end - conf["raster_leadin"], x_min)
+                    orientation = {
+                        "leadin": pos_leadin,
+                        "start": pos_start,
+                        "end": pos_end,
+                        "leadout": pos_leadout,
+                        "line_y": line_y,
+                        "data": pxarray_reversed,
+                        "lo": px_n - segment_start,
+                        "hi": px_n - segment_end,
+                    }
+
+                if collect:
+                    collected.append((segment_start, segment_end, line_start, line_y))
+                else:
+                    # emit one segment behind, so each lead-out can end on the
+                    # scanline that follows it, see _raster_exit_y
+                    if last is not None:
+                        _emit_raster_segment(
+                            last,
+                            seekrate,
+                            feedrate_,
+                            intensity_,
+                            _raster_exit_y(last, orientation),
+                        )
+                    last = orientation
+
+        # prime for next line, collection always scans forward
+        if collect:
+            pass
+        elif (raster_mode == "Bidirectional") and (direction == 1):  # fwd
+            direction = -1  # switch to rev
+        elif (raster_mode == "Bidirectional") and (direction == -1):  # rev
+            direction = 1  # switch to fwd
+
+    if last is not None:
+        _emit_raster_segment(last, seekrate, feedrate_, intensity_)  # nothing left to tilt onto
+
+    common = (
+        posx,
+        pxsize_x,
+        conf["raster_leadin"],
+        x_min,
+        x_max,
+        pxarray,
+        pxarray_reversed,
+        px_n,
+        seekrate,
+        feedrate_,
+        intensity_,
+    )
+    if raster_mode == "NearestNeighbor":
+        nn_last = _emit_raster_nn(
+            collected, head_pos[:2] if head_pos else [posx, posy], next_rect, *common
+        )
+        if nn_last:
+            return nn_last
+    elif pick_corner:
+        bidi_last = _emit_raster_bidi(collected, head_pos[:2], next_rect, px_w, line_count, *common)
+        if bidi_last:
+            return bidi_last
+
+    # left on for the next item, the pass end switches it off
+    return [last["leadout"], last["line_y"]] if last else head_pos
+
+
+# Which scopes currently want each assist output energised. An output is on
+# while any scope holds it, so one scope ending cannot cut an output another
+# still needs, and a repeat claim emits nothing.
+_assist_holds = {"air_assist": set(), "aux_assist": set()}
+
+
+def _assist_holds_reset():
+    for holds in _assist_holds.values():
+        holds.clear()
+
+
+def _assist_holds_release():
+    """Drop every hold, queueing an off for anything still energised."""
+    for key, turn_off in (("air_assist", air_off), ("aux_assist", aux_off)):
+        if _assist_holds[key]:
+            _assist_holds[key].clear()
+            turn_off()
+
+
+def _switch_assists(passes, scope, on):
+    """Claim or release `scope`'s hold on the assists that any of `passes` runs.
+
+    Scope is how long an assist stays on: 'feed' while burning, 'pass' for a
+    whole pass, 'job' for every pass in the job. Air and aux are independent
+    outputs and each picks its own scope. A command goes out only when the
+    output's overall state changes, so a pass ending leaves a job scope hold
+    energised and repeated feed claims across contiguous burns emit nothing.
+    """
+    for key, turn_on, turn_off in (
+        ("air_assist", air_on, air_off),
+        ("aux_assist", aux_on, aux_off),
+    ):
+        if not any(pass_.get(key) == scope for pass_ in passes):
+            continue
+        holds = _assist_holds[key]
+        was_on = bool(holds)
+        if on:
+            holds.add(scope)
+        else:
+            holds.discard(scope)
+        if bool(holds) != was_on:
+            (turn_on if on else turn_off)()
+
+
+def _feed_assists(pass_, on):
+    """Claim or release the 'feed' scope hold, held across contiguous burns.
+
+    Only the seek to the next contour separates one burn from the next, so
+    switching per contour would cycle the relay hundreds of times on a job of
+    small shapes and give the gas no time to come up.
+    """
+    _switch_assists([pass_], "feed", on)
+
+
+def _order_path_def(def_, pass_, seekrate, feedrate_, head_pos, next_rect, reorder):
+    """The polylines of a path def as dispatch burns them: re-sequenced,
+    reversed, and split, in emission order. Returns [(polyline, is_arc), ...]
+    where is_arc marks pieces of a split closed contour."""
+    polys = [p for p in def_["data"] if len(p) > 0]
+    tour = [[ci, False] for ci in range(len(polys))]
+    arc_flags = None
+    if reorder and not pass_.get("relative") and head_pos is not None and polys:
+        from jobimport import pathoptimizer
+
+        start = head_pos[:2]
+
+        def improve(polys, tour):
+            return pathoptimizer.improve_seek_order(
+                [p[0] for p in polys],
+                [p[-1] for p in polys],
+                tour,
+                start,
+                dirs=pathoptimizer.polyline_dirs(polys),
+                seekrate=seekrate,
+                feedrate=feedrate_,
+                end_rect=next_rect,
+            )
+
+        if conf["split_closed_paths"]:
+            # enter loops well first, then split them into arcs the ordering
+            # is free to interleave, a loop kept together burns as before.
+            # neither cut placement dominates, so both are improved and the
+            # cheaper tour wins
+            pathoptimizer.rotate_closed_entries(
+                polys, tour, start, seekrate, feedrate_, end_rect=next_rect
+            )
+            best = None
+            for neighbors in (False, True):
+                v_polys, v_flags = pathoptimizer.split_closed_paths(
+                    polys, start=start, neighbors=neighbors
+                )
+                if neighbors and best is not None and v_polys == best[1]:
+                    break
+                v_tour = [[ci, False] for ci in range(len(v_polys))]
+                v_cost = improve(v_polys, v_tour)
+                if best is None or (v_cost is not None and v_cost < best[0]):
+                    best = (v_cost, v_polys, v_tour, v_flags)
+                if not any(v_flags):
+                    break  # nothing split, the variants are identical
+            _cost, polys, tour, arc_flags = best
+        else:
+            improve(polys, tour)
+            # closed contours are free to be entered anywhere along the loop
+            pathoptimizer.rotate_closed_entries(
+                polys, tour, start, seekrate, feedrate_, end_rect=next_rect
+            )
+        # with nothing to head for afterwards a tour and its reverse cost
+        # the same inside, so whichever end is nearer the head starts
+        if next_rect is None and len(tour) > 1:
+            entry_dirs, exit_dirs = pathoptimizer.polyline_dirs(polys)
+
+            def tour_entry(t, flipped):
+                ci, rev = t
+                if flipped:
+                    rev = not rev
+                if rev:
+                    d = exit_dirs[ci]
+                    return polys[ci][-1][:2], None if d is None else (-d[0], -d[1])
+                return polys[ci][0][:2], entry_dirs[ci]
+
+            p_fwd, d_fwd = tour_entry(tour[0], False)
+            p_rev, d_rev = tour_entry(tour[-1], True)
+            t_fwd = pathoptimizer.seek_time(start, None, p_fwd, d_fwd, seekrate, feedrate_)
+            t_rev = pathoptimizer.seek_time(start, None, p_rev, d_rev, seekrate, feedrate_)
+            if t_rev < t_fwd - 1e-9:
+                tour[:] = [[ci, not rev] for ci, rev in reversed(tour)]
+    return [
+        (polys[ci][::-1] if rev else polys[ci], bool(arc_flags and arc_flags[ci]))
+        for ci, rev in tour
+    ]
+
+
+def _job_laser_path(
+    def_, pass_, seekrate, feedrate_, intensity_, head_pos=None, next_rect=None, reorder=False
+):
+    """Emit one path def. With reorder set (path kind, absolute pass, known
+    head position) the polylines are re-sequenced and reversed for minimal
+    planner-model seek time from head_pos towards next_rect, on top of the
+    import-time ordering. With conf split_closed_paths, closed contours may
+    also be burned as separate arcs when interleaving them saves travel,
+    arcs the ordering keeps adjacent burn as one continuous move. Fill defs
+    keep their deliberate scanline order. Returns the planar head position
+    after the last emitted vertex, head_pos if nothing was emitted, or None
+    if the pass is relative (the emitted targets are offsets, so the
+    position is unknown)."""
+    pierce_time = pass_["pierce_time"]
+    ordered = _order_path_def(def_, pass_, seekrate, feedrate_, head_pos, next_rect, reorder)
+    last = None
+    prev_burned = False
+    cut_points = set()  # split arc ends already burned, they need no pierce
+    for polyline, is_arc in ordered:
+        # a split arc entering on an already-cut point resumes a contour
+        resumes = is_arc and tuple(polyline[0][:2]) in cut_points
+        if is_arc:
+            cut_points.add(tuple(polyline[0][:2]))
+            cut_points.add(tuple(polyline[-1][:2]))
+        # an arc starting where the head rests continues the current burn,
+        # so re-joined pieces of a split contour stay one seamless cut
+        if prev_burned and len(polyline) > 1 and polyline[0] == last:
+            feedrate(feedrate_)
+            intensity(intensity_)
+            is_2d = len(polyline[0]) == 2
+            if is_2d:
+                for i in range(1, len(polyline)):
+                    move(polyline[i][0], polyline[i][1])
+            else:
+                for i in range(1, len(polyline)):
+                    move(polyline[i][0], polyline[i][1], polyline[i][2])
+            last = polyline[-1]
+            prev_burned = True
+            continue
+        # a lone vertex with no pierce only seeks, so it needs no assist
+        burns = pierce_time > 0 or len(polyline) > 1
+        # turn on assists if set to 'feed', before the seek so the gas is
+        # already flowing when the head arrives, and so the switch does not
+        # land between the seek and the pierce where it would break the
+        # deceleration the planner works out across that pair
+        if burns:
+            _feed_assists(pass_, True)
+        # first vertex -> seek
+        feedrate(seekrate)
+        if not pass_["seekzero"]:
+            intensity(intensity_)
+        else:
+            intensity(0.0)
+        is_2d = len(polyline[0]) == 2
+        if is_2d:
+            move(polyline[0][0], polyline[0][1])
+        else:
+            move(polyline[0][0], polyline[0][1], polyline[0][2])
+        # burn through in place first, otherwise a thick material is still
+        # being penetrated as the head sets off. A resumed split arc sits on
+        # kerf that is already through, so its pierce is skippable
+        if pierce_time > 0 and not (resumes and conf["skip_pierce_on_resume"]):
+            intensity(intensity_)
+            duration(pierce_time)
+            dwell()
+        # remaining vertices -> feed
+        if len(polyline) > 1:
+            feedrate(feedrate_)
+            intensity(intensity_)
+            if is_2d:
+                for i in range(1, len(polyline)):
+                    move(polyline[i][0], polyline[i][1])
+            else:
+                for i in range(1, len(polyline)):
+                    move(polyline[i][0], polyline[i][1], polyline[i][2])
+        # left on for the next contour, the pass end switches it off
+        last = polyline[-1]
+        prev_burned = burns
+    if pass_.get("relative"):
+        return None if last else head_pos
+    return [last[0], last[1]] if last else head_pos
 
 
 def job_laser(jobdict):
@@ -1096,302 +2680,488 @@ def job_laser(jobdict):
     ###########################################################################
     {
       "head": {
-          "noreturn": True,          # do not return to origin, default: False
-          "optimized": 0.08,         # optional, tolerance to which it was optimized, default: 0 (not optimized)
-       },
+        "noreturn": True,          # do not return to origin, default: False
+        "optimized": 0.08,         # optional, tolerance to which it was optimized, default: 0 (not optimized)
+      },
       "passes": [
-          {
-              "items": [0],          # item by index
-              "relative": True,      # optional, default: False
-              "seekrate": 6000,      # optional, rate to first vertex
-              "feedrate": 2000,      # optional, rate to other vertices
-              "intensity": 100,      # optional, default: 0 (in percent)
-              "seekzero": False,     # optional, default: True
-              "pierce_time": 0,      # optional, default: 0
-              "pxsize": [0.4],       # optional
-              "air_assist": "pass",  # optional (feed, pass, off), default: pass
-          }
+        {
+          "items": [0],            # item by index
+          "relative": True,        # optional, default: False
+          "seekrate": 6000,        # optional, rate to first vertex
+          "feedrate": 2000,        # optional, rate to other vertices
+          "intensity": 100,        # optional, default: 0 (in percent)
+          "seekzero": False,       # optional, default: True
+          "pierce_time": 0,        # optional, default: conf pierce_time
+          "pxsize": [0.4],         # optional
+          "air_assist": "pass",    # optional (off, feed, pass, job), default: pass
+          "aux_assist": "off",     # optional (off, feed, pass, job), default: off
+        }
       ],
-     "items": [
+      "items": [
         {"def":0, "translate":[0,0,0], "color":"#BADA55"}
-     ],
-     "defs": [
+      ],
+      "defs": [
         {"kind":"path", "data":[[[0,10,0]]]},
         {"kind":"fill", "data":[[[0,10,0]]], "pxsize":0.4},
         {"kind":"image", "data":<data in base64>, "pos":[0,0], "size":[300,200]},
         {"kind":"mill", "data":[('G0',(x,y,z)), ('F', 1000), ('G1', (x,y,z))]},
-     ],
-     "stats":{"items":[{"bbox":[x1,y1,x2,y2], "len":100}], "all":{}}
+      ],
+      "stats":{"items":[{"bbox":[x1,y1,x2,y2], "len":100}], "all":{}}
     }
     ###########################################################################
     """
 
-    if not 'defs' in jobdict or not 'items' in jobdict:
+    if "defs" not in jobdict or "items" not in jobdict:
         print("ERROR: invalid job")
         return
 
-    if not 'passes' in jobdict:
+    if "passes" not in jobdict:
         print("NOTICE: no passes defined")
         return
 
-    # reset valves
+    # raises an exception if the job is not valid
+    job_laser_validate(jobdict)
+
+    # reset valves, including any holds a previous job may have left behind
+    _assist_holds_reset()
     air_off()
-    # aux_off()
+    aux_off()
 
-    # loop passes
-    for pass_ in jobdict['passes']:
-        if 'pxsize' in pass_:
-            pxsize_y = float(pass_['pxsize'])
-        else:
-            pxsize_y = float(conf['pxsize'])
-        pxsize_y = max(pxsize_y, 0.01)  # prevent div by 0
-        intensity(0.0)
-        pxsize_x = pxsize_y/2.0  # use 2x horiz resol.
-        pixelwidth(pxsize_x)
-        # assists on, beginning of pass if set to 'pass'
-        if 'air_assist' in pass_:
-            if pass_['air_assist'] == 'pass':
-                air_on()
-        else:
-            air_on()    # also default this behavior
-        # if 'aux_assist' in pass_ and pass_['aux_assist'] == 'pass':
-        #     aux_on()
-        # seekrate
-        if 'seekrate' in pass_:
-            seekrate = pass_['seekrate']
-        else:
-            seekrate = conf['seekrate']
-        # feedrate
-        if 'feedrate' in pass_:
-            feedrate_ = pass_['feedrate']
-        else:
-            feedrate_ = conf['feedrate']
-        # intensity
-        if 'intensity' in pass_:
-            intensity_ = pass_['intensity']
-        else:
-            intensity_ = 0.0
-        # set absolute/relative
-        if 'relative' not in pass_ or not pass_['relative']:
-            absolute()
-        else:
-            relative()
-        # loop pass' items
-        for itemidx in pass_['items']:
-            item = jobdict['items'][itemidx]
-            def_ = jobdict['defs'][item['def']]
-            kind = def_['kind']
-            if kind == "image":
-                pos = def_["pos"]
-                size = def_["size"]
-                data = def_["data"]  # in base64, format: jpg, png, gif
-                px_w = int(size[0]/pxsize_x)
-                px_h = int(size[1]/pxsize_y)
-                raster_mode = conf['raster_mode']
-                if raster_mode not in ['Forward', 'Reverse', 'Bidirectional']:
-                    raster_mode = 'Bidirectional'
-                    print("WARN: raster_mode not recognized. Please check your config file.")
-                
-                # create image obj, convert to grayscale, scale, loop through lines
-                imgobj = Image.open(io.BytesIO(base64.b64decode(data[22:])))
-                imgobj = imgobj.resize((px_w,px_h), resample=Image.BICUBIC)
-                if imgobj.mode == 'RGBA':
-                    imgbg = Image.new('RGBA', imgobj.size, (255, 255, 255))
-                    imgbg.paste(imgobj, imgobj)
-                    imgobj = imgbg.convert("L")
-                else:
-                    imgobj = imgobj.convert("L")
+    # assists on for the whole job if any pass asks for it
+    _switch_assists(jobdict["passes"], "job", True)
 
-                # assists on, beginning of feed if set to 'feed'
-                if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
-                    air_on()
-                # if 'aux_assist' in pass_ and pass_['aux_assist'] == 'feed':
-                #     aux_on()
-
-                # extract raw pixel data into one large list 
-                # 0 = black / full power
-                # 255 = white / transparent / no power
-                pxarray = list(imgobj.getdata())
-                pxarray[:] = (value for value in pxarray if type(value) is not str)
-                if conf['raster_invert']:
-                    pxarray = 255 - pxarray
-                pxarray_reversed = pxarray[::-1]
-                px_n = len(pxarray)
-
-                posx = pos[0] # left edge location [mm]
-                posy = pos[1] # top edge location [mm]
-                line_y = posy + 0.5*pxsize_y
-                line_count = int(size[1]/pxsize_y)
-                line_start = line_end = 0
-
-                # calc leadin/out
-                pos_leadin = posx - conf['raster_leadin']
-                if pos_leadin < 0:
-                    print("WARN: not enough leadin space")
-                    pos_leadin = 0
-                pos_leadout = posx + size[0] + conf['raster_leadin']
-                if pos_leadout > conf['workspace'][0]:
-                    print("WARN: not enough leadout space")
-                    pos_leadout = conf['workspace'][0]
-                
-                # print("mm: %s|%s|%s  h:%s" % ( posx + 0.5*pxsize_x - pos_leadin, size[0], pos_leadout - (posx + size[0] - 0.5*pxsize_x), size[1]))
-                # print("px: |%s|  raster_size:%s" % (px_w, pxsize_y))
-                # print(len(pxarray))
-                # print((px_w*px_h))
-
-                # set direction
-                if raster_mode == 'Reverse':
-                    direction = -1 # 1 is forward, -1 is reverse
-                else: # if 'Forward' or 'Bidirectional'
-                    direction = 1 
-
-                # we don't want to waste time at low speeds travelling over whitespace where there is no engraving going on
-                # so, chop off all whitespace at the beginning and end of each line
-                # additionally, break the line into segments so that large interior whitespaces can be travelled over quicker
-                # the threshold for a "large" interior whitespace is 2x the raster_leadin distance so we can still lead in/out properly
-                for i in range(line_count):
-                    line_end += px_w
-                    line = pxarray[line_start:line_end]
-                    if not all(px == 255 for px in line): # skip completely white raster lines
-                        whitespace_counter = 0
-                        on_starting_edge = True
-                        if direction == 1: # fwd
-                            segment_start = line_start
-                            segment_end = segment_start - 1 # will immediately increment
-                        elif direction == -1: # rev
-                            line = line[::-1]
-                            segment_start = line_end
-                            segment_end = segment_start + 1 # will immediately decrement
-
-                        for j in range(len(line)):
-                            segment_end += 1*direction
-                            if line[j] == 255:
-                                whitespace_counter += 1
-                            elif on_starting_edge: 
-                                # make the first non-white pixel our starting point
-                                segment_start = segment_end
-                                on_starting_edge = False
-                                whitespace_counter = 0
-                            elif whitespace_counter*pxsize_x <= 2*conf['raster_leadin']:
-                                # if the interior whitespace is too small, ignore it and travel at normal speeds
-                                whitespace_counter = 0
-                            
-                            segment_ended = False
-                            if j == (len(line) - 1):
-                                segment_ended = True
-                            elif (whitespace_counter*pxsize_x > 2*conf['raster_leadin']) and (line[j+1] != 255) and not (on_starting_edge):
-                                # we travel all the way to the end of the interior whitespace, and use whitespace_counter to figure out how far to backtrack
-                                segment_ended = True
-
-                            if segment_ended:
-                                # calculate the limits for engraving and leading in/out for this segment
-                                if direction == 1: # fwd
-                                    segment_end = segment_end - whitespace_counter + 1 # cut off the ending whitespace
-                                    pos_start = posx + (segment_start - line_start + 0.5)*pxsize_x
-                                    pos_end = posx + (segment_end - line_start - 0.5)*pxsize_x
-                                    pos_leadin = max(posx + (segment_start - line_start)*pxsize_x - conf['raster_leadin'], 0) # ensure we stay in the workspace
-                                    pos_leadout = min(posx + (segment_end - line_start)*pxsize_x + conf['raster_leadin'], conf['workspace'][0]) # ensure we stay in the workspace
-                                elif direction == -1: # rev
-                                    segment_end = segment_end + whitespace_counter - 1 # cut off the ending whitespace
-                                    pos_start = posx + (segment_start - line_start - 0.5)*pxsize_x
-                                    pos_end = posx + (segment_end - line_start + 0.5)*pxsize_x
-                                    pos_leadin = min(posx + (segment_start - line_start)*pxsize_x + conf['raster_leadin'], conf['workspace'][0]) # ensure we stay in the workspace
-                                    pos_leadout = max(posx + (segment_end - line_start)*pxsize_x - conf['raster_leadin'], 0) # ensure we stay in the workspace
-                                
-                                # write out the movement and engraving info for the segment
-                                intensity(0.0) # intensity for seek and lead-in
-                                feedrate(seekrate) # feedrate for seek
-                                move(pos_leadin, line_y) # seek to lead-in start              
-                                feedrate(feedrate_) # feedrate for lead-in, raster, and lead-out
-                                move(pos_start, line_y) # lead-in
-                                intensity(intensity_) # intensity for raster move
-                                rastermove(pos_end, line_y) # raster move
-                                if direction == 1: # fwd
-                                    rasterdata(pxarray, segment_start, segment_end) # stream raster data for above rastermove
-                                elif direction == -1: # rev
-                                    rasterdata(pxarray_reversed, px_n - segment_start, px_n - segment_end) # stream raster data for above rastermove
-                                intensity(0.0) # intensity for lead-out
-                                move(pos_leadout, line_y) # lead-out
-                                
-                                # prime for next segment
-                                segment_start = segment_end + whitespace_counter*direction
-                                segment_end = segment_start - 1*direction
-                                segment_ended = False
-                                whitespace_counter = 0
-
-                    # prime for next line
-                    if (raster_mode == 'Bidirectional') and (direction == 1): # fwd
-                        direction = -1 # switch to rev
-                    elif (raster_mode == 'Bidirectional') and (direction == -1): # rev
-                        direction = 1 # switch to fwd
-                    line_start = line_end
-                    line_y += pxsize_y
-
-                # assists off, end of feed if set to 'feed'
-                if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
-                    air_off()
-                # if 'aux_assist' in pass_ and pass_['aux_assist'] == 'feed':
-                #     aux_off()
-
-            elif kind == "fill" or kind == "path":
-                path = def_['data']
-                for polyline in path:
-                    if len(polyline) > 0:
-                        # first vertex -> seek
-                        feedrate(seekrate)
-                        if 'seekzero' in pass_ and not pass_['seekzero']:
-                            intensity(intensity_)
-                        else:
-                            intensity(0.0)
-                        is_2d = len(polyline[0]) == 2
-                        if is_2d:
-                            move(polyline[0][0], polyline[0][1])
-                        else:
-                            move(polyline[0][0], polyline[0][1], polyline[0][2])
-                        # remaining verteces -> feed
-                        if len(polyline) > 1:
-                            feedrate(feedrate_)
-                            intensity(intensity_)
-                            # turn on assists if set to 'feed'
-                            # also air_assist defaults to 'feed'
-                            if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
-                                air_on()
-                            # if 'aux_assist' in pass_ and pass_['aux_assist'] == 'feed':
-                            #     aux_on()
-                            # TODO dwell according to pierce time
-                            if is_2d:
-                                for i in range(1, len(polyline)):
-                                    move(polyline[i][0], polyline[i][1])
-                            else:
-                                for i in range(1, len(polyline)):
-                                    move(polyline[i][0], polyline[i][1], polyline[i][2])
-                            # turn off assists if set to 'feed'
-                            if 'air_assist' in pass_ and pass_['air_assist'] == 'feed':
-                                air_off()
-                            # if 'aux_assist' in pass_ and pass_['aux_assist'] == 'feed':
-                            #     aux_off()
-
-        # assists off, end of pass if set to 'pass'
-        if 'air_assist' in pass_:
-            if pass_['air_assist'] == 'pass':
-                air_off()
-        else:
-            air_off()  # also default this behavior
-        # if 'aux_assist' in pass_ and pass_['aux_assist'] == 'pass':
-        #     aux_off()
+    try:
+        _job_laser_passes(jobdict)
+        mark_pass()  # the passes are done, what follows is the run home
+    finally:
+        # Whatever happened, queue the outputs off. A raise part way through a
+        # pass would otherwise leave a relay energised with no command coming.
+        _assist_holds_release()
 
     # leave machine in absolute mode
     absolute()
 
     # return to origin
-    feedrate(conf['seekrate'])
+    feedrate(conf["seekrate"])
     intensity(0.0)
-    if 'head' in jobdict and \
-       'noreturn' in jobdict['head'] and \
-       jobdict['head']['noreturn']:
+    if "head" in jobdict and "noreturn" in jobdict["head"] and jobdict["head"]["noreturn"]:
         pass
+    elif not target_in_workarea(0.0, 0.0):
+        # every other move is bounds checked, and a table offset outside the bed
+        # puts the job origin off the machine, so this one would drive into a
+        # hard stop on the way home
+        print("WARN: job origin is outside the work area, not returning to it")
     else:
         move(0, 0, 0)
+
+
+def _item_seek_rect(jobdict, itemidx):
+    """Extent [x0, y0, x1, y1] the head will seek towards for an item, None
+    if unknown. Images seek somewhere on their def's extent, paths to their
+    first vertex."""
+    def_ = jobdict["defs"][jobdict["items"][itemidx]["def"]]
+    if def_["kind"] == "image":
+        pos, size = def_["pos"], def_["size"]
+        return [pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]]
+    if def_["kind"] in ("fill", "path"):
+        for polyline in def_["data"]:
+            if polyline:
+                p = polyline[0]
+                return [p[0], p[1], p[0], p[1]]
+    return None
+
+
+def _order_pass_items(jobdict, pass_, head_pos, end_rect, seekrate):
+    """A pass' item indices re-sequenced for minimal planner-model seek time
+    from head_pos towards end_rect, each item costed as its seek extent.
+    Relative passes, an unknown head position, and items without an extent
+    keep the listed order."""
+    items = pass_.get("items") or []
+    if len(items) < 2 or pass_.get("relative") or head_pos is None:
+        return items
+    rects = []
+    for itemidx in items:
+        rect = _item_seek_rect(jobdict, itemidx)
+        if rect is None:
+            return items
+        rects.append(rect)
+    from jobimport import pathoptimizer
+
+    def leg(r1, r2):
+        # closest approach between the two extents, stop to stop
+        dx = max(r1[0] - r2[2], r2[0] - r1[2], 0.0)
+        dy = max(r1[1] - r2[3], r2[1] - r1[3], 0.0)
+        return pathoptimizer.stop_seek_time((dx * dx + dy * dy) ** 0.5, seekrate)
+
+    start_rect = [head_pos[0], head_pos[1], head_pos[0], head_pos[1]]
+    # greedy construction from the head position
+    order = []
+    left = list(range(len(items)))
+    cur = start_rect
+    while left:
+        best = min(left, key=lambda j: leg(cur, rects[j]))
+        left.remove(best)
+        order.append(best)
+        cur = rects[best]
+
+    def bound(pos):
+        if pos < 0:
+            return start_rect
+        if pos >= len(order):
+            return end_rect
+        return rects[order[pos]]
+
+    # 2-opt, legs are symmetric so a reversal only changes its boundary legs
+    improved = True
+    while improved:
+        improved = False
+        for i in range(len(order) - 1):
+            for j in range(i + 1, len(order)):
+                a, d = bound(i - 1), bound(j + 1)
+                b, c = rects[order[i]], rects[order[j]]
+                before = leg(a, b)
+                after = leg(a, c)
+                if d is not None:
+                    before += leg(c, d)
+                    after += leg(b, d)
+                if after + 1e-9 < before:
+                    order[i : j + 1] = order[i : j + 1][::-1]
+                    improved = True
+    # with nothing to head for afterwards the reversed order costs the same
+    # inside, so whichever end is nearer the head goes first
+    if (
+        end_rect is None
+        and leg(start_rect, rects[order[-1]]) < leg(start_rect, rects[order[0]]) - 1e-9
+    ):
+        order.reverse()
+    return [items[k] for k in order]
+
+
+def _next_pass_rect(jobdict, passes, passidx):
+    """Extent the head makes for once the pass at passidx ends, None if
+    unknown. The next pass is anchored by its first listed item. The job's
+    closing seek home is deliberately left out of the model, so ordering
+    favors a first cut near the origin, a useful diagnostic that the job
+    sits where intended."""
+    if passidx + 1 < len(passes):
+        nxt = passes[passidx + 1]
+        if not nxt.get("relative") and nxt.get("items"):
+            return _item_seek_rect(jobdict, nxt["items"][0])
+    return None
+
+
+def _polyline_time(polyline, vmax, v_in=0.0, v_out=0.0):
+    """Time (s) to burn a polyline at vmax mm/s, entering at v_in and leaving
+    at v_out, under the planner's speed profile.
+
+    The analytical form of what the machine will do: each vertex is a junction
+    whose angle sets the speed carried through it, and each segment a
+    trapezoid between two such speeds. Same physics as the run-time model in
+    jobtime, driven straight off the geometry instead of an emitted stream.
+    Returns (time, entry direction, exit direction), the directions being what
+    the seeks either side of it turn out of and into.
+    """
+    from jobimport import pathoptimizer
+
+    accel = pathoptimizer.ACCEL
+    trapezoid = pathoptimizer.trapezoid_time
+    junction = pathoptimizer.junction_speed_cos
+    total = 0.0
+    first_dir = None
+    prev_len = prev_dir = None
+    prev_vin = v_in
+    for i in range(1, len(polyline)):
+        a, b = polyline[i - 1], polyline[i]
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        length = math.sqrt(dx * dx + dy * dy)
+        if length < 1e-9:
+            continue  # a repeated vertex is no move at all
+        direction = (dx / length, dy / length)
+        if first_dir is None:
+            first_dir = direction
+        if prev_dir is not None:
+            v_junction = junction(-(prev_dir[0] * direction[0] + prev_dir[1] * direction[1]), vmax)
+            total += trapezoid(prev_len, vmax, accel, prev_vin, v_junction)
+            prev_vin = v_junction
+        prev_len, prev_dir = length, direction
+    if prev_len is not None:
+        total += trapezoid(prev_len, vmax, accel, prev_vin, v_out)
+    return total, first_dir, prev_dir
+
+
+@functools.lru_cache(maxsize=4)
+def _raster_row_extents(data, px_w, px_h, invert):
+    """The engraved span (first ink column, last ink column edge) of each row
+    of an image, None for a row that engraves nothing.
+
+    All the pixel detail a run-time estimate needs: dispatch skips a blank row
+    outright and runs the head from the first ink to the last, so those two
+    columns set the travel. The scan is PIL's, a row crop per line, rather
+    than a walk over every pixel in Python.
+
+    Interior whitespace wide enough for dispatch to break a row into separate
+    segments (see _raster_line_segments) is engraved through here instead, so
+    a row with a big hole in it reads a little slow.
+
+    invert is in the key rather than read from conf because it decides what
+    counts as ink, see _raster_grayscale. Cached because editing a job
+    re-estimates the same image over and over.
+    """
+    del invert  # part of the cache key, applied inside _raster_grayscale
+    imgobj = _raster_grayscale(data, px_w, px_h)
+    ink = imgobj.point(lambda px: 0 if px == 255 else 255)
+    rows = []
+    for y in range(ink.height):
+        box = ink.crop((0, y, ink.width, y + 1)).getbbox()
+        rows.append(None if box is None else (box[0], box[2]))
+    return tuple(rows)
+
+
+def _image_time(def_, pass_, seekrate, feedrate_):
+    """Time (s) to engrave an image, from its pixels and the raster settings.
+
+    Analytical rather than measured: a scanline per pixel row, each a lead-in,
+    a run across whatever that row engraves, and a lead-out, plus the flyback
+    when the mode only engraves one way. Blank rows cost nothing, as dispatch
+    skips them. An image sent without pixel data (the old slim preview) is
+    read as engraving every row end to end.
+    """
+    from jobimport import pathoptimizer
+
+    pos = def_.get("pos") or [0.0, 0.0]
+    size = def_.get("size") or [0.0, 0.0]
+    width, height = float(size[0]), float(size[1])
+    pxsize_x, pxsize_y = _pass_pxsize(pass_)
+    if width <= 0.0 or height <= 0.0 or pxsize_x <= 0.0 or pxsize_y <= 0.0:
+        return 0.0
+    px_w = int(width / pxsize_x)  # x is 2x horizontal resolution
+    px_h = int(height / pxsize_y)
+    if px_w < 1 or px_h < 1:
+        return 0.0
+
+    raster_mode = conf["raster_mode"]
+    if raster_mode not in ("Forward", "Reverse", "Bidirectional", "NearestNeighbor"):
+        raster_mode = "Bidirectional"
+    leadin = conf["raster_leadin"] if raster_mode != "NearestNeighbor" else 0
+    x_min, x_max = _reachable_x_range()
+
+    rows = None
+    if def_.get("data"):
+        try:
+            rows = _raster_row_extents(def_["data"], px_w, px_h, bool(conf["raster_invert"]))
+        except Exception:
+            rows = None  # an image the estimate cannot read still gets a time
+
+    vmax = feedrate_ / 60.0
+    engraves_both_ways = raster_mode in ("Bidirectional", "NearestNeighbor")
+    total = 0.0
+    for li in range(px_h):
+        if rows is None:
+            lo, hi = 0, px_w
+        else:
+            span = rows[li] if li < len(rows) else None
+            if span is None:
+                continue  # a blank row engraves nothing, dispatch skips it
+            lo, hi = span
+        # the head runs lead-in, engraving and lead-out as one move, coming to
+        # rest at each end of the line
+        travel = min(pos[0] + hi * pxsize_x + leadin, x_max) - max(
+            pos[0] + lo * pxsize_x - leadin, x_min
+        )
+        if travel <= 0.0:
+            continue
+        total += pathoptimizer.trapezoid_time(travel, vmax, pathoptimizer.ACCEL, 0.0, 0.0)
+        if not engraves_both_ways:
+            total += pathoptimizer.stop_seek_time(travel, seekrate)  # flyback
+    return total
+
+
+def job_preview(jobdict):
+    """Seek lines and run time of a job as dispatch will order it.
+
+    Returns {"seeks": [[[x0,y0],[x1,y1]], ...], "duration": seconds}.
+
+    A dry run of the pass walk: path defs go through the real job-time
+    ordering (re-sequencing, splitting, reversal), so the preview shows what
+    the machine will actually do. Both answers come out of that one ordering
+    pass, which is the expensive part, and the times themselves are analytical
+    (see _polyline_time and _image_time) rather than measured off an emitted
+    command stream. An image def may carry "data_of": another def's index,
+    to share that def's pixel data rather than repeat it, and one without any
+    pixel data at all is read as engraving its whole extent. Purely
+    computational, safe without a machine connection.
+    """
+    from jobimport import pathoptimizer, resolve_image_data
+
+    resolve_image_data(jobdict)
+
+    def clamp(p, rect):
+        return [min(max(p[0], rect[0]), rect[2]), min(max(p[1], rect[1]), rect[3])]
+
+    seeks = []
+    duration = 0.0
+    head_pos = [0.0, 0.0]
+    head_dir = None  # the direction the head arrived on, for the next junction
+    returns_home = not jobdict.get("head", {}).get("noreturn")
+    passes = jobdict.get("passes") or []
+    for passidx, pass_ in enumerate(passes):
+        seekrate = pass_.get("seekrate", conf["seekrate"])
+        feedrate_ = pass_.get("feedrate", conf["feedrate"])
+        pierce_time = pass_.get("pierce_time", conf["pierce_time"])
+        pass_end_rect = _next_pass_rect(jobdict, passes, passidx)
+        pass_items = _order_pass_items(jobdict, pass_, head_pos, pass_end_rect, seekrate)
+        for i, itemidx in enumerate(pass_items):
+            def_ = jobdict["defs"][jobdict["items"][itemidx]["def"]]
+            kind = def_["kind"]
+            next_rect = None
+            if not pass_.get("relative"):
+                if i + 1 < len(pass_items):
+                    next_rect = _item_seek_rect(jobdict, pass_items[i + 1])
+                else:
+                    next_rect = pass_end_rect
+            if kind == "image":
+                pos, size = def_["pos"], def_["size"]
+                rect = [pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]]
+                entry = clamp(head_pos, rect)
+                if entry != head_pos:
+                    seeks.append([head_pos, entry])
+                    duration += pathoptimizer.seek_time(
+                        head_pos, head_dir, entry, None, seekrate, feedrate_
+                    )
+                duration += _image_time(def_, pass_, seekrate, feedrate_)
+                head_pos = clamp(clamp(entry, next_rect), rect) if next_rect else entry
+                head_dir = None  # a raster ends its last line at a standstill
+            elif kind == "fill" or kind == "path":
+                if pass_.get("relative"):
+                    head_pos = None
+                    continue
+                ordered = _order_path_def(
+                    def_, pass_, seekrate, feedrate_, head_pos, next_rect, kind == "path"
+                )
+                vmax = feedrate_ / 60.0
+                for polyline, _is_arc in ordered:
+                    p0 = list(polyline[0][:2])
+                    burn_time, entry_dir, exit_dir = _polyline_time(polyline, vmax)
+                    if head_pos is not None and p0 != head_pos:
+                        seeks.append([head_pos, p0])
+                        duration += pathoptimizer.seek_time(
+                            head_pos, head_dir, p0, entry_dir, seekrate, feedrate_
+                        )
+                    if pierce_time > 0:
+                        duration += pierce_time
+                    duration += burn_time
+                    head_pos = list(polyline[-1][:2])
+                    head_dir = exit_dir
+        if head_pos is None:
+            break  # a relative pass loses the position, stop the preview
+    if returns_home and head_pos is not None and head_pos != [0.0, 0.0]:
+        seeks.append([head_pos, [0.0, 0.0]])
+        duration += pathoptimizer.seek_time(
+            head_pos, head_dir, [0.0, 0.0], None, conf["seekrate"], conf["feedrate"]
+        )
+    return {
+        "seeks": [
+            [[round(a[0], 2), round(a[1], 2)], [round(b[0], 2), round(b[1], 2)]] for a, b in seeks
+        ],
+        "duration": duration,
+    }
+
+
+def _job_laser_passes(jobdict):
+    """Emit every pass of a laser job, in order."""
+    # a job starts with the head at the offset origin, seek-optimized ordering
+    # anchors on the emitted position from there (None once it is unknown)
+    head_pos = [0.0, 0.0]
+    passes = jobdict["passes"]
+    for passidx, pass_ in enumerate(passes):
+        mark_pass()  # so the run-time model can report on this pass alone
+        requested_pxsize = float(pass_.setdefault("pxsize", conf["pxsize"]))
+        pxsize_x, pxsize_y = _pass_pxsize(pass_)  # x is 2x horiz resolution
+        if requested_pxsize != pxsize_y:
+            print(f"WARN: pxsize of {requested_pxsize} mm/px is too small. Setting to {pxsize_y}")
+        intensity(0.0)
+        pixelwidth(pxsize_x)
+        # assists on, beginning of pass if set to 'pass'
+        pass_.setdefault("air_assist", "pass")
+        pass_.setdefault("aux_assist", "off")
+        _switch_assists([pass_], "pass", True)
+        pass_.setdefault("seekzero", True)
+        pass_.setdefault("pierce_time", conf["pierce_time"])
+        seekrate = pass_.setdefault("seekrate", conf["seekrate"])
+        feedrate_ = pass_.setdefault("feedrate", conf["feedrate"])
+        intensity_ = pass_.setdefault("intensity", 0.0)
+        # set absolute/relative
+        if not pass_.setdefault("relative", False):
+            absolute()
+        else:
+            relative()
+        # loop pass' items, themselves re-sequenced for minimal seek time
+        pass_end_rect = _next_pass_rect(jobdict, passes, passidx)
+        pass_items = _order_pass_items(jobdict, pass_, head_pos, pass_end_rect, seekrate)
+        for i, itemidx in enumerate(pass_items):
+            item = jobdict["items"][itemidx]
+            def_ = jobdict["defs"][item["def"]]
+            kind = def_["kind"]
+            next_rect = None
+            if not pass_["relative"]:
+                if i + 1 < len(pass_items):
+                    next_rect = _item_seek_rect(jobdict, pass_items[i + 1])
+                else:
+                    next_rect = pass_end_rect
+            if kind == "image":
+                head_pos = _job_laser_image(
+                    def_,
+                    pass_,
+                    pxsize_x,
+                    pxsize_y,
+                    seekrate,
+                    feedrate_,
+                    intensity_,
+                    head_pos,
+                    next_rect,
+                )
+            elif kind == "fill" or kind == "path":
+                head_pos = _job_laser_path(
+                    def_,
+                    pass_,
+                    seekrate,
+                    feedrate_,
+                    intensity_,
+                    head_pos,
+                    next_rect,
+                    reorder=(kind == "path"),
+                )
+
+        # assists off, end of pass for both 'feed' and 'pass'
+        _feed_assists(pass_, False)
+        _switch_assists([pass_], "pass", False)
+
+
+def job_mill_validate(jobdict):
+    """Validate that a mill job's G0/G1 targets stay within the work area.
+
+    Mill jobs run in absolute (machine) coordinates, so each axis target is
+    bounded to [0, workspace] on that axis. Raises ValueError with a descriptive
+    message on the first out-of-bounds move.
+
+    NOTE: the Z bound is conf["workspace"][2]; a mill must configure a non-zero Z
+    work-area dimension for any Z move to validate.
+    """
+    limits = conf["workspace"]
+    axes = ("x", "y", "z")
+
+    for defidx, def_ in enumerate(jobdict["defs"]):
+        for item in def_["data"]:
+            if item[0] in ("G0", "G1"):
+                target = item[1]
+                for i, axis in enumerate(axes):
+                    val = target[i]
+                    if val < 0 or val > limits[i]:
+                        raise ValueError(
+                            f"def {defidx}: {item[0]} {axis}={val} beyond "
+                            f"[0, {limits[i]}] of work area"
+                        )
 
 
 def job_mill(jobdict):
@@ -1409,71 +3179,167 @@ def job_mill(jobdict):
     ###########################################################################
     """
     # check job
-    if (not 'head' in jobdict) or \
-       (not 'kind' in jobdict['head']) or \
-       (jobdict['head']['kind'] != 'mill'):
+    if (
+        ("head" not in jobdict)
+        or ("kind" not in jobdict["head"])
+        or (jobdict["head"]["kind"] != "mill")
+    ):
         print("NOTICE: not a mill job")
         return
 
-    if not 'defs' in jobdict:
+    if "defs" not in jobdict:
         print("ERROR: invalid job")
         return
+    # raises ValueError if any move falls outside the work area
+    job_mill_validate(jobdict)
     # prime job
     air_off()
     aux_off()
     absolute()
     intensity(0.0)
-    seekrate = conf['seekrate']
-    feedrate_ = conf['feedrate']
+    seekrate = conf["seekrate"]
+    feedrate_ = conf["feedrate"]
     feedrate(seekrate)
     feedrate_active = seekrate
     # run job
-    for def_ in jobdict['defs']:
-        path = def_['data']
+    for def_ in jobdict["defs"]:
+        path = def_["data"]
         for item in path:
-            if item[0] == 'G0':
+            if item[0] == "G0":
                 if feedrate_active != seekrate:
                     feedrate(seekrate)
                     feedrate_active = seekrate
-                move(item[1][0],item[1][1],item[1][2])
-            elif item[0] == 'G1':
+                move(item[1][0], item[1][1], item[1][2])
+            elif item[0] == "G1":
                 if feedrate_active != feedrate_:
                     feedrate(feedrate_)
                     feedrate_active = feedrate_
-                move(item[1][0],item[1][1],item[1][2])
-            elif item[0] == 'F':
+                move(item[1][0], item[1][1], item[1][2])
+            elif item[0] == "F":
                 feedrate_ = item[1]
-            elif item[0] == 'S':
-                #convert RPMs to 0-100%
-                ipct = item[1]*(100.0/conf['mill_max_rpm'])
+            elif item[0] == "S":
+                # convert RPMs to 0-100%
+                ipct = item[1] * (100.0 / conf["mill_max_rpm"])
                 intensity(ipct)
-            elif item[0] == 'MIST':
-                if item[1] == True:
+            elif item[0] == "MIST":
+                if item[1]:
                     air_on()
-                elif item[1] == False:
+                elif not item[1]:
                     air_off()
-            elif item[0] == 'FLOOD':
-                if item[1] == True:
+            elif item[0] == "FLOOD":
+                if item[1]:
                     aux_on()
-                elif item[1] == False:
+                elif not item[1]:
                     aux_off()
     # finalize job
     air_off()
     aux_off()
     absolute()
-    feedrate(conf['seekrate'])
+    feedrate(conf["seekrate"])
     intensity(0.0)
     supermove(z=0)
     supermove(x=0, y=0)
+
+
+# Floyd-Steinberg dithering algorithm for raster data
+"""
+Floyd-Steinberg dithering coefficients (1/16):
+-------------------
+|     |  X  |  7  |
+-------------------
+|  1  |  5  |  3  |
+-------------------
+"""
+
+
+def raster_dither(px_w, px_h, pxarray, n_levels=2):
+    pxarray_dithered = pxarray.copy()
+    levels = [255 * x / (n_levels - 1) for x in range(0, n_levels)]
+    cutoffs = [x + 255 / (n_levels - 1) / 2 for x in levels]
+
+    for i in range(len(pxarray)):
+        # clamp accumulated diffusion error into range so a cutoff always matches
+        value = min(255, max(0, pxarray_dithered[i]))
+        residual = 0
+        for j, cutoff in enumerate(cutoffs):
+            if value <= cutoff:
+                residual = value - levels[j]
+                pxarray_dithered[i] = levels[j]
+                break
+        row = i // px_w
+        col = i % px_w
+        if col != px_w - 1:
+            pxarray_dithered[i + 1] += residual * 7 / 16
+        if row != px_h - 1:
+            if col != 0:
+                pxarray_dithered[i + px_w - 1] += residual * 1 / 16
+            pxarray_dithered[i + px_w] += residual * 5 / 16
+            if col != px_w - 1:
+                pxarray_dithered[i + px_w + 1] += residual * 3 / 16
+
+    return pxarray_dithered
+
+
+# Functions to keep the computer from sleeping in the middle of a long job
+# https://stackoverflow.com/questions/57647034/prevent-sleep-mode-python-wakelock-on-python
+def disable_computer_sleep():
+    system = platform.system()
+    if system == "Windows":
+        import ctypes
+
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+    elif system == "Linux":
+        import subprocess
+
+        args = [
+            "sleep.target",
+            "suspend.target",
+            "hibernate.target",
+            "hybrid-sleep.target",
+        ]
+        try:
+            # masking units needs root/polkit; on unprivileged hosts (e.g.
+            # Crostini) systemctl prints "Interactive authentication required".
+            # Swallow its stderr and continue with a single friendly note.
+            result = subprocess.run(["systemctl", "mask", *args], stderr=subprocess.DEVNULL)
+            if result.returncode != 0:
+                print("INFO: couldn't disable system sleep (needs root); continuing")
+        except Exception:
+            print("INFO: couldn't disable system sleep; continuing")
+    else:  # if system == 'Darwin':
+        print(f"Display disabling not implemented in {system}")
+
+
+def enable_computer_sleep():
+    system = platform.system()
+    if system == "Windows":
+        import ctypes
+
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+    elif system == "Linux":
+        import subprocess
+
+        args = [
+            "sleep.target",
+            "suspend.target",
+            "hibernate.target",
+            "hybrid-sleep.target",
+        ]
+        try:
+            result = subprocess.run(["systemctl", "unmask", *args], stderr=subprocess.DEVNULL)
+            if result.returncode != 0:
+                print("INFO: couldn't re-enable system sleep (needs root); continuing")
+        except Exception:
+            print("INFO: couldn't re-enable system sleep; continuing")
+    else:  # if system == 'Darwin':
+        print(f"Display disabling not implemented in {system}")
 
 
 if __name__ == "__main__":
     # run like this to profile: python -m cProfile driveboard.py
     connect()
     if connected():
-        testjob()
-        time.sleep(0.5)
-        while not status()['ready']:
+        while not status()["ready"]:
             time.sleep(1)
-            sys.stdout.write('.')
+            sys.stdout.write(".")
         close()

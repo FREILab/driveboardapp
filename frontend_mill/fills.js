@@ -1,137 +1,261 @@
-
-
-
 function fills_add_by_item(idx, callback) {
   if (jobhandler.defs[jobhandler.items[idx].def].kind != "path") {
-    callback()
-    return
+    callback();
+    return;
   }
-  var color = jobhandler.items[idx].color
-  var path = jobhandler.defs[jobhandler.items[idx].def].data
-  var bounds = jobhandler.stats.items[idx].bbox
-  var leadin = app_config_main.fill_leadin
-  var min_x = Math.max(bounds[0]-leadin, 0)
-  var max_x = Math.min(bounds[2]+leadin, app_config_main.workspace[0])
-  var fillpxsize = parseFloat($('#fillpxsize').val())
-  var fillpolylines = []  // polylines aka path
-  var lines = []
-  // setup loop function
-  var y = bounds[1]+0.001
-  var max_y_bounds = bounds[3]
-  loop_lines()
-  // loop function
-  function loop_lines() {
-    if (y > max_y_bounds) {
-      finalize()
-      return
+  var color = jobhandler.items[idx].color;
+
+  // Collect all path items with the same color for nested fill support
+  var allPaths = [];
+  var combinedBounds = [Infinity, Infinity, -Infinity, -Infinity];
+  jobhandler.loopItems(function (item, i) {
+    if (item.color === color) {
+      var pathData = jobhandler.defs[item.def].data;
+      allPaths.push(pathData);
+      // expand combined bounds
+      var itemBounds = jobhandler.stats.items[i].bbox;
+      jobhandler.bboxExpand2(combinedBounds, itemBounds);
     }
-    // for every fill line
-    // intersect with all segments of path
-    lines.push([[min_x,y],[max_x,y]])
-    var intersections = []
-    for (var i = 0; i < path.length; i++) {
-      var polyline = path[i]
-      if (polyline.length > 1) {
-        pv = polyline[0]
-        for (var j = 1; j < polyline.length; j++) {
-          var v = polyline[j]
-          res = fills_intersect(min_x, y, max_x, y, pv[0], pv[1], v[0], v[1])
-          if (res.onSeg1 && res.onSeg2) {
-            intersections.push([res.x, res.y])
-          }
-          pv = v
-        }
-      }
+  }, "path");
+
+  var leadin = app_config_main.fill_leadin;
+  if (
+    app_config_main.fill_mode != "Forward" &&
+    app_config_main.fill_mode != "Reverse" &&
+    app_config_main.fill_mode != "Bidirectional"
+  ) {
+    leadin = 0;
+  }
+  var min_x = Math.max(combinedBounds[0] - leadin, 0);
+  var max_x = Math.min(
+    combinedBounds[2] + leadin,
+    app_config_main.workspace[0],
+  );
+  var fillpxsize = parseFloat($("#fillpxsize").val());
+  var fillpolylines = []; // polylines aka path
+
+  // Pre-process: collect all segments with their Y-bounds for fast filtering
+  var segments = [];
+  var MIN_SEGMENT_HEIGHT = 1e-10; // Skip nearly-horizontal segments
+
+  function addSegment(x1, y1, x2, y2) {
+    var minY = Math.min(y1, y2);
+    var maxY = Math.max(y1, y2);
+    // Only add segments that have meaningful vertical extent
+    if (maxY - minY > MIN_SEGMENT_HEIGHT) {
+      segments.push({
+        x1: x1,
+        y1: y1,
+        x2: x2,
+        y2: y2,
+        minY: minY,
+        maxY: maxY,
+      });
     }
-    // sort intersection points by x
-    intersections = intersections.sort(function(a, b) {return a[0] - b[0]})
-    // generate cut path
-    if (intersections.length > 1) {
-      var pv = intersections[0]
-      var x_i = intersections[0][0]
-      var y_i = intersections[0][1]
-      var min_x_opti = Math.max(x_i-leadin, 0)
-      var max_x_opti = Math.min(intersections[intersections.length-1][0]+leadin,
-                                app_config_main.workspace[0])
-      // fillpolylines.push([[min_x, y_i]])  // polyline of one
-      fillpolylines.push([[min_x_opti, y_i]])  // polyline of one
-      for (var k = 1; k < intersections.length; k++) {
-        var v = intersections[k]
-        if ((k % 2) == 1) {
-          fillpolylines.push([ [pv[0],pv[1]],[v[0],v[1]] ])  // polyline of two
-        }
-        pv = v
-      }
-      // fillpolylines.push([[max_x, y_i]])  // polyline of one
-      fillpolylines.push([[max_x_opti, y_i]])  // polyline of one
-    }
-    y+=fillpxsize
-    setTimeout(loop_lines, 0)
   }
 
-  function finalize() {
-    // generate a new color shifted from the old
-    var newcolor
-    var fillcolor = new paper.Color(color)
-    var jobcolors = jobhandler.getAllColors()
-    while (true) {
-      if (fillcolor.brightness > 0.5) {
-        fillcolor.brightness -= 0.3+0.1*Math.random()
-      } else {
-        fillcolor.brightness += 0.3+0.1*Math.random()
-      }
-      fillcolor.hue += 10+5*Math.random()
-      newcolor = fillcolor.toCSS(true)
-      if (jobcolors.indexOf(newcolor) == -1) {
-        break
+  for (var p = 0; p < allPaths.length; p++) {
+    var path = allPaths[p];
+    for (var i = 0; i < path.length; i++) {
+      var polyline = path[i];
+      if (polyline.length > 1) {
+        var pv = polyline[0];
+        for (var j = 1; j < polyline.length; j++) {
+          var v = polyline[j];
+          addSegment(pv[0], pv[1], v[0], v[1]);
+          pv = v;
+        }
+        // Auto-close: check intersection with closing segment (last to first point)
+        var first = polyline[0];
+        var last = polyline[polyline.length - 1];
+        var dx = first[0] - last[0];
+        var dy = first[1] - last[1];
+        // Only add closing segment if endpoints are not nearly coincident
+        if (dx * dx + dy * dy > 1e-10) {
+          addSegment(last[0], last[1], first[0], first[1]);
+        }
       }
     }
-    // add to jobhandler
-    jobhandler.defs.push({"kind":"fill", "data":fillpolylines})
-    jobhandler.items.push({"def":jobhandler.defs.length-1,
-                           "color":newcolor, "pxsize":fillpxsize})
-    jobhandler.calculateStats()  // TODO: only caclulate fill
-    // update pass widgets
-    jobhandler.passes = passes_get_active()
-    passes_clear()
-    passes_set_assignments()
-    jobhandler.render()
-    // jobhandler.draw()
-    callback()
+  }
+
+  // Sort segments by minY for efficient active edge tracking
+  segments.sort(function (a, b) {
+    return a.minY - b.minY;
+  });
+
+  var y = combinedBounds[1] + 0.001;
+  var max_y_bounds = combinedBounds[3];
+  var segmentIndex = 0; // Index into sorted segments
+  var activeSegments = []; // Segments that span the current Y range
+
+  // Process in batches to keep UI responsive
+  var BATCH_SIZE = 100;
+  var linesProcessed = 0;
+
+  function processBatch() {
+    var batchEnd = linesProcessed + BATCH_SIZE;
+
+    while (y <= max_y_bounds && linesProcessed < batchEnd) {
+      // Add new segments that start at or before current Y
+      while (
+        segmentIndex < segments.length &&
+        segments[segmentIndex].minY <= y
+      ) {
+        activeSegments.push(segments[segmentIndex]);
+        segmentIndex++;
+      }
+
+      // Remove segments that end before current Y (with small epsilon for robustness)
+      activeSegments = activeSegments.filter(function (seg) {
+        return seg.maxY > y - 1e-10;
+      });
+
+      // Find intersections with active segments only
+      var intersections = [];
+      for (var i = 0; i < activeSegments.length; i++) {
+        var seg = activeSegments[i];
+        var ix = fills_horizontal_intersect(y, seg.x1, seg.y1, seg.x2, seg.y2);
+        if (ix !== null) {
+          intersections.push(ix);
+        }
+      }
+
+      // Sort intersection points by x
+      intersections.sort(function (a, b) {
+        return a - b;
+      });
+
+      // Remove duplicate intersections
+      var MIN_INTERSECTION_GAP = 0; // 0mm minimum gap
+      var filtered = [];
+      for (var fi = 0; fi < intersections.length; fi++) {
+        if (
+          filtered.length === 0 ||
+          intersections[fi] - filtered[filtered.length - 1] >
+            MIN_INTERSECTION_GAP
+        ) {
+          filtered.push(intersections[fi]);
+        }
+      }
+      intersections = filtered;
+
+      // Generate cut path
+      if (intersections.length > 1) {
+        var x_i = intersections[0];
+        var y_i = y;
+        var min_x_opti = Math.max(x_i - leadin, 0);
+        var max_x_opti = Math.min(
+          intersections[intersections.length - 1] + leadin,
+          app_config_main.workspace[0],
+        );
+        fillpolylines.push([[min_x_opti, y_i]]); // polyline of one
+        for (var k = 0; k + 1 < intersections.length; k += 2) {
+          fillpolylines.push([
+            [intersections[k], y_i],
+            [intersections[k + 1], y_i],
+          ]); // polyline of two
+        }
+        fillpolylines.push([[max_x_opti, y_i]]); // polyline of one
+      }
+
+      y += fillpxsize;
+      linesProcessed++;
+    }
+
+    if (y <= max_y_bounds) {
+      // More work to do, yield to UI then continue
+      setTimeout(processBatch, 0);
+    } else {
+      finalize();
+    }
+  }
+
+  processBatch();
+
+  function finalize() {
+    // Call backend to optimize the fill path according to fill_mode
+    fills_optimize_and_add(fillpolylines, color, fillpxsize, callback);
   }
 }
 
+// Call backend to optimize fill path, then add to jobhandler
+function fills_optimize_and_add(
+  fillpolylines,
+  originalColor,
+  fillpxsize,
+  callback,
+) {
+  $.ajax({
+    type: "POST",
+    url: "/optimize_fill",
+    contentType: "application/json",
+    data: JSON.stringify({ data: fillpolylines }),
+    dataType: "json",
+    success: function (result) {
+      var optimizedData = result.data;
+      var fillMode = result.fill_mode;
+      console.log("Fill optimized with mode: " + fillMode);
+      fills_add_to_job(optimizedData, originalColor, fillpxsize, callback);
+    },
+    error: function (xhr, status, error) {
+      console.error("Fill optimization failed, using raw data: " + error);
+      // Fall back to unoptimized data
+      fills_add_to_job(fillpolylines, originalColor, fillpxsize, callback);
+    },
+  });
+}
 
-function fills_intersect(Ax, Ay, Bx, By, Dx, Dy, Ex, Ey) {
-    // intersect two line segments: A-B and D-E.
-    // If the lines intersect, the result contains the x and y of the
-    // intersection (treating the lines as infinite) and booleans for
-    // whether line segment 1 or line segment 2 contain the point
-    var denominator, a, b, numerator1, numerator2, result = {
-        x: null,
-        y: null,
-        onSeg1: false,
-        onSeg2: false
+// Add optimized fill to jobhandler
+function fills_add_to_job(fillData, originalColor, fillpxsize, callback) {
+  // generate a new color shifted from the old
+  var newcolor;
+  var fillcolor = new paper.Color(originalColor);
+  var jobcolors = jobhandler.getAllColors();
+  while (true) {
+    if (fillcolor.brightness > 0.5) {
+      fillcolor.brightness -= 0.3 + 0.1 * Math.random();
+    } else {
+      fillcolor.brightness += 0.3 + 0.1 * Math.random();
     }
-    denominator = ((Ey - Dy) * (Bx - Ax)) - ((Ex - Dx) * (By - Ay))
-    if (denominator == 0) { return result }
-    a = Ay - Dy
-    b = Ax - Dx
-    numerator1 = ((Ex - Dx) * a) - ((Ey - Dy) * b)
-    numerator2 = ((Bx - Ax) * a) - ((By - Ay) * b)
-    a = numerator1 / denominator
-    b = numerator2 / denominator
-    // ray intersection
-    result.x = Ax + (a * (Bx - Ax))
-    result.y = Ay + (a * (By - Ay))
-    // if A-B is a segment and D-E is a ray, they intersect if:
-    if (a > 0 && a < 1) {
-        result.onSeg1 = true
+    fillcolor.hue += 10 + 5 * Math.random();
+    newcolor = fillcolor.toCSS(true);
+    if (jobcolors.indexOf(newcolor) == -1) {
+      break;
     }
-    // if D-E is a segment and A-B is a ray, they intersect if:
-    if (b > 0 && b < 1) {
-        result.onSeg2 = true
-    }
-    // if A-B and D-E are segments, they intersect if both are true
-    return result
+  }
+  // add to jobhandler
+  jobhandler.defs.push({ kind: "fill", data: fillData });
+  jobhandler.items.push({
+    def: jobhandler.defs.length - 1,
+    color: newcolor,
+    pxsize: fillpxsize,
+  });
+  jobhandler.calculateStats(); // TODO: only caclulate fill
+  // update pass widgets
+  jobhandler.passes = passes_get_active();
+  passes_clear();
+  passes_set_assignments();
+  jobhandler.render();
+  // jobhandler.draw()
+  callback();
+}
+
+// Optimized intersection for horizontal scanline with a segment
+// Returns the x-coordinate of intersection, or null if no intersection
+function fills_horizontal_intersect(y, x1, y1, x2, y2) {
+  // Handle near-horizontal segments (avoid division by near-zero)
+  var dy = y2 - y1;
+  if (Math.abs(dy) < 1e-10) {
+    return null;
+  }
+
+  // Calculate parameter t along the segment
+  var t = (y - y1) / dy;
+
+  // Check if intersection is strictly inside the segment (not at endpoints)
+  // Using small epsilon to handle floating point precision
+  if (t > 1e-10 && t < 1 - 1e-10) {
+    return x1 + t * (x2 - x1);
+  }
+  return null;
 }
