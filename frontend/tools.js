@@ -432,51 +432,92 @@ function tools_tselect_seg_inbox(ax, ay, bx, by, x1, y1, x2, y2) {
   return t0 <= t1;
 }
 
-function tools_addfill_init() {
-  // add color choices to addfill_btn
-  var select_html = "";
-  // params
-  select_html +=
-    "<li>" +
-    '<form class="form-inline">' +
-    '<div class="form-group">' +
-    '<div class="input-group" style="margin:10px">' +
-    '<div class="input-group-addon" style="width:10px">pxsize [mm]</div>' +
-    '<input id="fillpxsize" type="text" class="form-control input-sm" style="width:40px;"' +
-    'value="' +
-    app_config_main.pxsize +
-    '" title="match this to laser focus size">' +
-    "</div>" +
-    "</div>" +
-    "</form>" +
-    "</li>";
-  // colors
-  jobhandler.loopItems(function (path, idx) {
-    select_html +=
-      '<li id="addfill_' +
-      idx +
-      '" style="background-color:' +
-      path.color +
-      ';"">' +
-      '<a href="#" class="addfill_color" style="color:' +
-      path.color +
+// The fill popup: pxsize, one button per path colour (a fill covers every
+// path of its colour), and the fills already in the job with their pxsize.
+// colors: [[color, item idx], ...], fills: job items of kind fill.
+function tools_addfill_html(colors, fills, pxsize) {
+  var e = issues_escape;
+  function swatch(color) {
+    return (
+      '<span class="addfill_swatch" style="background-color:' +
+      e(color) +
+      '"></span>'
+    );
+  }
+  var html =
+    '<div class="addfill_head">Fill' +
+    '<button type="button" class="close" id="addfill_close" title="close">&times;</button></div>' +
+    '<div class="input-group input-group-sm addfill_row">' +
+    '<span class="input-group-addon">pxsize [mm]</span>' +
+    '<input id="fillpxsize" type="text" class="form-control" value="' +
+    e(pxsize) +
+    '" title="match this to laser focus size"></div>' +
+    '<div class="addfill_row"><button type="button" id="addfill_selection" class="btn btn-default btn-sm">Fill selection</button></div>' +
+    '<div class="addfill_row">';
+  if (colors.length == 0) {
+    html += "No job loaded.";
+  }
+  colors.forEach(function (c) {
+    html +=
+      '<a href="#" class="addfill_color" data-idx="' +
+      Number(c[1]) +
+      '" title="fill ' +
+      e(c[0]) +
       '">' +
-      '<span class="label label-default kindmem">path</span>' +
-      '<span style="display:none" class="idxmem">' +
-      idx +
-      "</span></a></li>";
-  }, "path");
-  $("#addfill_colors").html(select_html);
+      swatch(c[0]) +
+      "</a>";
+  });
+  html +=
+    '</div><div class="addfill_head">Added fills</div><div class="addfill_fills">';
+  if (fills.length == 0) {
+    html += "None yet.";
+  }
+  fills.forEach(function (fill) {
+    html +=
+      '<div class="addfill_fill">' +
+      swatch(fill.color) +
+      e(fill.color) +
+      " &nbsp; " +
+      e(fill.pxsize) +
+      " mm</div>";
+  });
+  return html + "</div>";
+}
 
-  // bind all color add buttons within dropdown
-  $(".addfill_color").click(function (e) {
-    var idx = parseFloat($(this).children("span.idxmem").text());
-    $("#addfill_colors").dropdown("toggle");
-    app_fill_btn.start();
-    fills_add_by_item(idx, function () {
-      app_fill_btn.stop();
-    });
-    return false;
+// a fill line spacing the scan loop can step with, or null
+function tools_addfill_pxsize(text) {
+  var v = parseFloat(text);
+  return v > 0 && isFinite(v) ? v : null;
+}
+
+function tools_addfill_init() {
+  // keep what the operator typed across re-renders
+  var pxsize = $("#fillpxsize").val() || app_config_main.pxsize;
+  var colors = [];
+  var seen = [];
+  jobhandler.loopItems(function (path, idx) {
+    if (seen.indexOf(path.color) == -1) {
+      seen.push(path.color);
+      colors.push([path.color, idx]);
+    }
+  }, "path");
+  var fills = [];
+  jobhandler.loopItems(function (fill) {
+    fills.push(fill);
+  }, "fill");
+  $("#addfill_panel").html(tools_addfill_html(colors, fills, pxsize));
+}
+
+// add a fill for each item index (one per colour), then show it in the list
+function tools_addfill_run(idxs) {
+  if (tools_addfill_pxsize($("#fillpxsize").val()) === null) {
+    $().uxmessage("notice", "pxsize must be a number above 0.");
+    return;
+  }
+  app_fill_btn.start();
+  fills_add_by_items(idxs, function () {
+    app_fill_btn.stop();
+    tools_addfill_init();
   });
 }
 

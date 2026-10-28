@@ -110,6 +110,33 @@ div.log_error {
 }
 
 
+.addfill_panel {
+    padding: 6px 10px;
+    min-width: 240px;
+}
+.addfill_head {
+    font-weight: bold;
+    margin: 4px 0 6px;
+}
+.addfill_row {
+    margin-bottom: 8px;
+}
+.addfill_swatch {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    margin-right: 4px;
+    border: 1px solid #888;
+    vertical-align: middle;
+}
+.addfill_fills {
+    max-height: 200px;
+    overflow-y: auto;
+}
+.addfill_fill {
+    margin-bottom: 4px;
+}
+
 .pass_color_dropdown > li > a:hover {
     background-color: transparent;
     background-image: none;
