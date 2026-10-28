@@ -1,0 +1,34 @@
+.material {
+  padding: 12px;  
+}
+
+[class^="material_quantity_"] {
+  text-align: center;
+  border: 2px solid black;
+  border-radius: 5px;
+  margin: 5px;
+}
+
+.material_quantity_1 {
+  height: 300px;
+  width: 600px;
+  line-height: 300px;
+}
+
+.material_quantity_3 {
+  height: 300px;
+  width: 200px;
+  line-height: 300px;
+}
+  
+.material_quantity_6 {
+  height: 200px;
+  width: 200px;
+  line-height: 200px;
+}
+
+[class^="material_quantity_"] p {
+    line-height: 1.5;
+    display: inline-block;
+    vertical-align: middle;
+}

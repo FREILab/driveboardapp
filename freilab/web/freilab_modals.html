@@ -1,0 +1,162 @@
+<!-- FREILab: material / billing dialogs, injected by freilab/run.py -->
+      <!-- material modal -->
+      <div id="material_modal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="myLargeModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+              <h4 class="modal-title" id="info_header">Material</h4>
+            </div>
+            <table id="material_table" style="width:100%">
+            </table> 
+          </div>
+        </div>
+      </div>
+      
+      <!-- material_quantity_1 modal -->
+      <div id="material_quantity_1_modal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="myLargeModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+              <h4 class="modal-title" id="info_header">Menge</h4>
+            </div>
+            <h4 class="chosen_material" style="text-align: center;"></h4>
+            <div>
+              <table style="margin: auto">
+                <tr>
+                  <td><div class="material_quantity_1" quantity="1" onclick="chose_quantity(1)"></div></td>
+                </tr>
+              </table>
+            </div>
+            <div style="text-align: center; padding: 15px;">
+              <button class="btn btn-default" data-dismiss="modal" style="margin-right: 100px; width: 150px; background-color: #D9534F; color: white;" >Abbrechen</button>
+              <button class="btn btn-default run_btn" onclick="material_start()" style="width: 150px; background-color: #5CB85C; color: white;">Start</button>              
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- material_quantity_3 modal -->
+      <div id="material_quantity_3_modal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="myLargeModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+              <h4 class="modal-title" id="info_header">Menge</h4>
+            </div>
+            <h4 class="chosen_material" style="text-align: center;"></h4>
+            <div>
+              <table style="margin: auto">
+                <tr>
+                  <td><div class="material_quantity_3" quantity="1" onclick="chose_quantity(1)"></div></td>
+                  <td><div class="material_quantity_3" quantity="2" onclick="chose_quantity(2)"></div></td>
+                  <td><div class="material_quantity_3" quantity="3" onclick="chose_quantity(3)"></div></td>
+                </tr>
+              </table>
+            </div>
+            <div style="text-align: center; padding: 15px;">
+              <button class="btn btn-default" data-dismiss="modal" style="margin-right: 100px; width: 150px; background-color: #D9534F; color: white;" >Abbrechen</button>
+              <button class="btn btn-default run_btn" onclick="material_start()" style="width: 150px; background-color: #5CB85C; color: white;">Start</button>              
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- material_quantity_6 modal -->
+      <div id="material_quantity_6_modal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="myLargeModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+              <h4 class="modal-title" id="info_header">Menge</h4>
+            </div>
+            <h4 class="chosen_material" style="text-align: center;"></h4>
+            <div>
+              <table style="margin: auto">
+                <tr>
+                  <td><div class="material_quantity_6" quantity="1" onclick="chose_quantity(1)"></div></td>
+                  <td><div class="material_quantity_6" quantity="2" onclick="chose_quantity(2)"></div></td>
+                  <td><div class="material_quantity_6" quantity="3" onclick="chose_quantity(3)"></div></td>
+                </tr>
+                <tr>
+                  <td><div class="material_quantity_6" quantity="4" onclick="chose_quantity(4)"></div></td>
+                  <td><div class="material_quantity_6" quantity="5" onclick="chose_quantity(5)"></div></td>
+                  <td><div class="material_quantity_6" quantity="6" onclick="chose_quantity(6)"></div></td>
+                </tr>
+              </table>
+            </div>
+            <div style="text-align: center; padding: 15px;">
+              <button class="btn btn-default" data-dismiss="modal" style="margin-right: 100px; width: 150px; background-color: #D9534F; color: white;" >Abbrechen</button>
+              <button class="btn btn-default run_btn" onclick="material_start()" style="width: 150px; background-color: #5CB85C; color: white;">Start</button>              
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- restekiste_modal -->
+      <div id="restekiste_modal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="myLargeModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+              <h4 class="modal-title" id="info_header">Restekiste</h4>
+            </div>
+            <h4 style="text-align: center;">Bei Material aus der Restekiste wird um eine Spende gebeten.<br/>Bitte Spendenbetrag eintragen:</h4>
+            <div style="text-align: center">
+              <input id="restekiste_spende" class="form-control" type="text" style="width: 150px; display: inline-block" value="0,20 €"/>
+            </div>
+            <div style="text-align: center; padding: 15px;">
+              <button class="btn btn-default" data-dismiss="modal" style="margin-right: 100px; width: 150px; background-color: #D9534F; color: white;" >Abbrechen</button>
+              <button class="btn btn-default run_btn" onclick="material_start()" style="width: 150px; background-color: #5CB85C; color: white;">Start</button>              
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- abgesprochen_modal -->
+      <div id="abgesprochen_modal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="myLargeModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+              <h4 class="modal-title" id="info_header">Abgesprochenes Fremdmaterial</h4>
+            </div>
+            <h4 style="text-align: center;">
+              Fremdmaterial darf nur nach ausdrücklicher Absprache mit Tobias oder Johannes genutzt werden.<br/>
+              Es fällt eine Nutzungsgebühr von 50% des Materialpreises an (solange nicht anders abgesprochen.<br/>
+              Art des Materials:
+            </h4>
+            <div style="text-align: center">
+              <input id="abgesprochen_material" class="form-control" type="text" style="width: 400px; display: inline-block" />
+            </div>
+            <h4 style="text-align: center;"> Nutzungsgebühr (50% des Preises):</h4>
+            <div style="text-align: center">
+              <input id="abgesprochen_spende" class="form-control" type="text" style="width: 150px; display: inline-block" value="0 €"/>
+            </div>
+            <div style="text-align: center; padding: 15px;">
+              <button class="btn btn-default" data-dismiss="modal" style="margin-right: 100px; width: 150px; background-color: #D9534F; color: white;" >Abbrechen</button>
+              <button class="btn btn-default run_btn" onclick="material_start()" style="width: 150px; background-color: #5CB85C; color: white;">Start</button>              
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- wiederverwendet_modal -->
+      <div id="wiederverwendet_modal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="myLargeModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+              <h4 class="modal-title" id="info_header">Bereits abgerechnet</h4>
+            </div>
+            <h4 style="text-align: center;">
+              Bist du dir sicher, dass du das Material schon abgerechnet hast?
+            </h4>
+            <div style="text-align: center; padding: 15px;">
+              <button class="btn btn-default" data-dismiss="modal" style="margin-right: 100px; width: 150px; background-color: #D9534F; color: white;" >Abbrechen</button>
+              <button class="btn btn-default run_btn" onclick="material_start()" style="width: 150px; background-color: #5CB85C; color: white;">Start</button>              
+            </div>
+          </div>
+        </div>
+      </div>

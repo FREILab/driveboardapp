@@ -1,0 +1,33 @@
+diff --git a/firmware/src/planner.c b/firmware/src/planner.c
+index 2065363..56b6ed5 100644
+--- a/firmware/src/planner.c
++++ b/firmware/src/planner.c
+@@ -296,7 +296,7 @@ inline void planner_discard_current_block() {
+ }
+ 
+ inline void planner_reset_block_buffer() {
+-  block_buffer_tail = block_buffer_head; 
++  block_buffer_tail = block_buffer_head;
+ }
+ 
+ 
+diff --git a/firmware/src/stepper.c b/firmware/src/stepper.c
+index 4022745..8a11979 100644
+--- a/firmware/src/stepper.c
++++ b/firmware/src/stepper.c
+@@ -802,11 +802,11 @@ inline void stepper_homing_cycle() {
+     homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 4.0*zdir, 0.1*CONFIG_SEEKRATE);
+   #endif
+   // x-axis
+-  homing_move(-999999*xdir, 0.0, 0.0, 10.0*xdir, 0.0, 0.0, 0.4*CONFIG_SEEKRATE);
+-  homing_move(-999999*xdir, 0.0, 0.0, 4.0*xdir, 0.0, 0.0, 0.1*CONFIG_SEEKRATE);
++  homing_move(-999999*xdir, 0.0, 0.0, 8.0*xdir, 0.0, 0.0, 0.4*CONFIG_SEEKRATE);
++  homing_move(-999999*xdir, 0.0, 0.0, 2.0*xdir, 0.0, 0.0, 0.1*CONFIG_SEEKRATE);
+   // y-axis
+-  homing_move(0.0, -999999*ydir, 0.0, 0.0, 10.0*ydir, 0.0, 0.4*CONFIG_SEEKRATE);
+-  homing_move(0.0, -999999*ydir, 0.0, 0.0, 4.0*ydir, 0.0, 0.1*CONFIG_SEEKRATE);
++  homing_move(0.0, -999999*ydir, 0.0, 0.0, 7.0*ydir, 0.0, 0.4*CONFIG_SEEKRATE);
++  homing_move(0.0, -999999*ydir, 0.0, 0.0, 3.0*ydir, 0.0, 0.1*CONFIG_SEEKRATE);
+ 
+   planner_set_position(0.0, 0.0, 0.0);
+   clear_vector(stepper_position);
