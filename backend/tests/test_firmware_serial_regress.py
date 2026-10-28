@@ -1,5 +1,7 @@
 """Regression tests for serial.c flow control and framing, executed in simavr.
 
+  - a stop or resume that lands while the protocol loop is draining a raster
+    line must not eat the first byte of the next job,
   - one lost or extra wire byte must not leave the doubled-byte check
     misaligned for good, so a resume recovers the link,
   - CMD_CHUNK_PROCESSED acks go out as soon as a chunk is read, not only when
@@ -29,6 +31,32 @@ def _pad(n):
 
 def _stop_codes(frame):
     return [b for b in frame if 32 < b < 65]
+
+
+def test_stop_while_draining_raster_keeps_next_job_intact():
+    # The raster block ends after two pixels, but the line's END never comes,
+    # so the protocol loop sits in the consume wait with the rx buffer empty.
+    raster = fw.double(
+        E("f", 3000)
+        + E("s", 100)
+        + E("p", 0.5)
+        + E("x", 2.0)
+        + [fw.CMD_RASTER, fw.CMD_RASTER_DATA_START, 200, 200]
+    )
+    send = (
+        raster
+        + _pad(400)
+        + fw.double([fw.CMD_STOP])
+        + _pad(20)
+        + fw.double([fw.CMD_RESUME])
+        + _pad(20)
+        + fw.line_program(5, feedrate=3000)
+        + _pad(40)
+        + fw.double([fw.CMD_SUPERSTATUS])
+    )
+    out, _, info = fw.run(send=send, run_cycles=14_000_000, count_portb=fw.X_STEP_PORTB_BIT)
+    assert _stop_codes(fw.frames(out)[-1]) == [], "next job was read as raster data"
+    assert info["steps"] == 445, "the move after the resume did not run to x=5"
 
 
 def test_lost_byte_resyncs_so_resume_recovers():

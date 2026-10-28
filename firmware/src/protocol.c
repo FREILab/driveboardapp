@@ -140,6 +140,9 @@ inline void protocol_loop() {
       // when stop, ignore serial chars
       // NOTE: A stop can happen any time during the protocol loop
       //       because both stepper and serial rx interrupt my trigger it.
+      //       A CMD_RESUME can clear it any time too, so this check alone
+      //       does not cover the read: a byte read while stopped comes back
+      //       as CMD_NONE (see serial_protocol_read).
       protocol_idle();
     } else {
       if(chr < 128) {  /////////////////////////////// marker
