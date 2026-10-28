@@ -155,7 +155,7 @@ class GcodeReader:
 
         # regexes
         self.re_parts = re.compile(r"(X|Y|Z|G|M|T|S|F)(-?[0-9]+\.?[0-9]*(?:E-?[0-9]*)?)").findall
-        self.re_toolchange = re.compile(r"(M6)").findall
+        self.re_toolchange = re.compile(r"M0*6(?![0-9])").findall  # not M60-M69
         self.re_T = re.compile(r"(T)([0-9]+)").findall
         self.re_toolinfo = re.compile(r"\((T[0-9]+) *(.+) *\)").findall
 
@@ -228,6 +228,7 @@ class GcodeReader:
             rawline = rawline.strip()
             # words are case-insensitive, inline (comments) are not code
             line = re.sub(r"\(.*?\)", "", rawline.upper()).strip()
+            line = re.sub(r"^N[0-9]+\s*", "", line)  # line number, not code
             # reject line condition
             if len(line) == 0 or line[0] not in (
                 "X",

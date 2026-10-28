@@ -567,7 +567,26 @@ def test_motion_before_any_tool_is_dropped():
     ]
 
 
-@pytest.mark.parametrize("line", ["N10 G1 X99", "O1234", "$H"])
+@pytest.mark.parametrize("m6", ["M6", "M06"])
+def test_m6_and_m06_start_a_tool_pass(m6):
+    job = _gcode(f"T1 {m6}\nG1 X1\nT2 {m6}\nG1 X2\n")
+    assert [d["tool"] for d in job["defs"]] == ["T1", "T2"]
+
+
+def test_m62_does_not_start_a_tool_pass():
+    job, rows = _gcode_rows("T1 M6\nG1 X1\nM62 P1\nG1 X2\n")
+    assert len(job["defs"]) == 1
+    assert _data(job) == [("G1", (1, None, None)), ("G1", (2, None, None))]
+    assert [(r["problem"], r["result"]) for r in rows] == [("M62 unsupported", "IGNORED")]
+
+
+def test_line_numbers_are_read_past():
+    job, rows = _gcode_rows("N5 T1 M6\nN10 G1 X1\nN20\n")
+    assert _data(job) == [("G1", (1, None, None))]
+    assert rows == []
+
+
+@pytest.mark.parametrize("line", ["O1234", "$H"])
 def test_unreadable_gcode_line_is_reported(line):
     _, rows = _gcode_rows(f"; header\n%\nT1 M6\n{line}\n")
     assert [(r["problem"], r["where"], r["kind"]) for r in rows] == [
@@ -595,7 +614,7 @@ def test_default_and_end_codes_are_silent(line):
 
 
 def test_comments_blank_and_foreign_lines_are_ignored():
-    text = "; header\n\n(just a comment)\n%\nN10 G1 X99\nT1 M6\n(move) \nG1 X1 (inline note)\n"
+    text = "; header\n\n(just a comment)\n%\nT1 M6\n(move) \nG1 X1 (inline note)\n"
     job = _gcode(text)
     assert _data(job) == [("G1", (1, None, None))]
 
