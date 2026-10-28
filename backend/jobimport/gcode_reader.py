@@ -128,6 +128,7 @@ class GcodeReader:
         # flags
         self.bTool = False
         self.where = None  # source line being read
+        self.dropped_at = None  # last line reported as "Move before tool set"
 
         # modal state
         self.G_motion = "G0"
@@ -203,9 +204,11 @@ class GcodeReader:
 
     def on_action(self, action):
         if not self.bTool:
-            issues.report(
-                "Move before tool set", "NOT CUT", "dropped", "Set tool first", self.where
-            )
+            if self.where != self.dropped_at:  # once per line, not per action
+                self.dropped_at = self.where
+                issues.report(
+                    "Move before tool set", "NOT CUT", "dropped", "Set tool first", self.where
+                )
             return
         self.path.append(action)
 
@@ -221,8 +224,9 @@ class GcodeReader:
         """Convert gcode to a job file."""
         for lineno, rawline in enumerate(gcodestring.splitlines(), 1):
             self.where = f"line {lineno}"
+            rawline = rawline.strip()
             # words are case-insensitive, inline (comments) are not code
-            line = re.sub(r"\(.*?\)", "", rawline.upper())
+            line = re.sub(r"\(.*?\)", "", rawline.upper()).strip()
             # reject line condition
             if len(line) == 0 or line[0] not in (
                 "X",
@@ -241,7 +245,7 @@ class GcodeReader:
                         self.toolinfo[toolinfo[0][0]] = toolinfo[0][1]
                 # reject: comments and program delimiters are fine, anything else is lost
                 else:
-                    if line.strip() and line[0] not in (";", "%"):
+                    if line and line[0] not in (";", "%"):
                         issues.report(
                             "Line not read", "NOT CUT", "dropped", "Remove from G-code", self.where
                         )

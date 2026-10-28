@@ -575,6 +575,19 @@ def test_unreadable_gcode_line_is_reported(line):
     ]
 
 
+def test_indented_comments_and_code_are_read_like_unindented_ones():
+    job, rows = _gcode_rows("T1 M6\n  ; indented comment\n  (c) ; x\n G1 X1\n")
+    assert _data(job) == [("G1", (1, None, None))]
+    assert rows == []
+
+
+def test_move_before_tool_counts_once_per_line():
+    _, rows = _gcode_rows("G1 X1 F100\nG1 X2\n")
+    assert [(r["problem"], r["where"], r["count"]) for r in rows] == [
+        ("Move before tool set", "line 1", 2)
+    ]
+
+
 @pytest.mark.parametrize("line", ["G17", "G54", "G94", "M2", "M30"])
 def test_default_and_end_codes_are_silent(line):
     _, rows = _gcode_rows(f"T1 M6\n{line}\n")
