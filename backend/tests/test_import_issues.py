@@ -319,7 +319,7 @@ def test_svg_switch_of_only_non_rendering_children_is_silent():
     assert rows == []
 
 
-def test_svg_raster_under_supported_clip_in_unsupported_clip_gets_a_row():
+def _nested_clip_svg(outer_image=False):
     import base64
     import io
 
@@ -333,14 +333,23 @@ def test_svg_raster_under_supported_clip_in_unsupported_clip_gets_a_row():
         '<clipPath id="bad"><circle r="40" cx="50" cy="50"/></clipPath>'
     )
     img = f'<image x="0" y="0" width="30" height="30" href="{uri}"/>'
-    body = (
-        defs
-        + f'<g id="outer" clip-path="url(#bad)"><g id="inner" clip-path="url(#ok)">{img}</g></g>'
-    )
-    _, rows = _import(_svg(body))
+    inner = f'<g id="inner" clip-path="url(#ok)">{img}</g>'
+    # a different position, or the importer reports the pair as duplicate images
+    extra = img.replace('x="0"', 'x="60"') if outer_image else ""
+    return _svg(defs + f'<g id="outer" clip-path="url(#bad)">{extra}{inner}</g>')
+
+
+def test_svg_raster_under_supported_clip_in_unsupported_clip_names_the_unsupported_one():
+    _, rows = _import(_nested_clip_svg())
     (row,) = rows
     assert (row["problem"], row["result"]) == ("Clip path ignored", "CUT UNCLIPPED")
-    assert row["where"] == 'g "inner"'
+    assert row["where"] == 'g "outer"'
+
+
+def test_svg_nested_clip_rasters_under_both_levels_give_one_row():
+    _, rows = _import(_nested_clip_svg(outer_image=True))
+    (row,) = rows
+    assert (row["where"], row["count"]) == ('g "outer"', 1)
 
 
 def test_svg_unknown_renderable_tag_row():

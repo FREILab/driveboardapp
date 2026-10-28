@@ -1129,13 +1129,16 @@ class SVGReader:
         # own frame (xformToWorld now includes the element's transform)
         own_clip = node.get("clip-path")
         if own_clip:
-            node["clip_owner"] = {
-                "where": node.get("where"),
-                # rasters are only left whole where no clip in the chain is applied
-                "rect": own_clip in self._clip_rects
-                and (parentNode.get("clip_owner") or {"rect": True})["rect"],
-                "reported": False,
-            }
+            parent_owner = parentNode.get("clip_owner")
+            if own_clip in self._clip_rects and parent_owner and not parent_owner["rect"]:
+                # the clip that is not applied is the ancestor's, name that one
+                node["clip_owner"] = parent_owner
+            else:
+                node["clip_owner"] = {
+                    "where": node.get("where"),
+                    "rect": own_clip in self._clip_rects,
+                    "reported": False,
+                }
             if own_clip in self._clip_rects:
                 node["clips"].append(
                     {
