@@ -4,7 +4,7 @@ import json
 
 from config import conf
 
-from . import issues, pathoptimizer
+from . import issues, pathoptimizer, template
 from .dba import resolve_image_data
 from .dedupe import dedupe_job
 from .dxf_parser import DXFParser
@@ -19,7 +19,7 @@ class UnknownFileType(TypeError):
     from inside a reader, which is a bug."""
 
 
-def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
+def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None, params=None):
     """Convert a job string (dba, svg, dxf, or gcode).
 
     Args:
@@ -27,6 +27,7 @@ def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
         optimize: Flag for optimizing path tolerances.
         tolerance: Tolerance used in convert/optimization.
         matrix: Transformation matrix to apply to dba
+        params: Values for the parameters of a parametric svg, by name
 
     Returns:
         A parsed .dba job.
@@ -44,7 +45,7 @@ def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
         if optimize:
             optimize_job(job, tolerance)
     elif type_ == "svg":
-        job = read_svg(job, tolerance, optimize=optimize)
+        job = read_svg(job, tolerance, optimize=optimize, params=params)
     elif type_ == "dxf":
         job = read_dxf(job, tolerance, optimize=optimize)
     elif type_ == "gcode":
@@ -133,8 +134,18 @@ def apply_alignment_matrix(job, matrix):
                     matrixApply(mat, one_point)
 
 
-def read_svg(svg_string, tolerance, forced_dpi=None, optimize=True):
-    """Read a svg file string and convert to dba job."""
+def read_svg(svg_string, tolerance, forced_dpi=None, optimize=True, params=None):
+    """Read a svg file string and convert to dba job.
+
+    A parametric svg (see template) is rendered with params, or its defaults,
+    and the job keeps the template so the values can be changed later.
+    """
+    if isinstance(svg_string, bytes):
+        svg_string = svg_string.decode("utf-8")
+    source, decl = svg_string, None
+    if template.has_params(source):
+        decl = template.parse_params(source)
+        svg_string = template.render(source, template.resolve_values(decl, params))
     svgReader = SVGReader(tolerance, conf["workspace"])
     res = svgReader.parse(svg_string, forced_dpi, conf["require_unit"])
     # {'boundarys':b, 'dpi':d, 'lasertags':l, 'rasters':r}
@@ -197,6 +208,8 @@ def read_svg(svg_string, tolerance, forced_dpi=None, optimize=True):
     if optimize:
         optimize_job(job, tolerance)
 
+    if decl is not None:
+        job["template"] = {"params": decl, "svg": source}
     return job
 
 

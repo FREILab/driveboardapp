@@ -14,7 +14,8 @@ import os
 
 import jobimport
 import pytest
-from jobimport import imagedata
+from helpers import TEMPLATE_SVG
+from jobimport import imagedata, issues
 from jobimport.gcode_reader import GcodeReader
 from jobimport.imagedata import preview_image_data
 from jobimport.svg_reader import SVGReader
@@ -1412,3 +1413,34 @@ def test_dumps_drops_separator_padding():
 def test_dumps_output_reloads_unchanged():
     job = {"head": {}, "passes": [], "items": [{"def": 0}], "defs": [{"kind": "path", "data": []}]}
     assert json.loads(jobimport.dumps(job)) == job
+
+
+# ---------------------------------------------------------------------------
+# parametric templates
+# ---------------------------------------------------------------------------
+
+
+def test_template_svg_renders_defaults_and_keeps_template():
+    job = jobimport.convert(TEMPLATE_SVG, optimize=False)
+    assert job["passes"][0]["feedrate"] == 1500
+    assert job["template"]["svg"] == TEMPLATE_SVG
+    assert job["template"]["params"][0]["name"] == "v"
+    # the =param: text is neither outlined nor cut: only the red rect is an item
+    assert [i.get("color") for i in job["items"]] == ["#ff0000"]
+
+
+def test_template_svg_takes_params():
+    job = jobimport.convert(TEMPLATE_SVG, optimize=False, params={"v": 1200})
+    assert job["passes"][0]["feedrate"] == 1200
+    xs = [p[0] for path in job["defs"][0]["data"] for p in path]
+    assert max(xs) - min(xs) == pytest.approx(8.0)  # width 1200/150
+
+
+def test_template_svg_bad_param_fails_import():
+    with pytest.raises(issues.ImportFailed):
+        jobimport.convert(TEMPLATE_SVG, optimize=False, params={"v": 1})
+
+
+def test_plain_svg_has_no_template(testjobs_dir):
+    with open(os.path.join(testjobs_dir, "full-bed.svg")) as fp:
+        assert "template" not in jobimport.convert(fp.read(), optimize=False)
