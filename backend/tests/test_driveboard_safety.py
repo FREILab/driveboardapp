@@ -781,18 +781,19 @@ def _raster_runs(buf):
 
     Each segment is emitted as a seek to the lead-in, a ramp up to the first
     pixel, then the raster move itself, so leadin_mm is the distance between the
-    last two line targets and span_mm the distance from there to the raster
-    target. Both are unsigned, and comparable to a multiple of pxsize_x.
+    last two line targets before the raster move and span_mm the distance from
+    there to the raster target. Both are unsigned, and comparable to a multiple
+    of pxsize_x. The lead-out line sits between the raster move and its pixels.
     """
     runs = []
     lines = []  # x target of each line move so far
-    target_x = span = None
+    target_x = leadin = span = None
     i = 0
     while i < len(buf):
         byte = buf[i]
         if byte == ord(driveboard.CMD_RASTER_DATA_START):
             end = buf.index(ord(driveboard.CMD_RASTER_DATA_END), i)
-            runs.append((abs(lines[-1] - lines[-2]), span, end - i - 1))
+            runs.append((leadin, span, end - i - 1))
             i = end + 1
         elif byte >= 128:  # a 4-byte number followed by its parameter marker
             param, value = decode_param(buf, i)
@@ -803,6 +804,7 @@ def _raster_runs(buf):
             if chr(byte) == driveboard.CMD_LINE:
                 lines.append(target_x)
             elif chr(byte) == driveboard.CMD_RASTER:
+                leadin = abs(lines[-1] - lines[-2])
                 span = abs(target_x - lines[-1])
             i += 1
     return runs

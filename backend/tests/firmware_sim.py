@@ -327,13 +327,25 @@ def line_program(x, feedrate=1000):
 
 
 def raster_segment_program(
-    start, end, pixels, leadin=5.0, feedrate=4000, seekrate=6000, pixel_width=0.1, intensity=200
+    start,
+    end,
+    pixels,
+    leadin=5.0,
+    feedrate=4000,
+    seekrate=6000,
+    pixel_width=0.1,
+    intensity=200,
+    leadout=None,
 ):
     """Wire bytes for a raster segment the way the host emits one: seek to the
-    lead-in, ramp to the start edge at the feedrate, raster move with data,
-    lead out. The colinear lead-in gives the raster block the entry speed the
-    planner allows a short block, as in a real job."""
+    lead-in, ramp to the start edge at the feedrate, raster move, lead out,
+    then the raster move's pixel data. The colinear lead-in and lead-out carry
+    the raster block through at the feedrate, as in a real job. The lead-out is
+    as long as the lead-in unless given, zero being one clamped at the end of
+    travel, which caps the raster block's entry at a speed it could stop from
+    within itself."""
     sign = 1.0 if end >= start else -1.0
+    leadout = leadin if leadout is None else leadout
     logical = (
         encode_value_param(PARAM_INTENSITY, 0)
         + encode_value_param(PARAM_FEEDRATE, seekrate)
@@ -345,12 +357,12 @@ def raster_segment_program(
         + encode_value_param(PARAM_INTENSITY, intensity)
         + encode_value_param(PARAM_PIXEL_WIDTH, pixel_width)
         + encode_value_param(PARAM_TARGET_X, end)
-        + [CMD_RASTER, CMD_RASTER_DATA_START]
+        + [CMD_RASTER]
+        + encode_value_param(PARAM_INTENSITY, 0)
+        + encode_value_param(PARAM_TARGET_X, end + sign * leadout)
+        + [CMD_LINE, CMD_RASTER_DATA_START]
         + list(pixels)
         + [CMD_RASTER_DATA_END]
-        + encode_value_param(PARAM_INTENSITY, 0)
-        + encode_value_param(PARAM_TARGET_X, end + sign * leadin)
-        + [CMD_LINE]
     )
     return double(logical)
 

@@ -1891,6 +1891,13 @@ def _emit_raster_segment(orientation, seekrate, feedrate_, intensity_, exit_y=No
     exit_y ends the lead-out on the next segment's scanline instead of this
     one, see _raster_exit_y. The beam is already off by then, so the tilt only
     changes where the head comes to rest.
+
+    The lead-out goes ahead of the pixel data, the order serial_raster_read in
+    firmware/src/serial.c relies on. The controller reads no command while
+    raster data streams, and that lasts until the raster move has run, so a
+    lead-out sent after the data is planned only once the head has already
+    stopped dead at full speed at the end of the line. Sent first, it is in the
+    planner while the raster move runs and the move carries straight on into it.
     """
     line_y = orientation["line_y"]
     intensity(0.0)  # intensity for seek and lead-in
@@ -1900,9 +1907,9 @@ def _emit_raster_segment(orientation, seekrate, feedrate_, intensity_, exit_y=No
     move(orientation["start"], line_y)  # lead-in
     intensity(intensity_)  # intensity for raster move
     rastermove(orientation["end"], line_y)  # raster move
-    rasterdata(orientation["data"], orientation["lo"], orientation["hi"])  # stream raster data
     intensity(0.0)  # intensity for lead-out
     move(orientation["leadout"], line_y if exit_y is None else exit_y)  # lead-out
+    rasterdata(orientation["data"], orientation["lo"], orientation["hi"])  # stream raster data
 
 
 # How far off its own scanline a lead-out may finish, as a fraction of the x

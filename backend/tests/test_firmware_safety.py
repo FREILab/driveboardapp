@@ -392,8 +392,10 @@ def test_zero_length_raster_move_does_not_stall_the_protocol_loop():
 # so energy per mm holds through the ramps. At 4000 mm/min the ramp covers
 # nominal^2/(4*accel) ~ 2.2mm at the configured 500 mm/s^2, so a short run
 # never cruises and must engrave anyway. Runs use the host's real segment
-# shape (seek, colinear lead-in, raster, lead-out): the lead-in gives the
-# raster block the entry speed the planner allows a short block.
+# shape (seek, colinear lead-in, raster, lead-out) with the lead-out clamped
+# away, as at the end of travel: a lead-out carries a short run through at
+# full speed, but without one the planner caps the raster block's entry at a
+# speed it could stop from within the block, which keeps it on the ramps.
 # ---------------------------------------------------------------------------
 
 RASTER_NOMINAL_DUTY = 199  # intensity 200 after the [128,255] pixel mapping
@@ -401,7 +403,7 @@ RASTER_NOMINAL_DUTY = 199  # intensity 200 after the [128,255] pixel mapping
 
 def _segment_duty(pixels, span_px, portd=None):
     start = 11.125
-    send = fw.raster_segment_program(start, start + span_px * 0.1, pixels)
+    send = fw.raster_segment_program(start, start + span_px * 0.1, pixels, leadout=0.0)
     _, _, info = fw.run(send=send, run_cycles=8_000_000, watch_symbol="pwm_duty", portd=portd)
     return info
 
