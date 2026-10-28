@@ -97,10 +97,14 @@ def test_resume_clears_stop():
     # Stop, read status WHILE stopped (so the stop code is actually emitted),
     # resume, then read status again. Discriminating: with a working resume the
     # final frame is clean; a no-op resume would leave the stop set and the last
-    # frame would still carry the stop marker.
+    # frame would still carry the stop marker. The no-op 'A's after the resume
+    # let the stopped frame finish first: one still being written drops a
+    # superstatus request that lands meanwhile.
     out, _ = fw.run(
         send=fw.double(
-            [fw.CMD_STOP, fw.CMD_SUPERSTATUS, fw.CMD_RESUME, fw.CMD_SUPERSTATUS, fw.CMD_SUPERSTATUS]
+            [fw.CMD_STOP, fw.CMD_SUPERSTATUS, fw.CMD_RESUME]
+            + [ord("A")] * 8
+            + [fw.CMD_SUPERSTATUS, fw.CMD_SUPERSTATUS]
         )
     )
     assert fw.STOPERROR_SERIAL_STOP_REQUEST in out, "stop was never actually reported"

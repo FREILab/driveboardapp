@@ -6,6 +6,9 @@ are present, and the firmware ELF + harness binary are built once per session.
 
 Set DRIVEBOARD_REQUIRE_FIRMWARE where the toolchain is installed on purpose,
 and a missing one fails instead of skipping.
+
+All harness timing is in AVR clock cycles at 16 MHz (CYCLES_PER_MS per ms),
+and --send bytes go out one per RX_GAP_CYCLES, see simavr_runner.c.
 """
 
 import functools
@@ -52,6 +55,12 @@ def unavailable(reason):
         )
     pytest.skip(reason)
 
+
+CYCLES_PER_MS = 16000
+# simavr_runner.c's spacing of --send bytes, in cycles: a 57600 baud 8N1 wire
+RX_GAP_CYCLES = 2778
+# and its wait after the boot hello before the first --send byte
+BOOT_CYCLES = 16000
 
 # Firmware protocol/sense constants (mirrors firmware/src/protocol.h + config).
 INFO_HELLO = 0x7E
@@ -226,6 +235,10 @@ def run(
     variant="config.driveboardusb.h",
 ):
     """Run a scenario.
+
+    run_cycles counts from reset, idle_cycles (wait before the first send byte)
+    and portc_delay (when the portc pins go high) from the boot hello, all in
+    AVR clock cycles.
 
     Returns (output_bytes, hello_seen). If watch_symbol and/or count_portb is
     given, returns (output_bytes, hello_seen, info) where info may hold the
