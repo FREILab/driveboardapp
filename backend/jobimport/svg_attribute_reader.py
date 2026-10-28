@@ -4,10 +4,73 @@ import logging
 import math
 import re
 
+from PIL import ImageColor
+
 from .utilities import NUMBER, matrixMult, parseFloats
-from .webcolors import css3_names_to_hex, normalize_hex, rgb_to_hex
 
 log = logging.getLogger("svg_reader")
+
+
+def _hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(*map(int, rgb[:3]))
+
+
+def _rgb_channels(args):
+    """Channels of an rgb() argument list, percentages scaled and all clamped to 0..255."""
+    chans = []
+    for num, pct in re.findall(rf"({NUMBER})(%?)", args):
+        num = float(num)
+        chans.append(min(255, max(0, round(num * 2.55) if pct else num)))
+    return chans
+
+
+def parse_color(val):
+    """Parse a color definition.
+
+    Returns a color in hex format, 'inherit', or 'none'.
+    'none' means that the geometry is not to be rendered.
+    See: http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
+    """
+    # http://www.w3.org/TR/SVG11/color.html
+    # http://www.w3.org/TR/2008/REC-CSS2-20080411/syndata.html#color-units
+    if val[0] == " ":
+        val = val.strip()
+    val = val.lower()  # CSS color syntax is case insensitive
+
+    if val[0] == "#":
+        try:
+            return _hex(ImageColor.getrgb(val))
+        except ValueError:
+            log.warn("invalid color, skipped: " + str(val))
+            return "inherit"
+    elif val.startswith("rgba"):
+        floats = _rgb_channels(val[5:-1])
+        if len(floats) == 4:
+            log.warn(
+                "opacity in rgba is ignored, \
+                          use stroke-opacity/fill-opacity instead"
+            )
+            return _hex(floats)
+    elif val.startswith("rgb"):
+        floats = _rgb_channels(val[4:-1])
+        if len(floats) == 3:
+            return _hex(floats)
+    elif val == "none":
+        # 'none' means the geometry is not to be filled or stroked
+        # http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
+        return "none"
+    elif val.startswith("hsl"):
+        log.warn("hsl/hsla color spaces are not supported")
+    elif val.startswith("url"):
+        # same document references are taken apart in colorAttrib
+        log.warn("only same document url(#id) paint references are supported")
+    elif val in ImageColor.colormap:  # named colors
+        return _hex(ImageColor.getrgb(val))
+    elif val in ["currentcolor", "inherit"]:
+        return "inherit"
+    else:
+        log.warn("invalid color, skipped: " + str(val))
+        return "inherit"
 
 
 class SVGAttributeReader:
@@ -106,7 +169,7 @@ class SVGAttributeReader:
             node[attr] = None
             return
         node.pop(attr + "-ref", None)
-        col = self._parseColor(value)
+        col = parse_color(value)
         if col != "inherit":
             node[attr] = col
 
@@ -265,46 +328,3 @@ class SVGAttributeReader:
                 return num
             log.error("invalid dimension")
         return None
-
-    def _parseColor(self, val):
-        """Parse a color definition.
-
-        Returns a color in hex format, 'inherit', or 'none'.
-        'none' means that the geometry is not to be rendered.
-        See: http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
-        """
-        # http://www.w3.org/TR/SVG11/color.html
-        # http://www.w3.org/TR/2008/REC-CSS2-20080411/syndata.html#color-units
-        if val[0] == " ":
-            val = val.strip()
-
-        if val[0] == "#":
-            return normalize_hex(val)
-        elif val.startswith("rgba"):
-            floats = parseFloats(val[5:-1])
-            if len(floats) == 4:
-                log.warn(
-                    "opacity in rgba is ignored, \
-                              use stroke-opacity/fill-opacity instead"
-                )
-                return rgb_to_hex(tuple(floats[:3]))
-        elif val.startswith("rgb"):
-            floats = parseFloats(val[4:-1])
-            if len(floats) == 3:
-                return rgb_to_hex(tuple(floats))
-        elif val == "none":
-            # 'none' means the geometry is not to be filled or stroked
-            # http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
-            return "none"
-        elif val.startswith("hsl"):
-            log.warn("hsl/hsla color spaces are not supported")
-        elif val.startswith("url"):
-            # same document references are taken apart in colorAttrib
-            log.warn("only same document url(#id) paint references are supported")
-        elif val in css3_names_to_hex:  # named colors
-            return css3_names_to_hex[val]
-        elif val in ["currentColor", "inherit"]:
-            return "inherit"
-        else:
-            log.warn("invalid color, skipped: " + str(val))
-            return "inherit"

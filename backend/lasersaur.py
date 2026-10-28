@@ -31,8 +31,9 @@ import logging
 import os
 import sys
 import time
-
-import requests
+import urllib.error
+import urllib.parse
+import urllib.request
 
 __author__ = "Stefan Hechenberger <stefan@nortd.com>"
 
@@ -55,23 +56,25 @@ class Lasersaur:
         """Make a http request.
 
         Raises:
-            requests.ConnectionError: Host not reachable.
-            requests.HTTPError: Web server responded with an error code.
+            urllib.error.URLError: Host not reachable.
+            urllib.error.HTTPError: Web server responded with an error code.
         """
 
         url = f"http://{self.host}:{self.port}{url}"
-        if postdict is None:
-            r = requests.get(url, auth=(self.user, self.pass_))
-        else:
-            r = requests.post(url, auth=(self.user, self.pass_), data=postdict)
-
-        if not r.ok:
-            if r.status_code == 400:
-                print("WEB ERROR: " + r.text[r.text.find("<pre>") + 5 : r.text.find("</pre>")])
-            r.raise_for_status()
+        data = None if postdict is None else urllib.parse.urlencode(postdict).encode()
+        auth = base64.b64encode(f"{self.user}:{self.pass_}".encode()).decode()
+        req = urllib.request.Request(url, data=data, headers={"Authorization": "Basic " + auth})
+        try:
+            with urllib.request.urlopen(req) as r:
+                body = r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 400:
+                text = e.read().decode("utf-8", "replace")
+                print("WEB ERROR: " + text[text.find("<pre>") + 5 : text.find("</pre>")])
+            raise
 
         if ret:
-            return r.json()
+            return json.loads(body)
 
     ### LOW-LEVEL
 
@@ -242,10 +245,10 @@ class Lasersaur:
         """
 
         job = {
-            "vector": {
-                "passes": [{"path": [0], "feedrate": feedrate, "intensity": intensity}],
-                "paths": [path],
-            }
+            "head": {},
+            "passes": [{"items": [0], "feedrate": feedrate, "intensity": intensity}],
+            "items": [{"def": 0}],
+            "defs": [{"kind": "path", "data": [path]}],
         }
         return self.load(json.dumps(job))
 
@@ -264,16 +267,10 @@ class Lasersaur:
             img = fp.read()
         img_b64 = base64.encodebytes(img).decode("utf8")
         job = {
-            "raster": {
-                "passes": [
-                    {
-                        "images": [0],
-                        "feedrate": feedrate,
-                        "intensity": intensity,
-                    },
-                ],
-                "images": [{"pos": pos, "size": size, "data": img_b64}],
-            }
+            "head": {},
+            "passes": [{"items": [0], "feedrate": feedrate, "intensity": intensity}],
+            "items": [{"def": 0}],
+            "defs": [{"kind": "image", "data": img_b64, "pos": pos, "size": size}],
         }
         return self.load(json.dumps(job))
 
@@ -285,6 +282,8 @@ class Lasersaur:
             jobs = self._request("/listing/starred", ret=True)
         elif kind == "unstarred":
             jobs = self._request("/listing/unstarred", ret=True)
+        else:
+            raise ValueError(f"Unknown listing kind: {kind!r}")
         return jobs
 
     def get(self, jobname):
@@ -347,18 +346,19 @@ class Lasersaur:
         base, name = os.path.split(jobfile)
         name, ext = os.path.splitext(name)
         job = self.open_file(jobfile, optimize=True)
-        if "vector" in job and "paths" in job["vector"] and type(job["vector"]["paths"]) is list:
-            if "passes" not in job["vector"] or feedrate is not None:
-                # file has no pass info | feedrate is specified
-                if feedrate is None:
-                    feedrate = 4000
-                job["vector"]["passes"] = [
-                    {
-                        "paths": list(range(len(job["vector"]["paths"]))),  # apply to all path
-                        "feedrate": feedrate,
-                        "intensity": intensity,
-                    }
-                ]
+        if not job.get("passes"):
+            # file has no pass info
+            job["passes"] = [
+                {
+                    "items": list(range(len(job["items"]))),  # apply to all items
+                    "feedrate": 4000 if feedrate is None else feedrate,
+                    "intensity": intensity,
+                }
+            ]
+        elif feedrate is not None:
+            for pass_ in job["passes"]:
+                pass_["feedrate"] = feedrate
+                pass_["intensity"] = intensity
         if local:
             self.host = "127.0.0.1"
             self.port = 4444

@@ -122,6 +122,8 @@ class GcodeReader:
 
         # modal state
         self.G_motion = "G0"
+        self.G_absolute = True  # G90/G91
+        self.unit_scale = 1  # G21 mm / G20 inch (output is mm)
         self.X_pos = None
         self.Y_pos = None
         self.Z_pos = None
@@ -141,7 +143,7 @@ class GcodeReader:
         self.floods = False
 
         # regexes
-        self.re_parts = re.compile(r"(X|Y|Z|G|M|T|S|F)(-?[0-9]+\.?[0-9]*(?:e-?[0-9]*)?)").findall
+        self.re_parts = re.compile(r"(X|Y|Z|G|M|T|S|F)(-?[0-9]+\.?[0-9]*(?:E-?[0-9]*)?)").findall
         self.re_toolchange = re.compile(r"(M6)").findall
         self.re_T = re.compile(r"(T)([0-9]+)").findall
         self.re_toolinfo = re.compile(r"\((T[0-9]+) *(.+) *\)").findall
@@ -194,9 +196,19 @@ class GcodeReader:
             return
         self.path.append(action)
 
+    def _scale(self, value):
+        return value if self.unit_scale == 1 else round(value * self.unit_scale, 4)
+
+    def _target(self, current, value):
+        """New axis position from a coordinate word, honoring G20/G21 and G90/G91."""
+        value = self._scale(value)
+        return value if self.G_absolute else round((current or 0) + value, 4)
+
     def parse(self, gcodestring):
         """Convert gcode to a job file."""
-        for line in gcodestring.splitlines():
+        for rawline in gcodestring.splitlines():
+            # words are case-insensitive, inline (comments) are not code
+            line = re.sub(r"\(.*?\)", "", rawline.upper())
             # reject line condition
             if len(line) == 0 or line[0] not in (
                 "X",
@@ -209,8 +221,8 @@ class GcodeReader:
                 "F",
             ):
                 # parse tool table
-                if line.startswith("(T"):
-                    toolinfo = self.re_toolinfo(line)
+                if rawline.startswith("(T"):
+                    toolinfo = self.re_toolinfo(rawline)
                     if toolinfo:
                         self.toolinfo[toolinfo[0][0]] = toolinfo[0][1]
                 # reject
@@ -236,17 +248,17 @@ class GcodeReader:
                     code[1] = int(code[1])
                 # target coordinates
                 if code[0] == "X":
-                    self.X_pos = code[1]
+                    self.X_pos = self._target(self.X_pos, code[1])
                     bMotion = True
                 elif code[0] == "Y":
-                    self.Y_pos = code[1]
+                    self.Y_pos = self._target(self.Y_pos, code[1])
                     bMotion = True
                 elif code[0] == "Z":
-                    self.Z_pos = code[1]
+                    self.Z_pos = self._target(self.Z_pos, code[1])
                     bMotion = True
                 # params: feedrate, freq, tool
                 elif code[0] == "F":
-                    self.F_rate = code[1]
+                    self.F_rate = self._scale(code[1])
                     bFeed = True
                 elif code[0] == "S":
                     self.S_freq = code[1]
@@ -280,6 +292,10 @@ class GcodeReader:
                 # motion style change
                 elif code[0] == "G" and code[1] in (0, 1):
                     self.G_motion = "G" + str(code[1])
+                elif code[0] == "G" and code[1] in (20, 21):
+                    self.unit_scale = 25.4 if code[1] == 20 else 1
+                elif code[0] == "G" and code[1] in (90, 91):
+                    self.G_absolute = code[1] == 90
                 # handle reporting of unsupported gcode
                 elif code[0] == "G" and code[1] in (2, 3):
                     print("ERROR: G2,G3 arc motions not supported")
@@ -289,8 +305,6 @@ class GcodeReader:
                     print("ERROR: G53 machine CS motion not supported")
                 elif code[0] == "G" and code[1] in (55, 56, 57, 58, 59):
                     print("ERROR: G55-G59 CS not supported")
-                elif code[0] == "G" and code[1] in (91,):
-                    print("ERROR: G91 relative motion not supported")
                 elif code[0] == "G" and code[1] in (92,):
                     print("ERROR: G92 shift CS not supported")
                 elif code[0] == "G" and code[1] in (93, 95):

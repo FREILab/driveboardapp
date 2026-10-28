@@ -4,6 +4,9 @@ import base64
 import io
 import logging
 import math
+import xml.etree.ElementTree as ET
+
+from PIL import Image
 
 from .svg_tag_reader import SVGTagReader
 from .svg_text_converter import convert_text_to_paths, get_conversion_warnings
@@ -18,24 +21,11 @@ from .utilities import (
     viewboxMatrix,
 )
 
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
-
 logging.basicConfig()
 log = logging.getLogger("svg_reader")
 # log.setLevel(logging.DEBUG)
 log.setLevel(logging.INFO)
 # log.setLevel(logging.WARN)
-
-
-try:
-    import xml.etree.ElementTree as ET
-except ImportError:
-    print(log.warn("Using non-C (slow) XML parser."))
-    import xml.etree.ElementTree as ET
-
 
 # SVG parser for the Lasersaur.
 # Converts SVG DOM to a flat collection of paths.
@@ -210,7 +200,7 @@ class SVGReader:
         header read rather than a decode, and one image is commonly placed
         many times over, so the answer is kept for the parse.
         """
-        if Image is None or not data_uri or "," not in data_uri:
+        if not data_uri or "," not in data_uri:
             return None
         size = self._image_sizes.get(data_uri)
         if size is None:
@@ -378,7 +368,7 @@ class SVGReader:
         if meet_or_slice == "slice":
             # the box keeps its extent and the pixels beyond it are dropped,
             # in the image's own frame, before any reorienting of the grid
-            if Image is None or not raster["data"]:
+            if not raster["data"]:
                 return
             raster.setdefault("ops", []).append(
                 (
@@ -436,10 +426,6 @@ class SVGReader:
             transpose = flip_h = flip_v = False
 
         if not raster["data"]:
-            return
-        if Image is None:
-            if not upright or flip_h or flip_v:
-                log.warning("rotated or mirrored image left as is, Pillow is missing")
             return
 
         if not (upright or quarter_turn):
@@ -790,7 +776,7 @@ class SVGReader:
             return False  # nothing left
         if ix0 <= px0 and iy0 <= py0 and ix1 >= px0 + pw and iy1 >= py0 + ph:
             return True  # clip contains the image; no crop
-        if Image is not None and raster["data"]:
+        if raster["data"]:
             raster.setdefault("ops", []).append(
                 (
                     "crop",

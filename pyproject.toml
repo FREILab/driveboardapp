@@ -13,12 +13,10 @@ dependencies = [
     "pillow>=9.1",
     "pyserial>=3.4",
     "dxfgrabber>=1.0",
-    "requests>=2.21.0",
     "fonttools>=4.60.0",
 ]
 
 [project.optional-dependencies]
-visualization = ["PyGObject>=3.42.0"]
 raspberrypi = ["RPi.GPIO>=0.7.0"]
 text = ["skia-pathops>=0.8.0"]
 
@@ -41,13 +39,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ["backend"]
-omit = [
-    "*/tests/*",
-    # vendored, not ours to cover
-    "*/jobimport/png.py",
-    "*/jobimport/webcolors.py",
-    "*/jobimport/dxfgrabber/*",
-]
+omit = ["*/tests/*"]
 
 [tool.coverage.report]
 skip_empty = true

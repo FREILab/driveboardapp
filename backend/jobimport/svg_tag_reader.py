@@ -207,20 +207,15 @@ class SVGTagReader:
     def line(self, node):
         # http://www.w3.org/TR/SVG11/shapes.html#LineElement
         # has transform and style attributes
-        # Note: lines can't really have fills, but we check anyway for consistency
-        has_stroke = self._has_valid_stroke(node)
-        has_fill = self._has_valid_fill(node)
-        if not has_stroke and not has_fill:
+        # a line has no interior, so fill does not apply (unlike polyline)
+        if not self._has_valid_stroke(node):
             return
         x1 = node.get("x1") or 0.0
         y1 = node.get("y1") or 0.0
         x2 = node.get("x2") or 0.0
         y2 = node.get("y2") or 0.0
         d = ["M", x1, y1, "L", x2, y2]
-        if has_stroke:
-            self._pathReader.add_path(d, node)
-        if has_fill:
-            self._pathReader.add_path(d, node, color=node.get("fill"))
+        self._pathReader.add_path(d, node)
 
     def circle(self, node):
         # http://www.w3.org/TR/SVG11/shapes.html#CircleElement

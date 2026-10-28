@@ -172,7 +172,7 @@ def read_svg(svg_string, tolerance, forced_dpi=None, optimize=True):
         for tag in res["lasertags"]:
             if len(tag) == 11:
                 idxs = []
-                for colidx in range(5, 10):
+                for colidx in range(5, 11):
                     idxs.extend(color_to_idxs.get(tag[colidx], []))
                 if "passes" not in job:
                     job["passes"] = []

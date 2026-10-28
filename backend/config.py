@@ -350,6 +350,8 @@ def load(configname):
         with open(path) as fp:
             try:
                 userconf = json.load(fp)
+                if not isinstance(userconf, dict):
+                    raise ValueError("top-level JSON is not an object")
                 for k in list(userconfigurable.keys()):
                     if k in userconf:
                         conf[k] = userconf[k]

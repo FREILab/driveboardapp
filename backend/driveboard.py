@@ -17,12 +17,7 @@ import serial
 import serial.tools.list_ports
 from config import conf, write_config_fields
 from jobtime import JobTimer
-
-if not conf["mill_mode"]:
-    try:
-        from PIL import Image
-    except ImportError:
-        print("Pillow module missing, raster mode will fail.")
+from PIL import Image
 
 __author__ = "Stefan Hechenberger <stefan@nortd.com>"
 

@@ -76,7 +76,7 @@ def checkserial(func):
 ### STATIC FILES
 
 
-def _frontend_file(filename, *subdirs):
+def _frontend_file(path):
     """Serve a frontend asset, revalidated on every request.
 
     Without an explicit Cache-Control a browser is free to guess how long the
@@ -85,8 +85,11 @@ def _frontend_file(filename, *subdirs):
     talks to. no-cache still allows the cached copy to be reused, it just has to
     be revalidated first, which costs one 304 per asset.
     """
-    root = os.path.join(conf["rootdir"], frontend_path, *subdirs)
-    response = bottle.static_file(filename, root=root)
+    root = os.path.join(conf["rootdir"], frontend_path)
+    if "/" in path and not os.path.isfile(os.path.join(root, path)):
+        # the mill frontend shares the laser frontend's vendored css/fonts/js/img
+        root = os.path.join(conf["rootdir"], "frontend")
+    response = bottle.static_file(path, root=root)
     response.set_header("Cache-Control", "no-cache")
     return response
 
@@ -101,29 +104,14 @@ def static_bin_handler(file):
     return _frontend_file(file)
 
 
-@bottle.route("/css/<path:path>")
-def static_css_handler(path):
-    return _frontend_file(path, "css")
-
-
-@bottle.route("/fonts/<path:path>")
-def static_font_handler(path):
-    return _frontend_file(path, "fonts")
-
-
-@bottle.route("/js/<path:path>")
-def static_js_handler(path):
-    return _frontend_file(path, "js")
-
-
-@bottle.route("/img/<path:path>")
-def static_img_handler(path):
-    return _frontend_file(path, "img")
+@bottle.route("/<path:re:(?:css|fonts|js|img)/.+>")
+def static_asset_handler(path):
+    return _frontend_file(path)
 
 
 @bottle.route("/favicon.ico")
 def favicon_handler():
-    return _frontend_file("favicon.ico", "img")
+    return _frontend_file("img/favicon.ico")
 
 
 @bottle.route("/temp", method="POST")
@@ -524,12 +512,25 @@ def _get_sorted(globpattern, library=False, stripext=False):
     return files
 
 
+def _job_base(jobname, library=False):
+    # path of a job without extension; the one place a user-supplied name
+    # becomes a path, so a name can never point outside its directory
+    if (
+        not isinstance(jobname, str)
+        or not jobname
+        or jobname in (".", "..")
+        or "/" in jobname
+        or "\\" in jobname
+        or "\0" in jobname
+    ):
+        raise bottle.HTTPResponse("Invalid job name.", 400)
+    base = os.path.join(conf["rootdir"], "library") if library else conf["stordir"]
+    return os.path.join(base, jobname)
+
+
 def _get(jobname, library=False):
     # get job as sting
-    if library:
-        jobpath = os.path.join(conf["rootdir"], "library", jobname.strip("/\\"))
-    else:
-        jobpath = os.path.join(conf["stordir"], jobname.strip("/\\"))
+    jobpath = _job_base(jobname, library)
     with _queue_lock:
         if os.path.exists(jobpath + ".dba"):
             jobpath = jobpath + ".dba"
@@ -543,10 +544,7 @@ def _get(jobname, library=False):
 
 
 def _get_path(jobname, library=False):
-    if library:
-        jobpath = os.path.join(conf["rootdir"], "library", jobname.strip("/\\"))
-    else:
-        jobpath = os.path.join(conf["stordir"], jobname.strip("/\\"))
+    jobpath = _job_base(jobname, library)
     if os.path.exists(jobpath + ".dba"):
         return jobpath + ".dba"
     elif os.path.exists(jobpath + ".dba.starred"):
@@ -556,7 +554,7 @@ def _get_path(jobname, library=False):
 
 
 def _exists(jobname):
-    namepath = os.path.join(conf["stordir"], jobname.strip("/\\"))
+    namepath = _job_base(jobname)
     if os.path.exists(namepath + ".dba") or os.path.exists(namepath + ".dba.starred"):
         raise bottle.HTTPResponse("File name exists.", 400)
 
@@ -580,7 +578,7 @@ def _add(job, name):
     # add job (dba string)
     # overwrites file if already exists, use _unique_name(name) to avoid
     with _queue_lock:
-        namepath = os.path.join(conf["stordir"], name.strip("/\\") + ".dba")
+        namepath = _job_base(name) + ".dba"
         fd, tmppath = tempfile.mkstemp(prefix=".job-", suffix=".tmp", dir=conf["stordir"])
         try:
             with os.fdopen(fd, "w") as fp:
@@ -816,6 +814,7 @@ def load():
     # sanity check
     if job is None or name is None:
         raise bottle.HTTPResponse("Invalid request data.", 400)
+    _job_base(name)  # reject unsafe names before any work is done
     progressive = bool(load_request.get("progressive"))
     # A dba posted back with nothing to do to it is already what convert()
     # would hand back, so it goes to the queue as it stands. This is the run

@@ -9,7 +9,6 @@ var jobview_width = 0;
 var jobview_height = 0;
 var jobview_mm2px = 1.0;
 
-var jobview_gridLayer = undefined;
 var jobview_boundsLayer = undefined;
 var jobview_seekLayer = undefined;
 var jobview_feedLayer = undefined;
@@ -34,25 +33,6 @@ function jobview_clear() {
   jobview_path = new THREE.Group();
   jobview_scene.add(jobview_path);
   jobview_render();
-}
-
-function jobview_reset_layer(layer) {
-  if (layer) {
-    layer.remove();
-  }
-  layer = new paper.Layer();
-  layer.pivot = new paper.Point(0, 0);
-  var x = 0;
-  var y = 0;
-  if ("offset" in status_cache) {
-    var x_mm = status_cache.offset[0];
-    var y_mm = status_cache.offset[1];
-    x = Math.floor(x_mm * jobview_mm2px);
-    y = Math.floor(y_mm * jobview_mm2px);
-  }
-  console.log("status_cahce.offset: " + x_mm + "," + y_mm);
-  layer.position = new paper.Point(x, y);
-  return layer;
 }
 
 function jobview_resize() {
@@ -117,16 +97,6 @@ function jobview_resize() {
     }
     paper.view.draw();
   }, 300);
-}
-
-function jobview_deselect_all() {
-  for (var i = 0; i < paper.project.layers.length; i++) {
-    var layer = paper.project.layers[i];
-    for (var j = 0; j < layer.children.length; j++) {
-      var child = layer.children[j];
-      child.selected = false;
-    }
-  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -277,37 +247,6 @@ function fitCameraToObject(object, offset) {
   } else {
     jobview_camera.lookAt(center);
   }
-}
-
-function jobview_grid() {
-  if (!("workspace" in app_config_main) || !("grid_mm" in app_config_main)) {
-    return;
-  }
-  var w_mm = app_config_main.workspace[0];
-  var line_every_mm = app_config_main.grid_mm;
-  var every_px = (jobview_width * line_every_mm) / w_mm;
-  jobview_gridLayer = new paper.Layer();
-  jobview_gridLayer.transformContent = false;
-  jobview_gridLayer.pivot = new paper.Point(0, 0);
-  jobview_gridLayer.activate();
-  var grid_group = new paper.Group();
-  // vertical
-  var x = every_px;
-  while (x < jobview_width) {
-    var line = new paper.Path();
-    line.add([x, 0], [x, jobview_height]);
-    grid_group.addChild(line);
-    x += every_px;
-  }
-  // horizontal
-  var y = every_px;
-  while (y < jobview_height) {
-    var line = new paper.Path();
-    line.add([0, y], [jobview_width, y]);
-    grid_group.addChild(line);
-    y += every_px;
-  }
-  grid_group.strokeColor = "#dddddd";
 }
 
 function jobview_head() {}

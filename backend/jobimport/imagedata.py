@@ -4,10 +4,7 @@ import base64
 import io
 import logging
 
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
+from PIL import Image
 
 log = logging.getLogger("svg_reader")
 
@@ -29,7 +26,7 @@ def normalize_image_data(data_uri):
     Returns the data URI unchanged when it needs no conversion, and when it
     cannot be read at all, leaving that to be reported downstream.
     """
-    if Image is None or not data_uri:
+    if not data_uri:
         return data_uri
     try:
         payload = data_uri.split(",", 1)[-1]
@@ -56,7 +53,7 @@ def preview_image_data(data_uri, max_dim=PREVIEW_MAX_DIM):
     preview them. Returns a PNG data URI, or the input unchanged when it is
     already small enough or cannot be read.
     """
-    if Image is None or not data_uri:
+    if not data_uri:
         return data_uri
     try:
         payload = data_uri.split(",", 1)[-1]

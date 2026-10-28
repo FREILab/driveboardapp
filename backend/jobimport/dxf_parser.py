@@ -12,7 +12,7 @@ import dxfgrabber
 
 
 class DXFParser:
-    """Parse DXF using dxfgrabber >=0.7.4 <=0.8.1
+    """Parse DXF using dxfgrabber >=1.0
 
     Usage:
     reader = DXFParser(tolerance, bedwidth)
@@ -172,10 +172,11 @@ class DXFParser:
 
         for entity in dwg.entities:
             if entity.color == dxfgrabber.BYLAYER:
-                layer = dwg.layers[entity.layer]
-                entity.color = layer.color
+                # an entity may sit on a layer missing from the layer table
+                layer = dwg.layers.get(entity.layer, None)
+                entity.color = layer.color if layer else 7
                 if self.debug:
-                    print(f"set entity color to layer color {layer.color:d}")
+                    print(f"set entity color to layer color {entity.color:d}")
 
             if entity.dxftype == "LINE":
                 self.addLine(entity)
@@ -241,13 +242,8 @@ class DXFParser:
         cx = self.unitize(entity.center[0])
         cy = self.unitize(entity.center[1])
         r = self.unitize(entity.radius)
-        # version 0, 8, 0 changed some entity names
-        if self.dxfgrabber_version[1] == 8:
-            theta1deg = entity.start_angle
-            theta2deg = entity.end_angle
-        else:
-            theta1deg = entity.startangle
-            theta2deg = entity.endangle
+        theta1deg = entity.start_angle
+        theta2deg = entity.end_angle
         thetadiff = theta2deg - theta1deg
         if thetadiff < 0:
             thetadiff = thetadiff + 360
@@ -276,9 +272,22 @@ class DXFParser:
         self.add_path_by_color(entity.color, path)
 
     def addPolyLine(self, entity):
-        path = []
-        for point in entity.points:
-            path.append([self.unitize(point[0]), self.unitize(point[1])])
+        pts = [[self.unitize(p[0]), self.unitize(p[1])] for p in entity.points]
+        # the closing segment runs from the last vertex back to the first
+        if entity.is_closed and len(pts) > 1:
+            pts.append(pts[0])
+        path = pts[:1]
+        for i in range(1, len(pts)):
+            (x1, y1), (x2, y2) = pts[i - 1], pts[i]
+            bulge = entity.bulge[i - 1] if i - 1 < len(entity.bulge) else 0.0
+            chord = sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if bulge and chord > 0:
+                # bulge = tan(sweep/4), positive is counter-clockwise
+                r = chord * (bulge**2 + 1) / (4 * abs(bulge))
+                path.pop()  # makeArc emits its own start point
+                self.makeArc(path, x1, y1, r, r, 0, int(abs(bulge) > 1), int(bulge > 0), x2, y2)
+            else:
+                path.append(pts[i])
         self.add_path_by_color(entity.color, path)
 
     def add_path_by_color(self, color, path):
@@ -459,7 +468,7 @@ class DXFParser:
 
         if y > self.y_min:
             self.y_min = y
-        elif y < self.y_max:
+        if y < self.y_max:
             self.y_max = y
 
     # convert value to mm

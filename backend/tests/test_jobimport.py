@@ -1191,7 +1191,7 @@ def test_a_translate_with_no_y_moves_in_x_only():
     segments = [seg for d in job["defs"] if d["kind"] == "path" for seg in d["data"]]
     assert len(segments) == 2
     corners = sorted((min(p[0] for p in s), min(p[1] for p in s)) for s in segments)
-    assert corners == pytest.approx([(10.0, 10.0), (60.0, 10.0)])
+    assert [c for xy in corners for c in xy] == pytest.approx([10.0, 10.0, 60.0, 10.0])
 
 
 def test_dedupe_drops_a_stacked_copy_from_an_svg():

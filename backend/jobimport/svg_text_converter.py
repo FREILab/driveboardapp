@@ -14,6 +14,8 @@ import platform
 import re
 import xml.etree.ElementTree as ET
 
+from .svg_attribute_reader import parse_color
+
 log = logging.getLogger("svg_text_converter")
 
 # Try to import pathops for removing overlapping contours
@@ -29,6 +31,8 @@ except ImportError:
 # This is reset at the start of each convert_text_to_paths call
 _conversion_warnings = []
 
+# cut settings text (=pass1:...=) is read by the tag reader, not outlined
+_re_lasertag = re.compile(r"=pass[0-9]+:")
 # a text element, with or without a namespace prefix, matched against the raw
 # document so one with none never has to be parsed and reserialized
 _re_text_element = re.compile(r"<\s*(?:[\w.-]+:)?(?:text|tspan)[\s/>]")
@@ -604,12 +608,6 @@ def convert_text_to_paths(svg_string):
         return svg_string
 
     try:
-        import fontTools.ttLib  # noqa: F401
-    except ImportError:
-        log.warning("fonttools not installed, text will not be converted to paths")
-        return svg_string
-
-    try:
         # Parse the SVG
         root = ET.fromstring(svg_str)
 
@@ -632,6 +630,8 @@ def convert_text_to_paths(svg_string):
         parent_map = {child: parent for parent in root.iter() for child in parent}
 
         for text_elem in text_elements:
+            if _re_lasertag.search("".join(text_elem.itertext())):
+                continue
             try:
                 # Get default styling from text element
                 font_family = get_style_attr(text_elem, "font-family", "sans-serif")
@@ -786,50 +786,15 @@ def get_text_content(elem):
 def normalize_color(color):
     """Convert a color value to a hex color code.
 
-    Handles:
-    - Hex colors (#rgb, #rrggbb)
-    - Named colors (red, blue, etc.)
-    - rgb() format
-
-    Args:
-        color: Color string in any supported format
-
     Returns:
         Hex color code (e.g., '#ff0000') or '#000000' if conversion fails
     """
-    if not color or color == "none":
-        return "#000000"
-
-    color = color.strip().lower()
-
-    # Already a hex color
-    if color.startswith("#"):
-        # Handle 3-digit hex (#rgb -> #rrggbb)
-        if len(color) == 4:
-            return "#" + color[1] * 2 + color[2] * 2 + color[3] * 2
-        return color
-
-    # Try to convert named color to hex using webcolors
+    color = (color or "").strip().lower()
     try:
-        from . import webcolors
-
-        return webcolors.name_to_hex(color)
-    except (ValueError, KeyError):
-        pass
-
-    # Handle rgb() format
-    if color.startswith("rgb(") and color.endswith(")"):
-        try:
-            rgb_str = color[4:-1]
-            parts = [p.strip() for p in rgb_str.split(",")]
-            if len(parts) == 3:
-                r, g, b = [int(p) for p in parts]
-                return f"#{r:02x}{g:02x}{b:02x}"
-        except ValueError:
-            pass
-
-    # Default to black
-    return "#000000"
+        color = parse_color(color) if color else None
+    except ValueError:
+        color = None
+    return color if color and color.startswith("#") else "#000000"
 
 
 def get_style_attr(elem, attr_name, default=None):
