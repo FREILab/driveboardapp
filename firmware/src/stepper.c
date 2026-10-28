@@ -107,7 +107,7 @@ static void adjust_speed( uint32_t steps_per_minute );
 static void adjust_beam_dynamics( uint32_t steps_per_minute );
 static uint32_t config_step_timer(uint32_t cycles);
 static void homing_delimit();
-static void homing_move(double xfar, double yfar, double zfar,
+static bool homing_move(double xfar, double yfar, double zfar,
                         double xback, double yback, double zback,
                         double feedrate);
 
@@ -704,7 +704,8 @@ inline void adjust_beam_dynamics( uint32_t steps_per_minute ) {
 }
 
 
-inline void homing_move(double xfar, double yfar, double zfar,
+// Returns false, leaving any stop set, when homing has to be abandoned.
+inline bool homing_move(double xfar, double yfar, double zfar,
                         double xback, double yback, double zback,
                         double feedrate) {
   // wait until planner buffer empty and executed
@@ -716,6 +717,18 @@ inline void homing_move(double xfar, double yfar, double zfar,
   planner_line(xfar, yfar, zfar, feedrate, 0, 0.0);
   // wait for limit hit
   while(stepper_processing()) { protocol_idle(); }
+  // A limit hit is the only normal end of the approach. Any other stop (user,
+  // watchdog, ...) must stay set, not be resumed into a back-off with the
+  // limits disabled and the remaining axes. No stop at all (resumed part way)
+  // found no limit either.
+  switch (stepper_stop_status()) {
+    case STOPERROR_LIMIT_HIT_X1: case STOPERROR_LIMIT_HIT_X2:
+    case STOPERROR_LIMIT_HIT_Y1: case STOPERROR_LIMIT_HIT_Y2:
+    case STOPERROR_LIMIT_HIT_Z1: case STOPERROR_LIMIT_HIT_Z2:
+      break;
+    default:
+      return false;
+  }
   // reset, relative moves
   planner_set_position(0.0, 0.0, 0.0);
   clear_vector(stepper_position);
@@ -726,6 +739,7 @@ inline void homing_move(double xfar, double yfar, double zfar,
   // wait for move to finish
   while(stepper_processing()) { protocol_idle(); }
   disable_limits = false;
+  return !stepper_stop_requested();  // stopped during the back-off
 }
 
 
@@ -763,7 +777,7 @@ inline void homing_delimit() {
 }
 
 
-inline void stepper_homing_cycle() {
+inline bool stepper_homing_cycle() {
   // homing direction
   #if (CONFIG_INVERT_X_HOMING == 1)
     double xdir = -1.0;
@@ -791,16 +805,17 @@ inline void stepper_homing_cycle() {
   // execute homing moves
   #ifdef ENABLE_3AXES
     // z-axis, first for save retract
-    homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 10.0*zdir, 0.4*CONFIG_SEEKRATE);
-    homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 4.0*zdir, 0.1*CONFIG_SEEKRATE);
+    if (!homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 10.0*zdir, 0.4*CONFIG_SEEKRATE)) { return false; }
+    if (!homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 4.0*zdir, 0.1*CONFIG_SEEKRATE)) { return false; }
   #endif
   // x-axis
-  homing_move(-999999*xdir, 0.0, 0.0, 10.0*xdir, 0.0, 0.0, 0.4*CONFIG_SEEKRATE);
-  homing_move(-999999*xdir, 0.0, 0.0, 4.0*xdir, 0.0, 0.0, 0.1*CONFIG_SEEKRATE);
+  if (!homing_move(-999999*xdir, 0.0, 0.0, 10.0*xdir, 0.0, 0.0, 0.4*CONFIG_SEEKRATE)) { return false; }
+  if (!homing_move(-999999*xdir, 0.0, 0.0, 4.0*xdir, 0.0, 0.0, 0.1*CONFIG_SEEKRATE)) { return false; }
   // y-axis
-  homing_move(0.0, -999999*ydir, 0.0, 0.0, 10.0*ydir, 0.0, 0.4*CONFIG_SEEKRATE);
-  homing_move(0.0, -999999*ydir, 0.0, 0.0, 4.0*ydir, 0.0, 0.1*CONFIG_SEEKRATE);
+  if (!homing_move(0.0, -999999*ydir, 0.0, 0.0, 10.0*ydir, 0.0, 0.4*CONFIG_SEEKRATE)) { return false; }
+  if (!homing_move(0.0, -999999*ydir, 0.0, 0.0, 4.0*ydir, 0.0, 0.1*CONFIG_SEEKRATE)) { return false; }
 
   planner_set_position(0.0, 0.0, 0.0);
   clear_vector(stepper_position);
+  return true;
 }

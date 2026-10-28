@@ -196,14 +196,17 @@ inline void on_cmd(uint8_t command) {
       st.ref_mode = st.ref_mode_store;
       break;
     case CMD_HOMING:
-      stepper_homing_cycle();
       clear_vector(st.offset);
-      // move head to table offset
-      st.target[X_AXIS] = CONFIG_X_ORIGIN_OFFSET;
-      st.target[Y_AXIS] = CONFIG_Y_ORIGIN_OFFSET;
-      st.target[Z_AXIS] = CONFIG_Z_ORIGIN_OFFSET;
-      planner_line( st.target[X_AXIS], st.target[Y_AXIS], st.target[Z_AXIS],
-                    st.feedrate, 0, 0.0 );
+      // an abandoned homing leaves its stop set and the head unhomed,
+      // so there is no origin to move to
+      if (stepper_homing_cycle()) {
+        // move head to table offset
+        st.target[X_AXIS] = CONFIG_X_ORIGIN_OFFSET;
+        st.target[Y_AXIS] = CONFIG_Y_ORIGIN_OFFSET;
+        st.target[Z_AXIS] = CONFIG_Z_ORIGIN_OFFSET;
+        planner_line( st.target[X_AXIS], st.target[Y_AXIS], st.target[Z_AXIS],
+                      st.feedrate, 0, 0.0 );
+      }
       break;
     case CMD_OFFSET_STORE:
       st.offset_store[X_AXIS] = st.offset[X_AXIS];
