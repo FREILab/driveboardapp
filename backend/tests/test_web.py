@@ -2450,3 +2450,21 @@ def test_cancel_leaves_the_worker_started_after_a_drop(queue, killable_pool, mon
     killable_pool.future.set_result(None)
     assert entry["event"].wait(5)
     assert os.listdir(d) == []
+
+
+def test_load_template_with_params(auth_app, isolated_config):
+    from helpers import TEMPLATE_SVG
+
+    req = {"job": TEMPLATE_SVG, "name": "tpl", "optimize": False, "params": {"v": 1200}}
+    resp = auth_app.post("/load", {"load_request": json.dumps(req)})
+    job = _stored_job(isolated_config, json.loads(resp.body))
+    assert job["passes"][0]["feedrate"] == 1200 and "template" in job
+
+
+def test_load_template_out_of_range_is_fatal(auth_app, isolated_config):
+    from helpers import TEMPLATE_SVG
+
+    req = {"job": TEMPLATE_SVG, "name": "tpl", "review_issues": True, "params": {"v": 1}}
+    resp = auth_app.post("/load", {"load_request": json.dumps(req)}, expect_errors=True)
+    assert resp.status_int == 422
+    assert json.loads(resp.body)["fatal"]["problem"] == "Feed out of range"

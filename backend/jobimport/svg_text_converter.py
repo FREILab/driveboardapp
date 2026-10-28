@@ -28,8 +28,9 @@ except ImportError:
     PATHOPS_AVAILABLE = False
     log.debug("pathops not available, overlapping contours won't be removed")
 
-# cut settings text (=pass1:...=) is read by the tag reader, not outlined
-_re_lasertag = re.compile(r"=pass[0-9]+:")
+# cut settings (=pass1:...=) and template parameter (=param:...=) text is read
+# by the tag reader and the template engine, not outlined
+_re_lasertag = re.compile(r"=(?:pass[0-9]+|param):")
 # a text element, with or without a namespace prefix, matched against the raw
 # document so one with none never has to be parsed and reserialized
 _re_text_element = re.compile(r"<\s*(?:[\w.-]+:)?(?:text|tspan)[\s/>]")

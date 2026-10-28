@@ -677,7 +677,7 @@ _convert_pool_lock = threading.Lock()
 _convert_busy = set()
 
 
-def _convert_worker(in_path, out_path, quick_path, text, optimize, matrix, conf_overrides):
+def _convert_worker(in_path, out_path, quick_path, text, optimize, matrix, conf_overrides, params=None):
     """Convert a job file into a .dba file, in the worker process.
 
     With quick_path, the parsed-but-unoptimized job lands there as soon as it
@@ -696,7 +696,9 @@ def _convert_worker(in_path, out_path, quick_path, text, optimize, matrix, conf_
         # gcode is procedural, its order is never optimized (see read_gcode)
         optimize = optimize and jobimport.get_type(job) != "gcode"
         with issues.collecting() as found:
-            job = jobimport.convert(job, optimize=False, tolerance=conf["tolerance"], matrix=matrix)
+            job = jobimport.convert(
+                job, optimize=False, tolerance=conf["tolerance"], matrix=matrix, params=params
+            )
         _write_issues(out_path, found)
         with open(quick_path + ".tmp", "w") as fp:
             fp.write(jobimport.dumps(jobimport.share_image_data(job)))
@@ -706,7 +708,7 @@ def _convert_worker(in_path, out_path, quick_path, text, optimize, matrix, conf_
     else:
         with issues.collecting() as found:
             job = jobimport.convert(
-                job, optimize=optimize, tolerance=conf["tolerance"], matrix=matrix
+                job, optimize=optimize, tolerance=conf["tolerance"], matrix=matrix, params=params
             )
         _write_issues(out_path, found)
     # placements of one picture share its payload on the way to disk, see
@@ -799,7 +801,7 @@ def _pending_register(future, out_path, tmpdir):
     return token
 
 
-def _convert_job(job, optimize, matrix, progressive=False):
+def _convert_job(job, optimize, matrix, progressive=False, params=None):
     """Convert a job to a .dba string, in a worker process where one can be had.
 
     Returns (dba_string, token, issues): token is None when the string is
@@ -822,6 +824,7 @@ def _convert_job(job, optimize, matrix, progressive=False):
         optimize,
         matrix,
         dict(conf),
+        params,
     )
     try:
         with open(args[0], "wb") as fp:
@@ -873,6 +876,7 @@ def load():
         optimize: flag whether to optimize (bool)
         overwrite: flag whether to overwite file if present (bool)
         matrix: alignment matrix to apply to dba (3x3 list of lists of float)
+        params: values for the parameters of a parametric svg ({name: number})
         review_issues: flag to hold a job with import issues for review (bool),
             answered {"hold", "name", "issues"} and decided via /load_commit
             or /load_cancel; failures are answered {"fatal": {...}}
@@ -911,6 +915,7 @@ def load():
         raise bottle.HTTPResponse("Invalid request data.", 400)
     _job_base(name)  # reject unsafe names before any work is done
     progressive = bool(load_request.get("progressive"))
+    params = load_request.get("params")  # values for a parametric svg
     review = bool(load_request.get("review_issues"))
     # A dba posted back with nothing to do to it is already what convert()
     # would hand back, so it goes to the queue as it stands. This is the run
@@ -923,7 +928,7 @@ def load():
         as_is = as_is and jobimport.get_type(job) == "dba"
         if not as_is:
             # convert, off this process so the serial thread keeps its timing
-            job, pending, found = _convert_job(job, optimize, matrix, progressive)  # a .dba
+            job, pending, found = _convert_job(job, optimize, matrix, progressive, params)  # a .dba
     except Exception as e:
         if review:
             raise _load_fatal(e) from None

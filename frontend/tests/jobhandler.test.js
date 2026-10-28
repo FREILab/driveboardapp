@@ -249,3 +249,31 @@ test("a limit of 0 turns the power/speed check off", () => {
   assert.equal(job.passOverPowerSpeedLimit(0), null);
   assert.equal(job.passOverPowerSpeedLimit(undefined), null);
 });
+
+// ---------------------------------------------------------------------------
+// parametric library jobs
+// ---------------------------------------------------------------------------
+
+function setJob(extra) {
+  const app = loadFrontend(["jobhandler.js"], { passes_set_assignments: () => {}, jobview_clear: () => {}, passes_clear: () => {} });
+  const job = Object.assign(
+    { defs: [{ kind: "path", data: [[[0, 0, 0]]] }], items: [{ def: 0, color: "#000000" }] },
+    extra,
+  );
+  app.jobhandler.set(job, "t", () => {});
+  return app.jobhandler;
+}
+
+test("template survives set and getJson", () => {
+  const template = {
+    params: [{ name: "vmin", default: 1500, min: 100, max: 6000, label: "Vorschub min" }],
+    svg: "<svg/>",
+  };
+  assert.deepStrictEqual(JSON.parse(setJob({ template }).getJson()).template, template);
+});
+
+test("job without template has no template key", () => {
+  const job = setJob({});
+  assert.strictEqual(job.template, null);
+  assert.ok(!("template" in JSON.parse(job.getJson())));
+});

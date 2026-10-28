@@ -55,6 +55,45 @@ Complete File Description
     {"kind":"image", "data":<data in base64>, "pos":[0,0], "size":[300,200], "source":<hash of pre-clip data>},  # source is optional
  ],
  "sources": {<hash>: <pre-clip data in base64>},   # optional, original data of clipped images for previews
- "stats":{"items":[{"bbox":[x1,y1,x2,y2], "len":100}], "all":{}}   # optional
+ "stats":{"items":[{"bbox":[x1,y1,x2,y2], "len":100}], "all":{}},  # optional
+ "template": {                  # optional, a parametric job, see below
+    "params": [{"name": "v", "default": 1500, "min": 100, "max": 6000, "label": "Feed"}],
+    "svg": "<svg ...> ... {{v}} ... </svg>"       # the source svg with its placeholders
+ }
 }
 ```
+
+Parametric templates
+--------------------
+
+A job with a `template` can be generated again with other values. The job itself
+is complete, generated with the defaults, so software that ignores the field
+runs the job with the defaults. The values are checked against min and max; a
+value outside is refused with a message naming the field and the range.
+
+### Authoring a template
+
+1. Draw it in Inkscape.
+2. Declare each parameter as a text element:
+   `=param:<name>:<default>:<min>:<max>:<label>=`. The label comes last so it
+   may contain spaces. Colons are not allowed in it. Like pass tags, these text
+   elements are neither cut nor outlined.
+3. Put `{{ expression }}` wherever a value goes: in visible text, in pass tags
+   (`=pass3:{{round(v3)}}:{{p1}}:#00ff00=`), and in any attribute, including
+   geometry (`height="{{d}}"`, path data, transforms).
+4. Open the SVG in the app as usual. The import finds the `=param:` tags,
+   renders the template with the defaults, converts it as a normal SVG, and
+   attaches `template` (the raw SVG and the parsed params) to the job.
+5. Export. The downloaded .dba contains `template`. Put it in the library.
+
+Keep the source SVG next to the library so it can be edited again in Inkscape.
+
+Inkscape may rewrite geometry attributes (path data, transforms) on save and
+lose a placeholder there. Set or check placeholders in geometry in a text editor
+after the last Inkscape save.
+
+The number of elements is fixed by the template: there are no loops and no
+conditionals. A different grid size means a different template.
+
+Expressions use numbers, parameter names, `+ - * / //`, parentheses and
+`round`, `min`, `max`, `abs`. Nothing else is evaluated.
