@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="85mm" height="14mm" viewBox="0 0 85 14">
+  <!-- Test_PowerQuadrate: 6 squares of 10 mm at 100 %, feed spread from vmax (left) to vmin (right) -->
+  <text x="0" y="1">=param:vmin:1500:100:6000:Vorschub min=</text>
+  <text x="0" y="1">=param:vmax:2000:100:6000:Vorschub max=</text>
+  <text x="0" y="1">=pass1:2000:15:#02ffff=</text>
+  <text x="0" y="1">=pass2:{{round(vmax - (vmax - vmin) * 0 / 5)}}:100:#000000=</text>
+  <text x="0" y="1">=pass3:{{round(vmax - (vmax - vmin) * 1 / 5)}}:100:#ff0000=</text>
+  <text x="0" y="1">=pass4:{{round(vmax - (vmax - vmin) * 2 / 5)}}:100:#00ff00=</text>
+  <text x="0" y="1">=pass5:{{round(vmax - (vmax - vmin) * 3 / 5)}}:100:#0000ff=</text>
+  <text x="0" y="1">=pass6:{{round(vmax - (vmax - vmin) * 4 / 5)}}:100:#fffb11=</text>
+  <text x="0" y="1">=pass7:{{round(vmax - (vmax - vmin) * 5 / 5)}}:100:#ff02de=</text>
+  <g fill="none" stroke-width="0.1">
+    <rect x="0" y="0" width="10" height="10" stroke="#000000"/>
+    <rect x="15" y="0" width="10" height="10" stroke="#ff0000"/>
+    <rect x="30" y="0" width="10" height="10" stroke="#00ff00"/>
+    <rect x="45" y="0" width="10" height="10" stroke="#0000ff"/>
+    <rect x="60" y="0" width="10" height="10" stroke="#fffb11"/>
+    <rect x="75" y="0" width="10" height="10" stroke="#ff02de"/>
+  </g>
+  <text x="5" y="5.7" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 0 / 5)}}</text>
+  <text x="5" y="13.4" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 0 / 5)}}</text>
+  <text x="20" y="5.7" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 1 / 5)}}</text>
+  <text x="20" y="13.4" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 1 / 5)}}</text>
+  <text x="35" y="5.7" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 2 / 5)}}</text>
+  <text x="35" y="13.4" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 2 / 5)}}</text>
+  <text x="50" y="5.7" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 3 / 5)}}</text>
+  <text x="50" y="13.4" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 3 / 5)}}</text>
+  <text x="65" y="5.7" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 4 / 5)}}</text>
+  <text x="65" y="13.4" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 4 / 5)}}</text>
+  <text x="80" y="5.7" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 5 / 5)}}</text>
+  <text x="80" y="13.4" fill="#02ffff" font-family="DejaVu Sans" font-size="2" text-anchor="middle">{{round(vmax - (vmax - vmin) * 5 / 5)}}</text>
+</svg>
