@@ -90,7 +90,6 @@ static volatile bool stop_requested;          // when set to true stepper interr
 static volatile uint8_t stop_status;          // yields the reason for a stop request
 static volatile bool paused;                  // when set, stepping is frozen (beam off) but block buffer/position are retained, so motion can resume exactly
 static volatile uint8_t resume_state;         // 0 none, 1 ramp requested, 2 ramping. eases the speed back up after a pause
-static uint32_t resume_rate_target;           // rate to ramp back up to when resuming from a pause
 static volatile uint8_t disable_limits;       // option to disable limts for homing cycle
 
 #if PWM_MODE == SYNCED_FREQ
@@ -171,6 +170,7 @@ void stepper_stop_processing() {
   // abandoning one part way would carry the remaining count into the next
   // dwell, which would then burn for the wrong time at the wrong tick rate.
   dwell_counter = 0;
+  resume_state = 0;  // the buffer ran dry or was flushed, the next move plans from rest
   // Disable stepper driver interrupt
   TIMSK1 &= ~(1<<OCIE1A);
   control_laser_intensity(0);
@@ -411,7 +411,13 @@ ISR(TIMER1_COMPA_vect) {
     }
     if (current_block->type == TYPE_LINE || current_block->type == TYPE_RASTER_LINE) {
       // starting on new line block
-      adjusted_rate = current_block->initial_rate;
+      if (resume_state == 2 && adjusted_rate < current_block->initial_rate) {
+        // still easing up after a pause: carry on from the actual speed
+        // rather than step up to the planned junction speed
+      } else {
+        adjusted_rate = current_block->initial_rate;
+        if (resume_state == 2) { resume_state = 0; }  // back on the plan
+      }
       acceleration_tick_counter = CYCLES_PER_ACCELERATION_TICK/2; // start halfway, midpoint rule.
       if (current_block->type == TYPE_RASTER_LINE) {
         // reset before the beam dynamics call below reads them
@@ -423,7 +429,6 @@ ISR(TIMER1_COMPA_vect) {
       counter_y = counter_x;
       counter_z = counter_x;
       step_events_completed = 0;
-      resume_state = 0;  // new block starts at initial_rate, no resume ramp
     }
   }
 
@@ -476,23 +481,28 @@ ISR(TIMER1_COMPA_vect) {
       if (step_events_completed < current_block->step_event_count) {  // block not finished
 
         if (resume_state == 1) {
-          // resuming from a pause: drop to the block's start rate, then ramp
-          // back up to the pre-pause rate rather than jumping there directly
-          resume_rate_target = adjusted_rate;
-          adjusted_rate = current_block->initial_rate;
-          if (adjusted_rate > resume_rate_target) {
-            adjusted_rate = resume_rate_target;
-          }
+          // resuming from a pause: the head is at rest wherever in the block
+          // it stopped, so the planned profile no longer applies. Ramp from
+          // rest (adjust_speed clamps to MINIMUM_STEPS_PER_MINUTE).
+          adjusted_rate = 0;
           acceleration_tick_counter = CYCLES_PER_ACCELERATION_TICK/2;
           adjust_laser_speed_beam_dynamics( adjusted_rate );
           resume_state = 2;
         } else if (resume_state == 2) {
-          // ramping back up to the pre-pause rate
+          // own trapezoid for the rest of the block: accelerate toward
+          // nominal_rate, capped by the speed from which the remaining steps
+          // still brake to final_rate (v^2 = vf^2 + 2*a*steps_left)
           if ( acceleration_tick() ) {
             adjusted_rate += current_block->rate_delta;
-            if (adjusted_rate >= resume_rate_target) {
-              adjusted_rate = resume_rate_target;
-              resume_state = 0;
+            if (adjusted_rate > current_block->nominal_rate) {
+              adjusted_rate = current_block->nominal_rate;
+            }
+            float final_rate = current_block->final_rate;
+            uint32_t brake_rate = sqrt( final_rate*final_rate +
+                2.0*current_block->rate_delta*ACCELERATION_TICKS_PER_SECOND*60 *
+                (current_block->step_event_count - step_events_completed) );
+            if (adjusted_rate > brake_rate) {
+              adjusted_rate = brake_rate;
             }
             adjust_laser_speed_beam_dynamics( adjusted_rate );
           }
