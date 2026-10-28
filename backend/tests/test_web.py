@@ -1967,6 +1967,17 @@ def test_review_commit_queues_job(queue):
     assert app.get(f"/load_commit/{hold}", expect_errors=True).status_int == 404
 
 
+def test_load_answers_are_json_not_html(queue):
+    # file-controlled text (element ids, names) must never come back as text/html
+    app, d = queue
+    resp = _review(app, job=ISSUE_SVG, name="<b>x")
+    assert resp.content_type == "application/json"
+    hold = json.loads(resp.body)["hold"]
+    resp = app.get(f"/load_commit/{hold}")
+    assert resp.content_type == "application/json"
+    assert json.loads(resp.body) == "<b>x"
+
+
 def test_review_cancel_leaves_queue_untouched(queue):
     app, d = queue
     hold = json.loads(_review(app, job=ISSUE_SVG, name="no").body)["hold"]

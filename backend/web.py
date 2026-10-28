@@ -899,12 +899,14 @@ def load():
                 "pending": pending,
                 "expires": time.time() + CONVERT_TIMEOUT,
             }
+        bottle.response.content_type = "application/json"  # file text, never html
         return json.dumps({"hold": hold, "name": name, "issues": found})
     return _queue_loaded(job, name, overwrite, pending)
 
 
 def _queue_loaded(job, name, overwrite, pending):
     """Save a converted job to the queue, return the JSON body /load answers."""
+    bottle.response.content_type = "application/json"
     # an optimize still running against this name would land on top of what is
     # about to be written, so it is told to stand down first
     with _load_pending_lock:
