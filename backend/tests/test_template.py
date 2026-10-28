@@ -46,7 +46,7 @@ def test_safe_eval(expr, expected):
 
 @pytest.mark.parametrize("expr", [
     "__import__('os')", "v.real", "(1).__class__", "[1]", "v ** 2", "9**9**9",
-    "open('x')", "lambda: 1", "v if v else 1", "x", "1/0", "10000000 * 1000", "round(v, n=1)",
+    "open('x')", "lambda: 1", "v if v else 1", "x", "1/0", "10000000 * 1000", "round(v, n=1)", "round(v, -1000000)", "round(v, 7)", "round(v, 1.0)",
 ])
 def test_safe_eval_refuses_everything_else(expr):
     with pytest.raises(TemplateError):

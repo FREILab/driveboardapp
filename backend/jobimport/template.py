@@ -105,7 +105,11 @@ def safe_eval(expr, names):
             result = _BINARY[type(node.op)](walk(node.left), walk(node.right))
         elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
               and node.func.id in _FUNCS and not node.keywords):
-            result = _FUNCS[node.func.id](*(walk(a) for a in node.args))
+            args = [walk(a) for a in node.args]
+            # round(x, -1000000) builds a huge bigint, so bound the digits
+            if node.func.id == "round" and len(args) == 2 and not (type(args[1]) is int and -6 <= args[1] <= 6):
+                raise bad("round() digits not allowed", "Use a whole number from -6 to 6")
+            result = _FUNCS[node.func.id](*args)
         else:
             raise bad("Expression not allowed", "Use numbers, parameters, + - * / // and round/min/max/abs")
         if abs(result) > LIMIT:
