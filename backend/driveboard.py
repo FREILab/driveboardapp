@@ -1820,6 +1820,46 @@ def job_laser_validate(jobdict):
                             absolute_motion_seen = True
 
 
+def job_outside_work_area(jobdict):
+    """
+    Check every item of a job (passes are not needed) against the work area.
+
+    Returns None if all points fit, else a short description of the first
+    excess like "x 1450 > 1220 mm". Limits are in offset coordinates, as in
+    job_laser_validate.
+    """
+    global SerialLoop
+
+    if SerialLoop is None:
+        offsets = [0.0, 0.0, 0.0]  # no machine, no job origin
+    else:
+        with SerialLoop.lock:
+            offsets = list(SerialLoop._status["offset"])
+    limits = []  # (axis, lo, hi)
+    for i, axis in enumerate("xyz"):
+        if i < 2 or conf["workspace"][2]:
+            limits.append((i, axis, -offsets[i], conf["workspace"][i] - offsets[i]))
+
+    for item in jobdict["items"]:
+        def_ = jobdict["defs"][item["def"]]
+        shift = item.get("translate", [0, 0, 0])
+        if def_["kind"] == "image":
+            pos, size = def_["pos"], def_["size"]
+            points = [pos[:2], [pos[0] + size[0], pos[1] + size[1]]]
+        else:
+            points = [pos for polyline in def_["data"] for pos in polyline]
+        for point in points:
+            for i, axis, lo, hi in limits:
+                if i >= len(point):
+                    continue
+                v = point[i] + (shift[i] if i < len(shift) else 0)
+                if v < lo:
+                    return f"{axis} {round(v)} < {round(lo)} mm"
+                if v > hi:
+                    return f"{axis} {round(v)} > {round(hi)} mm"
+    return None
+
+
 def _emit_raster_segment(orientation, seekrate, feedrate_, intensity_, exit_y=None):
     """Stream one raster segment: seek to lead-in, ramp in, raster move with
     pixel data, ramp out. `orientation` describes one engraving direction of a

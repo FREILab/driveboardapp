@@ -1411,3 +1411,76 @@ def test_mill_job_without_a_machine_runs_nowhere_and_leaves_no_dispatch_state(mo
     assert driveboard._dispatch_thread is None
     assert driveboard._dispatch_lock.acquire(blocking=False)
     driveboard._dispatch_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Whole-job work-area check (import review)
+# ---------------------------------------------------------------------------
+
+
+def _area_job(def_, translate=None):
+    item = {"def": 0} if translate is None else {"def": 0, "translate": translate}
+    return {"items": [item], "defs": [def_]}  # imports usually have no passes
+
+
+def _area_path(*points, **item_kw):
+    return _area_job({"kind": "path", "data": [list(points)]}, **item_kw)
+
+
+def test_outside_work_area_none_when_everything_fits(loop, monkeypatch):
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    loop._status["offset"] = [0.0, 0.0, 0.0]
+    assert driveboard.job_outside_work_area(_area_path([0, 0], [1220, 610])) is None
+    assert driveboard.job_outside_work_area({"items": [], "defs": []}) is None
+
+
+def test_outside_work_area_names_the_first_excess(loop, monkeypatch):
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    loop._status["offset"] = [0.0, 0.0, 0.0]
+    job = _area_path([10, 10], [1450.4, 10])
+    assert driveboard.job_outside_work_area(job) == "x 1450 > 1220 mm"
+    job = _area_path([10, -5])
+    assert driveboard.job_outside_work_area(job) == "y -5 < 0 mm"
+    job = _area_job({"kind": "fill", "data": [[[10, 700]]]})
+    assert driveboard.job_outside_work_area(job) == "y 700 > 610 mm"
+
+
+def test_outside_work_area_applies_item_translate(loop, monkeypatch):
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    loop._status["offset"] = [0.0, 0.0, 0.0]
+    job = _area_path([10, 10], translate=[1300, 0, 0])
+    assert driveboard.job_outside_work_area(job) == "x 1310 > 1220 mm"
+
+
+def test_outside_work_area_checks_image_corners(loop, monkeypatch):
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    loop._status["offset"] = [0.0, 0.0, 0.0]
+    img = {"kind": "image", "pos": [1200, 0], "size": [50, 10], "data": ""}
+    assert driveboard.job_outside_work_area(_area_job(img)) == "x 1250 > 1220 mm"
+    img["pos"] = [100, 0]
+    assert driveboard.job_outside_work_area(_area_job(img)) is None
+
+
+def test_outside_work_area_shifts_the_limits_by_the_offset(loop, monkeypatch):
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    loop._status["offset"] = [100.0, 0.0, 0.0]
+    # limits become [-100, 1120]
+    assert driveboard.job_outside_work_area(_area_path([-100, 0], [1120, 0])) is None
+    assert driveboard.job_outside_work_area(_area_path([1150, 0])) == "x 1150 > 1120 mm"
+    assert driveboard.job_outside_work_area(_area_path([-101, 0])) == "x -101 < -100 mm"
+
+
+def test_outside_work_area_z_only_with_a_z_axis(loop, monkeypatch):
+    loop._status["offset"] = [0.0, 0.0, 0.0]
+    job = _area_path([10, 10, 60])
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    assert driveboard.job_outside_work_area(job) is None
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 50.0])
+    assert driveboard.job_outside_work_area(job) == "z 60 > 50 mm"
+
+
+def test_outside_work_area_without_a_machine_uses_zero_offsets(monkeypatch):
+    monkeypatch.setattr(driveboard, "SerialLoop", None)
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    assert driveboard.job_outside_work_area(_area_path([1, 1])) is None
+    assert driveboard.job_outside_work_area(_area_path([-1, 1])) == "x -1 < 0 mm"
