@@ -16,10 +16,10 @@ Starten statt `backend/app.py`:
 | `web/freilab_modals.html` | Die Dialoge |
 | `web/freilab.css` | Styles dazu |
 | `web/img/material/` | Material-Icons |
+| `library/` | Unsere Jobs, `run.py` listet und lädt sie zusätzlich zu `library/` von Upstream |
 | `firmware-homing.patch` | Homing-Rückfahrstrecken, nur beim Firmware-Bau anwenden (siehe unten) |
 | `test_overlay.py` | `pytest freilab/test_overlay.py` |
 
-Zusätzlich liegen unsere Jobs als neue Dateien in `library/` (`Maintenance_*`, `Parts_*`, `Test_*`).
 
 ## Maschinen-Einstellungen (nicht im Repo)
 

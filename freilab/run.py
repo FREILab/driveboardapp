@@ -4,13 +4,16 @@
 Nothing upstream is modified: this wraps web._frontend_file, which serves every UI file, so that
   - files in freilab/web/ win over files of the same name in frontend/ (freilab.js, img/material/...)
   - app.html gets freilab.css/freilab.js and the dialogs of freilab_modals.html injected
+  - the job library also lists and loads the jobs in freilab/library/
 """
 
+import glob
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
+LIBRARY = os.path.join(HERE, "library")
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "backend"))
 
 import bottle  # noqa: E402
@@ -31,6 +34,36 @@ def install(web):
         return upstream(filename, *subdirs)
 
     web._frontend_file = frontend_file
+
+    # Library: upstream's library/ first, then ours.
+    get_sorted, get_path = web._get_sorted, web._get_path
+
+    def library_sorted(globpattern, library=False, stripext=False):
+        files = get_sorted(globpattern, library, stripext)
+        if library:
+            with web._queue_lock:
+                mine = glob.glob(os.path.join(LIBRARY, globpattern))
+            names = {os.path.basename(p) for p in mine if os.path.isfile(p)}
+            names = {n[:-4] if stripext and n.endswith(".dba") else n for n in names}
+            files = sorted(set(files) | names)
+        return files
+
+    def library_path(jobname, library=False):
+        try:
+            return get_path(jobname, library)
+        except bottle.HTTPResponse:
+            if not library:
+                raise
+            mine = os.path.join(LIBRARY, jobname.strip("/\\"))
+            if os.path.exists(mine + ".dba"):
+                return mine + ".dba"
+            raise
+
+    def library_get(jobname, library=False):
+        with web._queue_lock, open(library_path(jobname, library)) as fp:
+            return fp.read()
+
+    web._get_sorted, web._get_path, web._get = library_sorted, library_path, library_get
 
 
 def _app_html(web):
