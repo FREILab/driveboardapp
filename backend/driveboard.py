@@ -3195,7 +3195,8 @@ def job_mill_validate(jobdict):
     message on the first out-of-bounds move.
 
     NOTE: the Z bound is conf["workspace"][2]; a mill must configure a non-zero Z
-    work-area dimension for any Z move to validate.
+    work-area dimension for any Z move to validate. Unlike a laser job, Z is not
+    skipped when it is 0: move() sends Z and every firmware board steps it.
     """
     limits = conf["workspace"]
     axes = ("x", "y", "z")
@@ -3206,6 +3207,8 @@ def job_mill_validate(jobdict):
                 target = item[1]
                 for i, axis in enumerate(axes):
                     val = target[i]
+                    if val is None:
+                        continue  # axis never set: move() does not send it
                     if val < 0 or val > limits[i]:
                         raise ValueError(
                             f"def {defidx}: {item[0]} {axis}={val} beyond "

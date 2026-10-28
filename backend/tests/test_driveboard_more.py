@@ -931,6 +931,27 @@ def test_mill_validate_rejects_negative_targets(target, axis):
         driveboard.job_mill_validate({"defs": [{"data": [["G0", target]]}]})
 
 
+def test_mill_validate_skips_axes_a_move_leaves_alone(monkeypatch):
+    # XY-only G-code: Z (or X/Y) never set is None, move() does not send it
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    job = {"defs": [{"data": [["G0", [10, 10, None]], ["G1", [None, 20, None]]]}]}
+    driveboard.job_mill_validate(job)  # must not raise
+    with pytest.raises(ValueError, match="x=5000"):
+        driveboard.job_mill_validate({"defs": [{"data": [["G1", [5000, None, None]]]}]})
+
+
+def test_mill_z_without_a_z_work_area_is_refused_by_import_check_and_run(loop, monkeypatch):
+    # the firmware steps Z on every board, so a Z move with no Z work area is refused
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
+    job = {"head": {"kind": "mill"}, "defs": [{"data": [["G0", [10, 10, 5]]]}]}
+    assert driveboard.job_outside_work_area(job) == "z 5 > 0 mm"
+    with pytest.raises(ValueError, match="z=5"):
+        driveboard.job_mill_validate(job)
+    job["defs"][0]["data"][0][1][2] = 0
+    assert driveboard.job_outside_work_area(job) is None
+    driveboard.job_mill_validate(job)
+
+
 # ---------------------------------------------------------------------------
 # Mill job conversion
 # ---------------------------------------------------------------------------
