@@ -15,13 +15,13 @@ test("added fills are listed with the pxsize each was made with", () => {
   const html = popup([], [{ color: "#c04040", pxsize: 0.2 }, { color: "#4040c0", pxsize: 0.1 }], "0.1");
   assert.ok(html.includes("#c04040 &nbsp; 0.2 mm"));
   assert.ok(html.includes("#4040c0 &nbsp; 0.1 mm"));
-  assert.ok(!html.includes("None yet."));
 });
 
-test("an empty job says so in both lists", () => {
+test("an empty job shows no placeholder text", () => {
   const html = popup([], [], "0.1");
-  assert.ok(html.includes("No job loaded."));
-  assert.ok(html.includes("None yet."));
+  assert.ok(!html.includes("No job loaded."));
+  assert.ok(!html.includes("None yet."));
+  assert.ok(!html.includes("addfill_color"));
 });
 
 test("each colour button carries its item index, the popup has a close x", () => {
