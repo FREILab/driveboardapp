@@ -7,6 +7,8 @@ are covered in test_driveboard_safety.py).
 """
 
 import base64
+import concurrent.futures
+import concurrent.futures.process
 import copy
 import gzip
 import io
@@ -533,7 +535,7 @@ def test_convert_matches_an_in_process_convert(as_text, testjobs_dir):
 def test_convert_reports_an_unusable_file_as_a_type_error():
     # the exception has to come back from the worker with its type intact,
     # otherwise /load answers 500 instead of 400
-    with pytest.raises(TypeError):
+    with pytest.raises(jobimport.UnknownFileType):
         web._convert_job(b"not a job at all", True, None)
 
 
@@ -2236,3 +2238,169 @@ def test_issues_collected_on_in_process_fallback(monkeypatch):
     monkeypatch.setattr(web, "_convert_pool_get", broken)
     _, _, found = web._convert_job(ISSUE_SVG, False, None)
     assert found == [ISSUE_ROW]
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups: unknown type vs a parser's TypeError, plain/json answers, cancel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("optimize", [True, False])
+def test_unknown_file_type_is_400_plain_and_fatal_in_review(queue, optimize):
+    app, d = queue
+    resp = _post_load(app, job="this is not any job format", name="junk", optimize=optimize)
+    assert (resp.status_int, resp.content_type) == (400, "text/plain")
+    assert "Invalid file type" in resp.text
+    resp = _review(app, job="this is not any job format", name="junk", optimize=optimize)
+    assert resp.status_int == 400
+    assert json.loads(resp.body)["fatal"]["problem"] == "Unknown file type"
+    assert os.listdir(d) == []
+
+
+@pytest.mark.parametrize("review", [False, True])
+def test_type_error_inside_a_parser_is_a_crash_not_unknown_type(queue, monkeypatch, review):
+    def broken():
+        raise OSError("cannot spawn")
+
+    def parser(*a, **k):
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    monkeypatch.setattr(web, "_convert_pool_get", broken)  # convert in this process
+    monkeypatch.setattr(jobimport.converter, "read_dxf", parser)
+    app, d = queue
+    resp = _post_load(app, job="0\nSECTION\n2\nHEADER\n", name="dxf", review_issues=review)
+    assert resp.status_int == 500
+    assert "Invalid file type" not in resp.text
+    if review:
+        assert json.loads(resp.body)["fatal"] == {
+            "problem": "Import crashed",
+            "where": "TypeError: 'NoneType' object is not subscriptable",
+            "fix": "Report file to admin",
+        }
+    assert os.listdir(d) == []
+
+
+def test_error_text_is_served_plain(auth_app, monkeypatch):
+    def busy(*a, **k):
+        raise driveboard.MachineBusy("<b>busy</b>")
+
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "target_in_workarea", lambda *a, **k: True)
+    monkeypatch.setattr(driveboard, "intensity", lambda *a, **k: None)
+    monkeypatch.setattr(driveboard, "move", busy)
+    monkeypatch.setattr(web, "_preview_result", (7, {"error": "<b>x</b>"}))
+    monkeypatch.setitem(conf, "fill_mode", "Reverse")
+    answers = [
+        auth_app.get("/move/100/100/0", expect_errors=True),
+        auth_app.post("/optimize_fill", b"<b>not json", expect_errors=True),
+        auth_app.post("/job_preview", b"<b>not json", expect_errors=True),
+        auth_app.get("/job_preview/7", expect_errors=True),
+    ]
+    assert [r.status_int for r in answers] == [409, 400, 400, 400]
+    assert [r.content_type for r in answers] == ["text/plain"] * 4
+
+
+def test_answers_naming_files_are_json(library, isolated_config, monkeypatch):
+    app, stor, lib = library
+    (lib / "x.dba").write_text(MINIMAL_DBA)
+    entry = {"event": threading.Event(), "name": "x", "error": None}
+    entry["event"].set()
+    monkeypatch.setitem(web._load_pending, "t4", entry)
+    answers = [
+        app.post("/temp", {"load_request": json.dumps({"job": "j"})}),
+        app.get("/load_library/x"),
+        app.get("/listing"),
+        app.get("/listing/starred"),
+        app.get("/listing_library"),
+        app.get("/listing_presets"),
+        app.get("/load_result/t4"),
+    ]
+    os.remove(os.path.join(tempfile.gettempdir(), json.loads(answers[0].body)))
+    assert [r.content_type for r in answers] == ["application/json"] * len(answers)
+
+
+class _KillablePool:
+    """A worker pool whose one task runs until killed, like the real one."""
+
+    def __init__(self):
+        self.future, self.killed = None, False
+        self._processes = {1: self}
+
+    def submit(self, fn, *args):
+        fn(*args)  # leaves the quick parse, then "optimizes" until killed
+        self.future = concurrent.futures.Future()
+        self.future.set_running_or_notify_cancel()
+        return self.future
+
+    def kill(self):
+        self.killed = True
+        self.future.set_exception(concurrent.futures.process.BrokenProcessPool("killed"))
+
+    def shutdown(self, wait):
+        pass
+
+
+@pytest.fixture
+def killable_pool(monkeypatch):
+    pool = _KillablePool()
+    monkeypatch.setattr(web, "_convert_pool", pool)
+    monkeypatch.setattr(web, "_convert_busy", type(web._convert_busy)())
+    return pool
+
+
+def test_cancel_kills_the_optimize_when_nothing_else_waits(queue, killable_pool):
+    app, d = queue
+    data = json.loads(_review(app, job=ISSUE_SVG, name="big", progressive=True).body)
+    entry = web._load_pending[web._load_held[data["hold"]]["pending"]]
+    assert app.get(f"/load_cancel/{data['hold']}").body == b"{}"
+    assert killable_pool.killed
+    assert web._convert_pool is None  # the next import starts a fresh worker
+    assert entry["event"].wait(5)
+    assert entry["error"] is None  # the kill is not an error of anyone's
+    assert os.listdir(d) == []
+
+
+def test_cancel_only_stales_when_another_import_waits(queue, killable_pool):
+    app, d = queue
+    data = json.loads(_review(app, job=ISSUE_SVG, name="big", progressive=True).body)
+    entry = web._load_pending[web._load_held[data["hold"]]["pending"]]
+    queued = concurrent.futures.Future()  # someone else's import, behind ours
+    web._convert_busy.add(queued)
+    app.get(f"/load_cancel/{data['hold']}")
+    assert not killable_pool.killed
+    assert web._convert_pool is killable_pool
+    assert entry["stale"] is True
+    killable_pool.future.set_result(None)  # the optimize finishes anyway
+    assert entry["event"].wait(5)
+    assert os.listdir(d) == []
+
+
+def test_cancel_after_the_optimize_finished_keeps_the_worker(queue, killable_pool):
+    app, d = queue
+    data = json.loads(_review(app, job=ISSUE_SVG, name="big", progressive=True).body)
+    entry = web._load_pending[web._load_held[data["hold"]]["pending"]]
+    killable_pool.future.set_result(None)
+    assert entry["event"].wait(5)
+    app.get(f"/load_cancel/{data['hold']}")
+    assert not killable_pool.killed
+    assert web._convert_pool is killable_pool
+    assert os.listdir(d) == []
+
+
+def test_cancel_leaves_the_worker_started_after_a_drop(queue, killable_pool, monkeypatch):
+    # a timeout elsewhere dropped the worker this optimize ran on, and the
+    # broken pool has not failed its future yet (the real one does that on its
+    # own thread, later): the cancel's future is not the new worker's business
+    app, d = queue
+    data = json.loads(_review(app, job=ISSUE_SVG, name="big", progressive=True).body)
+    entry = web._load_pending[web._load_held[data["hold"]]["pending"]]
+    monkeypatch.setattr(killable_pool, "kill", lambda: None)
+    web._convert_pool_drop()
+    fresh = _KillablePool()
+    web._convert_pool = fresh
+    app.get(f"/load_cancel/{data['hold']}")
+    assert not fresh.killed
+    assert web._convert_pool is fresh
+    killable_pool.future.set_result(None)
+    assert entry["event"].wait(5)
+    assert os.listdir(d) == []

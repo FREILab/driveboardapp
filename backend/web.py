@@ -33,6 +33,16 @@ _reconnect_lock = threading.Lock()
 _presets_lock = threading.RLock()
 jog_target_last = None  # last jog target commanded, in offset coordinates
 
+# error text that comes from a file or a job is never served as html
+PLAIN = {"Content-Type": "text/plain"}
+
+
+def _json(value):
+    """A JSON answer, for bodies that carry file or job names (never html)."""
+    bottle.response.content_type = "application/json"
+    return json.dumps(value)
+
+
 if conf["mill_mode"]:
     frontend_path = "frontend_mill"
     print("INFO: loading mill mode frontend")
@@ -53,7 +63,7 @@ def machine_busy_plugin(callback):
         try:
             return callback(*args, **kwargs)
         except driveboard.MachineBusy as e:
-            raise bottle.HTTPResponse(str(e), 409) from e
+            raise bottle.HTTPResponse(str(e), 409, PLAIN) from e
 
     return wrapper
 
@@ -128,7 +138,7 @@ def temp():
     print(job)
     print("file stashed: " + os.path.basename(filename))
     # return os.path.basename(filename)
-    return json.dumps(os.path.basename(filename))
+    return _json(os.path.basename(filename))
 
 
 @bottle.route("/download/<filename>/<dlname>")
@@ -611,10 +621,6 @@ def _unique_name(jobname):
     return jobname
 
 
-# error text that comes from a file or a job is never served as html
-PLAIN = {"Content-Type": "text/plain"}
-
-
 # Importing a job is seconds of C parsing (expat, PIL) that never releases the
 # GIL. Done in this interpreter it starves the serial thread, and the
 # controller reads that silence as a lost host and stops itself. A worker
@@ -628,6 +634,9 @@ PLAIN = {"Content-Type": "text/plain"}
 CONVERT_TIMEOUT = 600  # seconds, a big raster job legitimately takes minutes
 _convert_pool = None
 _convert_pool_lock = threading.Lock()
+# futures handed to _convert_pool, so a cancel can tell whether the worker is
+# busy with anyone else's import, guarded by _convert_pool_lock
+_convert_busy = set()
 
 
 def _convert_worker(in_path, out_path, quick_path, text, optimize, matrix, conf_overrides):
@@ -691,11 +700,20 @@ def _convert_pool_get():
     return _convert_pool
 
 
-def _convert_pool_drop():
-    """Discard the worker so the next request starts a clean one."""
+def _convert_pool_drop(only_for=None):
+    """Discard the worker so the next request starts a clean one.
+
+    With only_for, a future: only while that future is the one unfinished
+    thing the worker has, so no other import goes down with it. Deciding and
+    detaching under the submit lock means an import submitted meanwhile either
+    counts here or lands on the fresh worker.
+    """
     global _convert_pool
     with _convert_pool_lock:
+        if only_for is not None and [f for f in _convert_busy if not f.done()] != [only_for]:
+            return
         pool, _convert_pool = _convert_pool, None
+        _convert_busy.clear()  # what is left belongs to the discarded worker
     if pool is not None:
         for proc in list(pool._processes.values()):
             proc.kill()
@@ -711,6 +729,7 @@ def _pending_register(future, out_path, tmpdir):
     """Track a still-optimizing load, finish it on a watcher thread."""
     token = uuid.uuid4().hex
     entry = {"event": threading.Event(), "name": None, "error": None, "stale": False}
+    entry["future"] = future
     with _load_pending_lock:
         _load_pending[token] = entry
 
@@ -732,7 +751,8 @@ def _pending_register(future, out_path, tmpdir):
                 if entry["name"] and not entry["stale"]:
                     _add(entry["result"], entry["name"])
         except Exception as e:
-            entry["error"] = str(e)
+            if not entry["stale"]:  # a cancel may have killed the worker under it
+                entry["error"] = str(e)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
             entry["event"].set()
@@ -771,6 +791,8 @@ def _convert_job(job, optimize, matrix, progressive=False):
         try:
             with _convert_pool_lock:
                 future = _convert_pool_get().submit(_convert_worker, *args)
+                _convert_busy.difference_update([f for f in _convert_busy if f.done()])
+                _convert_busy.add(future)
             deadline = time.monotonic() + CONVERT_TIMEOUT
             try:
                 if progressive:
@@ -858,39 +880,41 @@ def load():
     # be tens of megabytes: converting it would copy it to the worker and
     # back, re-encode every raster, and queue behind whatever that single
     # worker is still busy with, all to arrive at the same bytes.
-    if not optimize and matrix is None and not progressive and jobimport.get_type(job) == "dba":
-        job, pending, found = (job.decode("utf-8") if isinstance(job, bytes) else job), None, []
-    else:
-        # convert, off this process so the serial thread keeps its timing
-        try:
+    try:
+        as_is = not optimize and matrix is None and not progressive
+        as_is = as_is and jobimport.get_type(job) == "dba"
+        if not as_is:
+            # convert, off this process so the serial thread keeps its timing
             job, pending, found = _convert_job(job, optimize, matrix, progressive)  # a .dba
-        except Exception as e:
-            if review:
-                raise _load_fatal(e) from None
-            if isinstance(e, TypeError):
-                if DEBUG:
-                    traceback.print_exc()
-                raise bottle.HTTPResponse("Invalid file type.", 400, PLAIN) from None
-            if isinstance(e, ValueError):
-                raise bottle.HTTPResponse(str(e), 422, PLAIN) from e
-            raise
+    except Exception as e:
         if review:
-            try:
-                outside = driveboard.job_outside_work_area(json.loads(job))
-            except Exception as e:  # a check, never the reason an import fails
-                print(f"WARN: work area check failed ({type(e).__name__}: {e})")
-                outside = None
-            if outside is not None:
-                found.append(
-                    {
-                        "problem": "Outside work area",
-                        "where": outside,
-                        "result": "RUN REFUSED",
-                        "kind": "dropped",
-                        "fix": "Move origin or scale",
-                        "count": 1,
-                    }
-                )
+            raise _load_fatal(e) from None
+        if isinstance(e, jobimport.UnknownFileType):
+            if DEBUG:
+                traceback.print_exc()
+            raise bottle.HTTPResponse("Invalid file type.", 400, PLAIN) from None
+        if isinstance(e, ValueError):
+            raise bottle.HTTPResponse(str(e), 422, PLAIN) from e
+        raise
+    if as_is:
+        job, pending, found = (job.decode("utf-8") if isinstance(job, bytes) else job), None, []
+    elif review:
+        try:
+            outside = driveboard.job_outside_work_area(json.loads(job))
+        except Exception as e:  # a check, never the reason an import fails
+            print(f"WARN: work area check failed ({type(e).__name__}: {e})")
+            outside = None
+        if outside is not None:
+            found.append(
+                {
+                    "problem": "Outside work area",
+                    "where": outside,
+                    "result": "RUN REFUSED",
+                    "kind": "dropped",
+                    "fix": "Move origin or scale",
+                    "count": 1,
+                }
+            )
 
     if review and found:
         # nothing reaches the queue until the operator decides
@@ -943,7 +967,7 @@ def _load_fatal(e):
         return _fatal(422, **e.issue)
     if isinstance(e, ValueError):
         return _fatal(422, "Import failed", str(e), "Check the file")
-    if isinstance(e, TypeError):
+    if isinstance(e, jobimport.UnknownFileType):
         return _fatal(400, "Unknown file type", None, "Use SVG, DXF, G-code or DBA")
     if isinstance(e, bottle.HTTPResponse) and e.status_code == 504:
         return _fatal(504, "Import timed out", None, "Simplify or split file")
@@ -970,7 +994,7 @@ def load_result(token):
         raise bottle.HTTPResponse(entry["error"], 422, PLAIN)
     if not entry["event"].is_set():
         raise bottle.HTTPResponse("Import timed out.", 504)
-    return json.dumps({"name": entry["name"]})
+    return _json({"name": entry["name"]})
 
 
 # imports with issues awaiting the operator, {hold: {"job", "name",
@@ -990,6 +1014,10 @@ def _held_drop(held):
     entry = _load_pending.pop(held["pending"], None) if held["pending"] else None
     if entry is not None:
         entry["stale"] = True  # its name is never set either, belt and braces
+        # stale alone leaves the worker busy and the next import waiting behind
+        # it, so a still-running optimize is killed, unless others need the worker
+        if entry.get("future") is not None:
+            _convert_pool_drop(only_for=entry["future"])
 
 
 @bottle.route("/load_commit/<hold>")
@@ -1030,7 +1058,7 @@ def listing(kind=None):
         files = _get_sorted("*.dba", stripext=True)
     else:
         raise bottle.HTTPResponse("Invalid kind.", 400)
-    return json.dumps(files)
+    return _json(files)
 
 
 @bottle.route("/get/<jobname>")
@@ -1094,7 +1122,7 @@ def clear():
 def listing_library():
     """List all library jobs by name."""
     files = _get_sorted("*.dba", library=True, stripext=True)
-    return json.dumps({"files": files, "path": os.path.join(conf["rootdir"], "library")})
+    return _json({"files": files, "path": os.path.join(conf["rootdir"], "library")})
 
 
 @bottle.route("/get_library/<jobname>")
@@ -1113,7 +1141,7 @@ def load_library(jobname):
     with _queue_lock:
         jobname = _unique_name(jobname)
         _add(job, jobname)
-    return json.dumps(jobname)
+    return _json(jobname)
 
 
 ### FAVORITES
@@ -1147,7 +1175,7 @@ def listing_presets():
     """List all preset settings."""
     presets = _read_presets()
 
-    return json.dumps({"presets": presets, "path": _get_presets_path()})
+    return _json({"presets": presets, "path": _get_presets_path()})
 
 
 # the pierce_time-less form is kept so an older client or a saved link still saves
@@ -1260,7 +1288,7 @@ def optimize_fill():
         return json.dumps({"data": optimized, "fill_mode": fill_mode})
     except Exception as e:
         traceback.print_exc()
-        raise bottle.HTTPResponse(f"Error optimizing fill: {str(e)}", 400) from e
+        raise bottle.HTTPResponse(f"Error optimizing fill: {e}", 400, PLAIN) from e
 
 
 # The job view's preview, computed off the request thread. The server serves
@@ -1343,7 +1371,7 @@ def job_preview():
         optimize = bool(request_data.get("optimize", True))
     except Exception as e:
         traceback.print_exc()
-        raise bottle.HTTPResponse(f"Error reading job: {str(e)}", 400) from e
+        raise bottle.HTTPResponse(f"Error reading job: {e}", 400, PLAIN) from e
     with _preview_lock:
         _preview_token += 1
         token = _preview_token
@@ -1368,7 +1396,7 @@ def job_preview_result(token):
     if result is None or result[0] != token:
         return json.dumps({"pending": True})
     if "error" in result[1]:
-        raise bottle.HTTPResponse(f"Error computing preview: {result[1]['error']}", 400)
+        raise bottle.HTTPResponse(f"Error computing preview: {result[1]['error']}", 400, PLAIN)
     return json.dumps(result[1])
 
 

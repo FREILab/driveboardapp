@@ -14,6 +14,11 @@ from .svg_reader import SVGReader
 from .utilities import matrixApply
 
 
+class UnknownFileType(TypeError):
+    """The job is none of the kinds convert reads, as opposed to a TypeError
+    from inside a reader, which is a bug."""
+
+
 def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
     """Convert a job string (dba, svg, dxf, or gcode).
 
@@ -46,7 +51,7 @@ def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
         job = read_gcode(job, tolerance, optimize=optimize)
     else:
         print("ERROR: file type not recognized")
-        raise TypeError
+        raise UnknownFileType
     if matrix:
         apply_alignment_matrix(job, matrix)
     # whatever the source, hand the frontend a raster it can actually display
@@ -246,8 +251,8 @@ def get_type(job):
             type_ = "gcode"
         else:
             print("ERROR: Cannot figure out file type 1.")
-            raise TypeError
+            raise UnknownFileType
     else:
         print("ERROR: Cannot figure out file type 2.")
-        raise TypeError
+        raise UnknownFileType
     return type_
