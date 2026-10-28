@@ -157,7 +157,8 @@ function request_post_send(args, formData) {
     statusCode: {
       400: function (s) {
         // alert(JSON.stringify(s))
-        if ("responseText" in s) {
+        // a fatal import answer has its own dialog
+        if ("responseText" in s && !issues_fatal_from(s)) {
           $().uxmessage("error", s.responseText);
         }
       },

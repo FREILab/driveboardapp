@@ -45,6 +45,7 @@
     <script src="tools.js"></script>
     <script src="app.js"></script>
     <script src="jobhandler.js"></script>
+    <script src="issues.js"></script>
     <script src="import.js"></script>
     <script src="controls.js"></script>
     <script src="passes.js"></script>
@@ -292,6 +293,42 @@
               <h4 class="modal-title" id="library_header">Job Library</h4>
             </div>
             <div id="library_content" class="modal-body">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- import issues modal: decided with its buttons only, a held import waits for the answer -->
+      <div id="import_issues_modal" class="modal fade" tabindex="-1" role="dialog" data-backdrop="static" data-keyboard="false" aria-labelledby="import_issues_title" aria-hidden="true">
+        <div class="modal-dialog">
+          <div class="modal-content issues-dialog">
+            <div class="modal-header issues-warn">
+              <h4 class="modal-title"><span class="glyphicon glyphicon-warning-sign"></span> <span id="import_issues_title"></span></h4>
+            </div>
+            <div class="modal-body">
+              <table class="table table-condensed issues-table">
+                <thead><tr><th>Problem</th><th>Result</th><th>Fix</th></tr></thead>
+                <tbody id="import_issues_rows"></tbody>
+              </table>
+            </div>
+            <div class="modal-footer">
+              <button type="button" id="import_issues_cancel" class="btn btn-default">Cancel</button>
+              <button type="button" id="import_issues_load" class="btn btn-warning">Load anyway</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- import fatal modal -->
+      <div id="import_fatal_modal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="import_fatal_title" aria-hidden="true">
+        <div class="modal-dialog">
+          <div class="modal-content issues-dialog">
+            <div class="modal-header issues-fatal">
+              <h4 class="modal-title"><span class="glyphicon glyphicon-remove-sign"></span> <span id="import_fatal_title"></span></h4>
+            </div>
+            <div id="import_fatal_body" class="modal-body"></div>
+            <div class="modal-footer">
+              <button type="button" class="btn btn-default" data-dismiss="modal">Close</button>
             </div>
           </div>
         </div>

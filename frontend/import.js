@@ -94,32 +94,13 @@ $(document).ready(function () {
       name: import_name,
       optimize: true,
       progressive: true,
+      review_issues: true,
     };
     request_post({
       url: "/load",
       data: load_request,
-      success: function (result) {
-        // a progressive load answers with the quick parse first and a token
-        // to pick up the optimized job when it is ready
-        var jobname = result && result.name ? result.name : result;
-        $().uxmessage("notice", "Parsed " + jobname + ".");
-        queue_update();
-        import_open(jobname);
-        if (result && result.pending) {
-          request_get({
-            url: "/load_result/" + result.pending,
-            success: function (done) {
-              $().uxmessage("notice", "Optimized " + done.name + ".");
-              import_open(done.name);
-            },
-            error: function () {},
-          });
-        }
-      },
-      error: function (data) {
-        $().uxmessage("error", "/load error.");
-        $().uxmessage("error", data.responseText, false);
-      },
+      success: import_load_answer,
+      error: import_load_failed,
       complete: function (data) {
         $("#open_btn").button("reset");
       },
@@ -160,24 +141,76 @@ $(document).ready(function () {
           name: import_name,
           optimize: true,
           matrix: matrix,
+          review_issues: true,
         };
         request_post({
           url: "/load",
           data: load_request,
-          success: function (jobname) {
-            $().uxmessage("notice", "Parsed " + jobname + ".");
-            queue_update();
-            import_open(jobname);
-          },
-          error: function (data) {
-            $().uxmessage("error", "/load error.");
-            $().uxmessage("error", data.responseText, false);
-          },
+          success: import_load_answer,
+          error: import_load_failed,
         });
       },
     });
   }
 }); // ready
+
+function import_load_answer(result) {
+  // an import with problems is held server side until the operator decides,
+  // a clean one answers as /load always did
+  var held = issues_hold_from(result);
+  if (!held) {
+    import_loaded(result);
+    return;
+  }
+  issues_show(
+    import_name,
+    held.issues,
+    function () {
+      request_get({
+        url: "/load_commit/" + held.hold,
+        success: import_loaded,
+        error: import_load_failed,
+      });
+    },
+    function () {
+      request_get({
+        url: "/load_cancel/" + held.hold,
+        success: function () {
+          $().uxmessage("notice", "Import cancelled.");
+        },
+      });
+    },
+  );
+}
+
+function import_load_failed(data) {
+  var fatal = issues_fatal_from(data);
+  if (fatal) {
+    issues_show_fatal(import_name, fatal);
+    return;
+  }
+  $().uxmessage("error", "/load error.");
+  $().uxmessage("error", data.responseText, false);
+}
+
+function import_loaded(result) {
+  // a progressive load answers with the quick parse first and a token
+  // to pick up the optimized job when it is ready
+  var jobname = result && result.name ? result.name : result;
+  $().uxmessage("notice", "Parsed " + jobname + ".");
+  queue_update();
+  import_open(jobname);
+  if (result && result.pending) {
+    request_get({
+      url: "/load_result/" + result.pending,
+      success: function (done) {
+        $().uxmessage("notice", "Optimized " + done.name + ".");
+        import_open(done.name);
+      },
+      error: function () {},
+    });
+  }
+}
 
 function import_open(jobname, from_library) {
   from_library = typeof from_library !== "undefined" ? from_library : false; // default to false
@@ -191,13 +224,6 @@ function import_open(jobname, from_library) {
     success: function (job) {
       // alert(JSON.stringify(data))
       // $().uxmessage('notice', data)
-
-      // Show any warnings from import (e.g., font fallbacks)
-      if (job.head && job.head.warnings) {
-        for (var i = 0; i < job.head.warnings.length; i++) {
-          $().uxmessage("warning", job.head.warnings[i]);
-        }
-      }
 
       function jobhandler_done() {
         tools_addfill_init();
