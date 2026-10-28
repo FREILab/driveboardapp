@@ -611,6 +611,10 @@ def _unique_name(jobname):
     return jobname
 
 
+# error text that comes from a file or a job is never served as html
+PLAIN = {"Content-Type": "text/plain"}
+
+
 # Importing a job is seconds of C parsing (expat, PIL) that never releases the
 # GIL. Done in this interpreter it starves the serial thread, and the
 # controller reads that silence as a lost host and stops itself. A worker
@@ -866,9 +870,9 @@ def load():
             if isinstance(e, TypeError):
                 if DEBUG:
                     traceback.print_exc()
-                raise bottle.HTTPResponse("Invalid file type.", 400) from None
+                raise bottle.HTTPResponse("Invalid file type.", 400, PLAIN) from None
             if isinstance(e, ValueError):
-                raise bottle.HTTPResponse(str(e), 422) from e
+                raise bottle.HTTPResponse(str(e), 422, PLAIN) from e
             raise
         if review:
             try:
@@ -963,7 +967,7 @@ def load_result(token):
     with _load_pending_lock:
         _load_pending.pop(token, None)
     if entry["error"]:
-        raise bottle.HTTPResponse(entry["error"], 422)
+        raise bottle.HTTPResponse(entry["error"], 422, PLAIN)
     if not entry["event"].is_set():
         raise bottle.HTTPResponse("Import timed out.", 504)
     return json.dumps({"name": entry["name"]})
@@ -1196,7 +1200,7 @@ def run(jobname):
     try:
         driveboard.job(json.loads(job))
     except ValueError as e:
-        raise bottle.HTTPResponse(str(e), 422) from e
+        raise bottle.HTTPResponse(str(e), 422, PLAIN) from e
     return "{}"
 
 
@@ -1219,7 +1223,7 @@ def run_direct():
     try:
         driveboard.job(json.loads(job))
     except ValueError as e:
-        raise bottle.HTTPResponse(str(e), 422) from e
+        raise bottle.HTTPResponse(str(e), 422, PLAIN) from e
     return "{}"
 
 

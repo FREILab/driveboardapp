@@ -163,7 +163,7 @@ function import_load_answer(result) {
     return;
   }
   issues_show(
-    import_name,
+    held.name,
     held.issues,
     function () {
       request_get({

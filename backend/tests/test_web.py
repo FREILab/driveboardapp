@@ -349,6 +349,7 @@ def test_run_maps_out_of_bounds_to_422(auth_app, monkeypatch):
     monkeypatch.setattr(driveboard, "job", _raise)
     resp = auth_app.get("/run/somejob", expect_errors=True)
     assert resp.status_int == 422  # validation failure surfaced to the client
+    assert resp.content_type == "text/plain"  # never rendered as html
 
 
 def test_direct_run_rejects_when_not_ready(auth_app, monkeypatch):
@@ -1380,6 +1381,7 @@ def test_load_unreadable_file_type_is_400(queue):
     resp = _post_load(queue[0], job="this is not any job format", name="junk", optimize=True)
     assert resp.status_int == 400
     assert "Invalid file type" in resp.text
+    assert resp.content_type == "text/plain"
     assert os.listdir(queue[1]) == []
 
 
@@ -1391,6 +1393,7 @@ def test_load_value_error_from_converter_is_422(queue, monkeypatch):
     resp = _post_load(queue[0], job=MINIMAL_DBA, name="x", optimize=True)
     assert resp.status_int == 422
     assert "bad geometry" in resp.text
+    assert resp.content_type == "text/plain"  # file text, never html
 
 
 def test_load_progressive_returns_pending_token_and_names_the_entry(queue, monkeypatch):
@@ -1456,6 +1459,7 @@ def test_load_result_reports_optimize_failure_as_422(auth_app, monkeypatch):
     resp = auth_app.get("/load_result/t2", expect_errors=True)
     assert resp.status_int == 422
     assert "kaboom" in resp.text
+    assert resp.content_type == "text/plain"
     assert "t2" not in web._load_pending
 
 
@@ -1773,6 +1777,7 @@ def test_direct_run_maps_validation_error_to_422(auth_app, monkeypatch):
     )
     assert resp.status_int == 422
     assert "beyond work area" in resp.text
+    assert resp.content_type == "text/plain"
 
 
 def test_direct_run_requires_machine(auth_app, monkeypatch):

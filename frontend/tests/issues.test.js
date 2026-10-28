@@ -159,7 +159,7 @@ function importApp() {
   const app = loadFrontend(["issues.js", "import.js"], { document: {}, queue_update() {} });
   const seen = [];
   app.import_loaded = (r) => seen.push(["loaded", r]);
-  app.issues_show = (name, issues) => seen.push(["show", issues.length]);
+  app.issues_show = (name, issues) => seen.push(["show", name, issues.length]);
   app.issues_show_fatal = (name, f) => seen.push(["fatal", f.problem]);
   return { app, seen };
 }
@@ -169,7 +169,14 @@ test("a load answer goes to the dialog, the queue or the fatal dialog as it shou
   app.import_load_answer("clean");
   app.import_load_answer({ hold: "h", name: "a", issues: [row(), row()] });
   app.import_load_failed({ responseText: '{"fatal":{"problem":"P","where":null,"fix":"F"}}' });
-  assert.deepEqual(seen, [["loaded", "clean"], ["show", 2], ["fatal", "P"]]);
+  assert.deepEqual(seen, [["loaded", "clean"], ["show", "a", 2], ["fatal", "P"]]);
+});
+
+test("the dialog is titled with the held answer's name, not the last picked file", () => {
+  const { app, seen } = importApp();
+  app.import_name = "picked later";
+  app.import_load_answer({ hold: "h", name: "first", issues: [row()] });
+  assert.deepEqual(seen, [["show", "first", 1]]);
 });
 
 test("a failure that is not a fatal answer stays a toast", () => {
