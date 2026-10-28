@@ -157,14 +157,16 @@ SIGNAL(USART_UDRE_vect) {
   if (chunks_processed > 0) {
     UDR0 = CMD_CHUNK_PROCESSED ;
     chunks_processed--;
-  } else {                    // Send a byte from the buffer
+  } else if (tail != tx_buffer_head) {  // Send a byte from the buffer
+    // (guarded: serial_write's non-atomic UDRIE0 set can re-enable us empty)
     UDR0 = tx_buffer[tail];
     if (++tail == TX_BUFFER_SIZE) {tail = 0;}  // increment
     tx_buffer_tail = tail;
   }
 
-  // disable tx interrupt, if buffer empty
-  if (tail == tx_buffer_head) { UCSR0B &= ~(1 << UDRIE0); }
+  // disable tx interrupt once nothing is left to send. Pending acks count:
+  // holding them until the next serial_write shrinks the host's send window.
+  if (tail == tx_buffer_head && chunks_processed == 0) { UCSR0B &= ~(1 << UDRIE0); }
 }
 
 
@@ -241,6 +243,7 @@ SIGNAL(USART_RX_vect) {
       consume_data = false;
       rx_buffer_head = rx_buffer_tail = 0;  // reset rx buffer
       rx_buffer_processed = 0;
+      chunks_processed = 0;  // the host zeroes its firmbuf tally on resume
       stepper_stop_resume();
     } else if (data == CMD_PAUSE) {
       // freeze immediately (beam off), retaining buffer/position; bypasses the
