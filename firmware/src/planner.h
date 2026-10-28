@@ -83,9 +83,6 @@ void planner_dwell(double dwell_time, uint8_t nominal_laser_intensity);
 // This call is blocking when the block buffer is full.
 void planner_command(uint8_t type);
 
-// Idles until there is a buffer slot open, and returns that buffer position
-int protocol_get_next_free_buffer( int block_buffer_head );
-
 // Returns true if there are blocks available to read from the buffer
 bool planner_blocks_available();
 

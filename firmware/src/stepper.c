@@ -589,25 +589,15 @@ ISR(TIMER1_COMPA_vect) {
       break;
 
     case TYPE_AIR_ASSIST_ENABLE:
-      control_air_assist(true);
-      current_block = NULL;
-      planner_discard_current_block();
-      break;
-
     case TYPE_AIR_ASSIST_DISABLE:
-      control_air_assist(false);
+      control_air_assist(current_block->type == TYPE_AIR_ASSIST_ENABLE);
       current_block = NULL;
       planner_discard_current_block();
       break;
 
     case TYPE_AUX_ASSIST_ENABLE:
-      control_aux_assist(true);
-      current_block = NULL;
-      planner_discard_current_block();
-      break;
-
     case TYPE_AUX_ASSIST_DISABLE:
-      control_aux_assist(false);
+      control_aux_assist(current_block->type == TYPE_AUX_ASSIST_ENABLE);
       current_block = NULL;
       planner_discard_current_block();
       break;
@@ -698,7 +688,6 @@ inline void adjust_beam_dynamics( uint32_t steps_per_minute ) {
         (PWM_MODE == STATIC_FREQ_PD5) || (PWM_MODE == STATIC_FREQ_PD6)
       uint8_t adjusted_intensity = current_block->nominal_laser_intensity *
                                    ((float)steps_per_minute/(float)current_block->nominal_rate);
-      adjusted_intensity = max(adjusted_intensity, 0);
     #elif PWM_MODE == SYNCED_FREQ
       uint8_t adjusted_intensity = current_block->nominal_laser_intensity *
                      (CONFIG_BEAMDYNAMICS_START + (1.0-CONFIG_BEAMDYNAMICS_START)*

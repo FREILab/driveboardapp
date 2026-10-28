@@ -30,6 +30,12 @@
   static volatile uint8_t pwm_duty = 0;
 #endif
 
+#if PWM_MODE == STEPPED_FREQ_PD5
+  #define STEPPED_OCR OCR0B  // PD5 is OC0B
+#elif PWM_MODE == STEPPED_FREQ_PD6
+  #define STEPPED_OCR OCR0A  // PD6 is OC0A
+#endif
+
 
 void sense_init() {
   //// chiller, door
@@ -140,40 +146,18 @@ inline void control_laser_intensity(uint8_t intensity) {
     #else
       OCR0A = intensity;
     #endif
-  #elif PWM_MODE == STEPPED_FREQ_PD5
+  #elif (PWM_MODE == STEPPED_FREQ_PD5) || (PWM_MODE == STEPPED_FREQ_PD6)
     #ifdef ENABLE_INTERLOCKS
       if (SENSE_DOOR_OPEN || SENSE_CHILLER_OFF) {
-        OCR0B = 0;
+        STEPPED_OCR = 0;
       } else {
-        OCR0B = intensity;
+        STEPPED_OCR = intensity;
       }
     #else
-      OCR0B = intensity;
+      STEPPED_OCR = intensity;
     #endif
     // depending on intensity adapt PWM freq
     // assuming phase correct PWM mode
-    if (intensity > 40) {
-      // set PWM freq to 3.9kHz
-      TCCR0B = _BV(CS01);
-    } else if (intensity > 10) {
-      // set PWM freq to 489Hz
-      TCCR0B = _BV(CS01) | _BV(CS00);
-    } else {
-      // set PWM freq to 122Hz
-      TCCR0B = _BV(CS02);
-    }
-  #elif PWM_MODE == STEPPED_FREQ_PD6
-    #ifdef ENABLE_INTERLOCKS
-      if (SENSE_DOOR_OPEN || SENSE_CHILLER_OFF) {
-        OCR0A = 0;
-      } else {
-        OCR0A = intensity;
-      }
-    #else
-      OCR0A = intensity;
-    #endif
-    // depending on intensity adapt PWM freq
-    // assuming: TCCR0A = _BV(COM0A1) | _BV(WGM00);  // phase correct PWM mode
     if (intensity > 40) {
       // set PWM freq to 3.9kHz
       TCCR0B = _BV(CS01);
@@ -205,10 +189,8 @@ inline uint8_t control_get_intensity() {
     return (OCR0B*255)/pwmTop;
   #elif PWM_MODE == STATIC_FREQ_PD6
     return OCR0A;
-  #elif PWM_MODE == STEPPED_FREQ_PD5
-    return OCR0B;
-  #elif PWM_MODE == STEPPED_FREQ_PD6
-    return OCR0A;
+  #elif (PWM_MODE == STEPPED_FREQ_PD5) || (PWM_MODE == STEPPED_FREQ_PD6)
+    return STEPPED_OCR;
   #elif PWM_MODE == SYNCED_FREQ
     return pwm_duty;
   #endif

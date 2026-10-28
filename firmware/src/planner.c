@@ -42,6 +42,7 @@ static double previous_nominal_speed;   // Nominal speed of previous path line s
 // prototypes for static functions (non-accesible from other files)
 static int8_t next_block_index(int8_t block_index);
 static int8_t prev_block_index(int8_t block_index);
+static int protocol_get_next_free_buffer(int block_buffer_head);  // idles until a buffer slot opens
 static double estimate_acceleration_distance(double initial_rate, double target_rate, double acceleration);
 static double intersection_distance(double initial_rate, double final_rate, double acceleration, double distance);
 static double max_allowable_speed(double acceleration, double target_velocity, double distance);
@@ -268,7 +269,7 @@ inline void planner_command(uint8_t type) {
 }
 
 
-inline int protocol_get_next_free_buffer( int block_buffer_head )
+inline static int protocol_get_next_free_buffer( int block_buffer_head )
 {
   // calculate the buffer head and check for space
   int next_buffer_head = next_block_index( block_buffer_head );
@@ -308,7 +309,7 @@ inline void planner_set_position(double x, double y, double z) {
   position[Y_AXIS] = lround(y*CONFIG_Y_STEPS_PER_MM);
   position[Z_AXIS] = lround(z*CONFIG_Z_STEPS_PER_MM);
   previous_nominal_speed = 0.0; // resets planner junction speeds
-  clear_vector_double(previous_unit_vec);
+  clear_vector(previous_unit_vec);
 }
 
 
