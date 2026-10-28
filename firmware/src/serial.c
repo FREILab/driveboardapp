@@ -219,11 +219,16 @@ SIGNAL(USART_RX_vect) {
     data_prev = data;
     return;
   } else {  // use, but check with previous
-    first_transmission = true;
     if (data != data_prev) {
       stepper_request_stop(STOPERROR_TRANSMISSION_ERROR);
-      return;  // discard the corrupt byte, don't act on it
+      // Discard the held byte, don't act on either. Keep this one as the
+      // first of a new pair: after a lost or extra wire byte every later pair
+      // would otherwise stay misaligned and not even CMD_RESUME gets through.
+      // Only two equal consecutive bytes are ever accepted.
+      data_prev = data;
+      return;
     }
+    first_transmission = true;
   }
   // handle char
   if (data < 16) {  // handle controls chars
