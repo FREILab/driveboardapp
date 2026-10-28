@@ -48,8 +48,13 @@ function issues_show(name, issues, on_load, on_cancel) {
     issues_title(name, n + (n == 1 ? " problem" : " problems")),
   );
   $("#import_issues_rows").html(issues_rows_html(issues));
+  var decided = false; // the buttons stay clickable while the modal fades out
   function decide(callback) {
     return function () {
+      if (decided) {
+        return;
+      }
+      decided = true;
       $("#import_issues_modal").modal("hide");
       callback();
     };

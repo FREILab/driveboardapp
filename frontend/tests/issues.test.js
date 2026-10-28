@@ -87,6 +87,8 @@ test("the dialog is titled with the name and the row count and wired to the butt
   assert.equal(app.dom.el("#import_issues_title").html, "<strong>a.svg</strong> – 2 problems");
   assert.deepEqual(app.dom.el("#import_issues_modal").modals.slice(-1), ["show"]);
   app.dom.el("#import_issues_cancel").handlers.click({});
+  assert.deepEqual(calls, ["cancel"]);
+  app.issues_show("a.svg", [row()], () => calls.push("load"), () => calls.push("cancel"));
   app.dom.el("#import_issues_load").handlers.click({});
   assert.deepEqual(calls, ["cancel", "load"]);
 });
@@ -126,4 +128,54 @@ test("the file name in a title is escaped", () => {
   assert.ok(!app.dom.el("#import_issues_title").html.includes("<i>"));
   app.issues_show_fatal("<i>x</i>", { problem: "P", where: null, fix: "F" });
   assert.ok(!app.dom.el("#import_fatal_title").html.includes("<i>"));
+});
+
+function click(app, id) {
+  app.dom.el(id).handlers.click({});
+}
+
+test("only the first click decides, whichever button it is", () => {
+  const app = loadFrontend(["issues.js"]);
+  const calls = [];
+  app.issues_show("a", [row()], () => calls.push("load"), () => calls.push("cancel"));
+  click(app, "#import_issues_load");
+  click(app, "#import_issues_load");
+  click(app, "#import_issues_cancel");
+  assert.deepEqual(calls, ["load"]);
+});
+
+test("a fresh dialog decides again", () => {
+  const app = loadFrontend(["issues.js"]);
+  const calls = [];
+  app.issues_show("a", [row()], () => calls.push("load1"), () => calls.push("cancel1"));
+  click(app, "#import_issues_load");
+  app.issues_show("b", [row()], () => calls.push("load2"), () => calls.push("cancel2"));
+  click(app, "#import_issues_cancel");
+  click(app, "#import_issues_load");
+  assert.deepEqual(calls, ["load1", "cancel2"]);
+});
+
+function importApp() {
+  const app = loadFrontend(["issues.js", "import.js"], { document: {}, queue_update() {} });
+  const seen = [];
+  app.import_loaded = (r) => seen.push(["loaded", r]);
+  app.issues_show = (name, issues) => seen.push(["show", issues.length]);
+  app.issues_show_fatal = (name, f) => seen.push(["fatal", f.problem]);
+  return { app, seen };
+}
+
+test("a load answer goes to the dialog, the queue or the fatal dialog as it should", () => {
+  const { app, seen } = importApp();
+  app.import_load_answer("clean");
+  app.import_load_answer({ hold: "h", name: "a", issues: [row(), row()] });
+  app.import_load_failed({ responseText: '{"fatal":{"problem":"P","where":null,"fix":"F"}}' });
+  assert.deepEqual(seen, [["loaded", "clean"], ["show", 2], ["fatal", "P"]]);
+});
+
+test("a failure that is not a fatal answer stays a toast", () => {
+  const { app, seen } = importApp();
+  app.import_load_failed({ responseText: "Invalid file type." });
+  assert.deepEqual(seen, []);
+  assert.equal(app.dom.messages.length, 2);
+  assert.equal(app.dom.messages[1].text, "Invalid file type.");
 });
