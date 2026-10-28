@@ -402,3 +402,9 @@ def test_svg_fill_in_stroke_colour_is_one_path_not_a_duplicate():
     job, rows = _import(_svg('<rect width="20" height="20" stroke="#000" fill="#000"/>'))
     assert rows == []
     assert len(job["defs"][0]["data"]) == 1
+
+
+def test_gcode_cam_header_cancel_codes_are_silent():
+    with issues.collecting() as c:
+        jobimport.read_gcode("G21 G90 G17 G40 G49 G80\nG61\nG64\nG15\nG69\n", 0.1)
+    assert c.issues() == []

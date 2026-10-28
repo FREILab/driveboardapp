@@ -11,8 +11,9 @@ debug = True
 # unsupported codes are reported under one label per group
 LABELS = {("G", n): "G55-G59" for n in (55, 56, 57, 58, 59)}
 LABELS.update({("G", 93): "G93,G95", ("G", 95): "G93,G95", ("M", 0): "M0,M1", ("M", 1): "M0,M1"})
-# defaults and program end: nothing to report
-QUIET = {("G", 17), ("G", 54), ("G", 94), ("M", 2), ("M", 30)}
+# defaults, no-op cancels (radius/length comp, canned cycle, polar, rotation)
+# and path modes, program end: nothing to report
+QUIET = {("G", n) for n in (15, 17, 40, 49, 54, 61, 64, 69, 80, 94)} | {("M", 2), ("M", 30)}
 
 
 class GcodeReader:

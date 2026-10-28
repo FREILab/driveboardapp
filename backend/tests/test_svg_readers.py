@@ -940,6 +940,20 @@ def test_convert_text_tspans_group_by_color(font):
     assert [p.get("id") for p in paths] == ["t_path_0", "t_path_1"]
 
 
+def test_convert_text_stroke_only_is_cut_in_its_stroke_colour(font):
+    body = (
+        '<text x="0" y="10" style="fill:none;stroke:#ff0000">A</text>'
+        '<text x="0" y="30" stroke="#00ff00">B</text>'
+        '<text x="0" y="50" fill="#0000ff" stroke="#00ff00">C'
+        '<tspan fill="none" stroke="#ffff00">D</tspan></text>'
+    )
+    with issues.collecting() as c:
+        out = convert_text_to_paths(_text_doc(body))
+    fills = [p.get("fill") for p in _paths(out)]
+    assert fills == ["#ff0000", "#00ff00", "#0000ff", "#ffff00"]
+    assert c.issues() == []
+
+
 def test_convert_text_tspan_uses_its_own_position(font):
     out = convert_text_to_paths(
         _text_doc('<text x="10" y="50" font-size="20"><tspan x="60" y="70">B</tspan></text>')
