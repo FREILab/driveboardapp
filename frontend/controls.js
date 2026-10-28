@@ -170,6 +170,23 @@ function controls_ready() {
       $().uxmessage("notice", "No passes assigned to this job.");
       return false;
     }
+    // check for power vs speed
+    var over = jobhandler.passOverPowerSpeedLimit(
+      app_config_main.power_speed_limit,
+    );
+    if (over) {
+      $().uxmessage(
+        "error",
+        "Pass " +
+          over.number +
+          " burns too strong for its speed (intensity/feedrate " +
+          over.ratio.toFixed(2) +
+          ", limit " +
+          app_config_main.power_speed_limit +
+          ").",
+      );
+      return false;
+    }
     // check for machine
     if (!status_cache.serial) {
       $().uxmessage("error", "No machine.");
@@ -349,6 +366,9 @@ function controls_ready() {
     delay: { show: 1000, hide: 100 },
   });
   $("#homing_btn").click(function (e) {
+    if (app_config_main.homing_reset_offset) {
+      $("#offset_reset_btn").trigger("click");
+    }
     request_get({
       url: "/homing",
       success: function (data) {

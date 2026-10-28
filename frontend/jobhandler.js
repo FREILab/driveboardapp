@@ -77,6 +77,22 @@ jobhandler = {
     return !!this.passes.length;
   },
 
+  // The first pass whose intensity (%) over feedrate (mm/min) is at or above
+  // limit, as {number, ratio} with number counting from 1, or null. A limit
+  // of 0 turns the check off.
+  passOverPowerSpeedLimit: function (limit) {
+    if (!(limit > 0)) {
+      return null;
+    }
+    for (var i = 0; i < this.passes.length; i++) {
+      var ratio = this.passes[i].intensity / this.passes[i].feedrate;
+      if (ratio >= limit) {
+        return { number: i + 1, ratio: ratio };
+      }
+    }
+    return null;
+  },
+
   loopItems: function (func, kind) {
     if (kind === undefined) {
       for (var i = 0; i < this.items.length; i++) {

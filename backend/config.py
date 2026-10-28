@@ -70,6 +70,8 @@ conf = {
     "enable_gzip": True,  # allow gzip upload of files / jobs
     "force_gzip": False,  # compress uploads even when the link looks fast
     "home_on_startup": False,
+    "homing_reset_offset": False,  # clear the offset before homing, not only after
+    "power_speed_limit": 0,  # refuse to run passes with intensity(%) / feedrate(mm/min) >= this, 0 = off
     "mill_mode": False,
     "mill_max_rpm": 18000,
     "alignment_host": None,
@@ -106,6 +108,8 @@ userconfigurable = {
     "split_closed_paths": "Allow seek optimization to burn a closed contour in separate arcs when that saves travel (eg the far sides of a row of circles on the way back). Adjacent arcs still burn as one continuous move. Disable for delicate cuts where an interrupted contour could resume misaligned.",
     "skip_pierce_on_resume": "Skip the pierce dwell when a split contour resumes at a point that is already cut through. Only affects arcs created by split_closed_paths.",
     "home_on_startup": "Automatically perform a homing cycle when the machine first connects.",
+    "homing_reset_offset": "Clear the offset right when homing is requested, instead of only once it has started. Use this when a leftover offset gets in the way of the homing move.",
+    "power_speed_limit": "Refuse to run a job when a pass has intensity (%) divided by feedrate (mm/min) at or above this value, so a slow, strong burn does not set the material on fire. 0 turns the check off.",
     "mill_max_rpm": "Maximum spindle RPM.",
     "require_unit": "Whether a physical unit (cm, mm, in) should be required to load SVG files.",
     "force_gzip": "Always compress uploaded jobs. Compression is otherwise used only over a connection the browser reports as slow, since it costs more time than it saves on a local or lan link.",

@@ -1,6 +1,9 @@
 # DriveboardApp Changelog
 
 ## Unreleased
+### New Features
+- New `power_speed_limit` option: running a job is refused when a pass has intensity (%) divided by feedrate (mm/min) at or above the limit. Off by default (0)
+- New `homing_reset_offset` option: the offset is cleared when homing is requested, instead of only once it has started. Off by default
 
 ## v26.08.1 (August 17, 2026)
 ### New Features

@@ -220,3 +220,32 @@ test("the color list covers every color in use", () => {
   assert.equal(colors.indexOf("#00ff00"), -1, "a color not in the job");
   assert.equal(colors.length, 3, "one per colored item");
 });
+
+// ---------------------------------------------------------------------------
+// power vs speed limit
+// ---------------------------------------------------------------------------
+
+test("a pass at or above the power/speed limit is reported, counting from 1", () => {
+  const job = withJob(
+    [{ kind: "path", data: [] }],
+    [{ def: 0 }],
+    [
+      { feedrate: 2000, intensity: 50 },
+      { feedrate: 100, intensity: 50 },
+    ],
+  );
+  const over = job.passOverPowerSpeedLimit(0.5);
+  assert.equal(over.number, 2);
+  assert.equal(over.ratio, 0.5);
+  assert.equal(job.passOverPowerSpeedLimit(0.6), null);
+});
+
+test("a limit of 0 turns the power/speed check off", () => {
+  const job = withJob(
+    [{ kind: "path", data: [] }],
+    [{ def: 0 }],
+    [{ feedrate: 1, intensity: 100 }],
+  );
+  assert.equal(job.passOverPowerSpeedLimit(0), null);
+  assert.equal(job.passOverPowerSpeedLimit(undefined), null);
+});

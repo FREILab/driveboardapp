@@ -91,3 +91,12 @@ def test_concurrent_config_updates_are_not_lost(isolated_config):
     with open(path) as fp:
         data = json.load(fp)
     assert data == {f"field_{i}": i for i in range(20)}
+
+
+def test_run_and_homing_safety_options_are_off_by_default():
+    import config
+
+    assert config.conf["power_speed_limit"] == 0
+    assert config.conf["homing_reset_offset"] is False
+    assert "power_speed_limit" in config.userconfigurable
+    assert "homing_reset_offset" in config.userconfigurable
