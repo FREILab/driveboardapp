@@ -702,7 +702,6 @@ def test_load_reports_a_truncated_svg_readably(auth_app):
     )
     assert resp.status_int == 422
     assert "well-formed" in resp.body.decode("utf-8")
-    assert "truncated" in resp.body.decode("utf-8")
 
 
 def test_queue_listing_never_changes_process_working_directory(isolated_config, monkeypatch):

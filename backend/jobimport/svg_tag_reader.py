@@ -4,7 +4,8 @@ import hashlib
 import logging
 import re
 
-from .svg_attribute_reader import SVGAttributeReader
+from . import issues
+from .svg_attribute_reader import SVGAttributeReader, element_label
 from .svg_path_reader import SVGPathReader
 from .utilities import matrixMult, parseFloats, parsePreserveAspectRatio, viewboxMatrix
 
@@ -65,6 +66,8 @@ class SVGTagReader:
             # Parse style attribute LAST so inline styles take precedence
             # over presentation attributes (CSS specificity rules)
             style_value = None
+            # issues name the element, and attributes can come in any order
+            node["where"] = element_label(tagName, tag.get("id"))
             for attr, value in list(tag.attrib.items()):
                 # log.debug("considering attrib: " + attr)
                 if attr == "style" or attr.endswith("}style"):
@@ -343,13 +346,17 @@ class SVGTagReader:
             return
 
         if data is None:
-            log.error("image tag skipped: no href attribute found")
+            issues.report(
+                "Image without data", "NOT CUT", "dropped", "Embed the image", node.get("where")
+            )
             return
 
         if not data.startswith("data:image/"):
             # only the svg content reaches here, never the file it came from,
             # so a href has no base path to resolve against
-            log.error("image tag skipped: only embedded images are supported, not linked ones")
+            issues.report(
+                "Linked image", "NOT CUT", "dropped", "Embed the image", node.get("where")
+            )
             return
 
         # Clean base64 data: remove whitespace that may have been introduced
@@ -403,7 +410,13 @@ class SVGTagReader:
                     viewboxMatrix(nums, (x, y, width, height), align, meet_or_slice),
                 )
                 return
-            log.error(f"nested svg viewBox '{vb}' is not a positive rectangle; ignored")
+            issues.report(
+                "Invalid viewBox",
+                "VIEWBOX IGNORED",
+                "changed",
+                "Fix the viewBox",
+                node.get("where"),
+            )
         if x or y:
             node["xformToWorld"] = matrixMult(node["xformToWorld"], [1, 0, 0, 1, x, y])
 
@@ -505,7 +518,13 @@ class SVGTagReader:
         if not fill_opacity:
             return False
         if not self._svgreader.is_pattern(ref):
-            log.warn(f"fill url(#{ref}) is not a pattern, shape left unpainted")
+            issues.report(
+                f'Unsupported fill "url(#{ref})"',
+                "FILL NOT CUT",
+                "dropped",
+                "Use a solid fill",
+                node.get("where"),
+            )
             return False
         return True
 

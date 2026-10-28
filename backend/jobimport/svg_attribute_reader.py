@@ -6,9 +6,15 @@ import re
 
 from PIL import ImageColor
 
+from . import issues
 from .utilities import NUMBER, matrixMult, parseFloats
 
 log = logging.getLogger("svg_reader")
+
+
+def element_label(tag, node_id=None):
+    """How an issue names an element: `rect "frame"`, or just `rect` without an id."""
+    return f'{tag} "{node_id}"' if node_id else tag
 
 
 def _hex(rgb):
@@ -27,8 +33,9 @@ def _rgb_channels(args):
 def parse_color(val):
     """Parse a color definition.
 
-    Returns a color in hex format, 'inherit', or 'none'.
-    'none' means that the geometry is not to be rendered.
+    Returns a color in hex format, 'inherit', or 'none'; None for a color
+    that is not supported. 'none' means that the geometry is not to be rendered.
+    Silent: colorAttrib, which has the element, reports what cannot be used.
     See: http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
     """
     # http://www.w3.org/TR/SVG11/color.html
@@ -41,15 +48,11 @@ def parse_color(val):
         try:
             return _hex(ImageColor.getrgb(val))
         except ValueError:
-            log.warn("invalid color, skipped: " + str(val))
             return "inherit"
     elif val.startswith("rgba"):
         floats = _rgb_channels(val[5:-1])
         if len(floats) == 4:
-            log.warn(
-                "opacity in rgba is ignored, \
-                          use stroke-opacity/fill-opacity instead"
-            )
+            # the alpha is ignored, which cutting has no use for anyway
             return _hex(floats)
     elif val.startswith("rgb"):
         floats = _rgb_channels(val[4:-1])
@@ -59,17 +62,14 @@ def parse_color(val):
         # 'none' means the geometry is not to be filled or stroked
         # http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
         return "none"
-    elif val.startswith("hsl"):
-        log.warn("hsl/hsla color spaces are not supported")
-    elif val.startswith("url"):
-        # same document references are taken apart in colorAttrib
-        log.warn("only same document url(#id) paint references are supported")
+    elif val.startswith("hsl") or val.startswith("url"):
+        # same document url(#id) references are taken apart in colorAttrib
+        return None
     elif val in ImageColor.colormap:  # named colors
         return _hex(ImageColor.getrgb(val))
     elif val in ["currentcolor", "inherit"]:
         return "inherit"
     else:
-        log.warn("invalid color, skipped: " + str(val))
         return "inherit"
 
 
@@ -148,12 +148,18 @@ class SVGAttributeReader:
         try:
             node[attr] = min(1.0, max(0.0, float(value)))
         except ValueError:
-            log.warn("invalid opacity, default to 1.0")
+            issues.report(
+                f'Invalid opacity "{value.strip()}"',
+                "FULL OPACITY",
+                "changed",
+                "Set a valid opacity",
+                node.get("where"),
+            )
             node[attr] = 1.0
 
     def dimensionAttrib(self, node, attr, value):
         """Read a dimension attribute."""
-        node[attr] = self._parseUnit(value)
+        node[attr] = self._parseUnit(value, node.get("where"))
 
     def colorAttrib(self, node, attr, value):
         # http://www.w3.org/TR/SVG11/color.html
@@ -170,8 +176,35 @@ class SVGAttributeReader:
             return
         node.pop(attr + "-ref", None)
         col = parse_color(value)
+        where = node.get("where")
+        if col is None:
+            # hsl, a url() to elsewhere or a malformed rgb(): no paint is set
+            issues.report(
+                f'Unsupported colour "{value.strip()}"',
+                "NOT CUT",
+                "dropped",
+                "Use a hex colour",
+                where,
+            )
+        elif col == "inherit" and value.strip().lower() not in ("inherit", "currentcolor"):
+            issues.report(
+                f'Invalid colour "{value.strip()}"',
+                "DEFAULT COLOUR",
+                "changed",
+                "Set a valid colour",
+                where,
+            )
         if col != "inherit":
             node[attr] = col
+
+    def _skip_transform(self, node, kind):
+        issues.report(
+            f'Invalid "{kind}" transform',
+            "TRANSFORM IGNORED",
+            "changed",
+            "Fix the transform",
+            node.get("where"),
+        )
 
     def transformAttrib(self, node, attr, value):
         # http://www.w3.org/TR/SVG11/coords.html#EstablishingANewUserSpace
@@ -191,7 +224,7 @@ class SVGAttributeReader:
                 elif len(params) == 2:
                     xforms.append([1, 0, 0, 1, params[0], params[1]])
                 else:
-                    log.warn("translate skipped; invalid num of params")
+                    self._skip_transform(node, "translate")
             # rotate
             elif xformKind == "rotate":
                 if len(params) == 3:
@@ -221,7 +254,7 @@ class SVGAttributeReader:
                         ]
                     )
                 else:
-                    log.warn("rotate skipped; invalid num of params")
+                    self._skip_transform(node, "rotate")
             # scale
             elif xformKind == "scale":
                 if len(params) == 1:
@@ -229,27 +262,27 @@ class SVGAttributeReader:
                 elif len(params) == 2:
                     xforms.append([params[0], 0, 0, params[1], 0, 0])
                 else:
-                    log.warn("scale skipped; invalid num of params")
+                    self._skip_transform(node, "scale")
             # matrix
             elif xformKind == "matrix":
                 if len(params) == 6:
                     xforms.append(params)
                 else:
-                    log.warn("matrix skipped; invalid num of params")
+                    self._skip_transform(node, "matrix")
             # skewX
             elif xformKind == "skewX":
                 if len(params) == 1:
                     angle = params[0] * self.DEG_TO_RAD
                     xforms.append([1, 0, math.tan(angle), 1, 0, 0])
                 else:
-                    log.warn("skewX skipped; invalid num of params")
+                    self._skip_transform(node, "skewX")
             # skewY
             elif xformKind == "skewY":
                 if len(params) == 1:
                     angle = params[0] * self.DEG_TO_RAD
                     xforms.append([1, math.tan(angle), 0, 1, 0, 0])
                 else:
-                    log.warn("skewY skipped; invalid num of params")
+                    self._skip_transform(node, "skewY")
 
         # calculate combined transformation matrix
         xform_combined = [1, 0, 0, 1, 0, 0]
@@ -297,9 +330,9 @@ class SVGAttributeReader:
         if len(floats) % 2 == 0:
             node[attr] = floats
         else:
-            log.error("odd number of vertices")
+            raise issues.ImportFailed("Odd number of points", "Fix the points", node.get("where"))
 
-    def _parseUnit(self, val):
+    def _parseUnit(self, val, where=None):
         if val is not None:
             vals = self.re_findall_unitparts(val)
             # [('123', 'em'), ('-10', 'cm')]
@@ -323,8 +356,20 @@ class SVGAttributeReader:
                 elif unit == "in":
                     num *= dpi
                 elif unit == "%" or unit == "em" or unit == "ex":
-                    log.error("%, em, ex dimension units not supported, use px or mm instead")
+                    issues.report(
+                        f'Unsupported unit "{unit}"',
+                        "TREATED AS PX",
+                        "changed",
+                        "Use px or mm",
+                        where,
+                    )
 
                 return num
-            log.error("invalid dimension")
+            issues.report(
+                f'Invalid dimension "{val.strip()}"',
+                "TREATED AS 0",
+                "changed",
+                "Set a valid size",
+                where,
+            )
         return None

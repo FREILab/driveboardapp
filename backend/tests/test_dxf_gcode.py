@@ -697,7 +697,6 @@ _LASERTAG_RES = {
         "#0000ff": [[[0.0, 5.0], [10.0, 5.0]]],
         "#00ff00": [[[0.0, 9.0], [10.0, 9.0]]],
     },
-    "warnings": {"x": "y"},
 }
 
 
@@ -719,7 +718,7 @@ def test_svg_lasertags_become_passes(monkeypatch):
         ],
     )
     assert job["head"]["dpi"] == 90
-    assert job["head"]["warnings"] == {"x": "y"}
+    assert "warnings" not in job["head"]
     colors = {i: it["color"] for i, it in enumerate(job["items"])}
     first, second = job["passes"]  # sorted by pass number
     assert (first["feedrate"], first["intensity"]) == (3000, 80)

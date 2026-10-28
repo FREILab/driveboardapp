@@ -8,8 +8,9 @@ import xml.etree.ElementTree as ET
 
 from PIL import Image
 
+from . import issues
 from .svg_tag_reader import SVGTagReader
-from .svg_text_converter import convert_text_to_paths, get_conversion_warnings
+from .svg_text_converter import convert_text_to_paths
 from .utilities import (
     matrixApply,
     matrixMult,
@@ -209,6 +210,7 @@ class SVGReader:
                 with Image.open(io.BytesIO(base64.b64decode(b64data))) as img:
                     size = img.size
             except Exception as e:
+                # an image that cannot be read is reported once, by imagedata
                 log.warning(f"Failed to read image size: {e}")
                 size = (0, 0)
             self._image_sizes[data_uri] = size
@@ -341,6 +343,7 @@ class SVGReader:
             result = self._encode_image_data(self._run_image_ops(img, resolved), header)
         except Exception as e:
             log.warning(f"Failed to transform image: {e}")
+            issues.report("Image not transformed", "USED AS IS", "changed", "Re-embed the image")
             return data_uri
         self._derived_images[key] = result
         return result
@@ -580,7 +583,7 @@ class SVGReader:
             return None
         return min(xs), min(ys), max(xs), max(ys)
 
-    def _pattern_tile(self, attribs, bbox):
+    def _pattern_tile(self, attribs, bbox, where=None):
         """The tile rectangle (x, y, w, h) in the frame of the filled shape,
         or None when the pattern paints nothing."""
         ar = self._tagReader._attribReader
@@ -601,7 +604,13 @@ class SVGReader:
             else:
                 vals[name] = num
             if vals[name] is None:
-                log.warn(f"pattern {name} in '{raw}' is not supported, fill skipped")
+                issues.report(
+                    f'Unsupported pattern {name} "{raw}"',
+                    "FILL NOT CUT",
+                    "dropped",
+                    "Use px or mm",
+                    where,
+                )
                 return None
         if units == "objectBoundingBox":
             bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -617,7 +626,7 @@ class SVGReader:
             return None
         return tile
 
-    def _pattern_content_xform(self, attribs, tile, bbox):
+    def _pattern_content_xform(self, attribs, tile, bbox, where=None):
         """The transform from pattern content coordinates to the tile at the
         origin, honoring 'viewBox' and 'patternContentUnits'."""
         vb = attribs.get("viewBox")
@@ -626,7 +635,9 @@ class SVGReader:
             if len(nums) == 4 and nums[2] > 0 and nums[3] > 0:
                 align, meet_or_slice = parsePreserveAspectRatio(attribs.get("preserveAspectRatio"))
                 return viewboxMatrix(nums, (0, 0, tile[2], tile[3]), align, meet_or_slice)
-            log.error(f"pattern viewBox '{vb}' is not a positive rectangle; ignored")
+            issues.report(
+                "Invalid pattern viewBox", "VIEWBOX IGNORED", "changed", "Fix the viewBox", where
+            )
         if attribs.get("patternContentUnits") == "objectBoundingBox":
             return [bbox[2] - bbox[0], 0, 0, bbox[3] - bbox[1], 0, 0]
         return [1, 0, 0, 1, 0, 0]
@@ -668,7 +679,13 @@ class SVGReader:
         """
         pid = fill["ref"]
         if pid in self._active_patterns:
-            log.warn(f"pattern #{pid} fills itself, ignored")
+            issues.report(
+                "Pattern fills itself",
+                "FILL NOT CUT",
+                "dropped",
+                "Fix the pattern",
+                node.get("where"),
+            )
             return
         bbox = self._shape_bbox(fill["d"], node)
         if bbox is None or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
@@ -676,7 +693,7 @@ class SVGReader:
         attribs, content = self._resolve_pattern(pid)
         if not content:
             return
-        tile = self._pattern_tile(attribs, bbox)
+        tile = self._pattern_tile(attribs, bbox, node.get("where"))
         if tile is None:
             return
 
@@ -690,7 +707,7 @@ class SVGReader:
             )
             pattern_xform = tmp["xform"]
         grid = matrixMult(node["xformToWorld"], pattern_xform)
-        content_xform = self._pattern_content_xform(attribs, tile, bbox)
+        content_xform = self._pattern_content_xform(attribs, tile, bbox, node.get("where"))
 
         span = self._pattern_tile_range(tile, pattern_xform, bbox)
         if span is None:
@@ -698,9 +715,12 @@ class SVGReader:
         i0, i1, j0, j1 = span
         count = (i1 - i0 + 1) * (j1 - j0 + 1)
         if count > self.MAX_PATTERN_TILES:
-            log.warn(
-                f"pattern #{pid} needs {count} tiles, only the first "
-                f"{self.MAX_PATTERN_TILES} are drawn"
+            issues.report(
+                "Pattern has too many tiles",
+                f"FIRST {self.MAX_PATTERN_TILES} TILES ONLY",
+                "changed",
+                "Use a larger tile",
+                node.get("where"),
             )
 
         # the shape only paints inside itself, and its box is what the
@@ -854,16 +874,11 @@ class SVGReader:
             # a file that arrived incomplete fails here rather than anywhere
             # readable, so say which it is instead of raising the parser's
             # line and column on their own
-            raise ValueError(
-                f"SVG is not well-formed XML ({e}). A file that was truncated "
-                "in transit or is still being written reads this way, so check "
-                "it opens in a browser and that its size matches the original."
-            ) from e
+            raise issues.ImportFailed("SVG not well-formed", "Export again", str(e)) from e
         tagName = self._tagReader._get_tag(svgRootElement)
 
         if tagName != "svg":
-            log.error("Invalid file, no 'svg' tag found.")
-            return self.boundarys
+            raise issues.ImportFailed("Not an SVG file", "Export as SVG")
 
         # 1. Get px2mm from argument
         if force_dpi is not None:
@@ -888,7 +903,9 @@ class SVGReader:
             width, width_unit = parseScalar(width_str)
             height, height_unit = parseScalar(height_str)
             if width_unit != height_unit:
-                log.error("Conflicting units found.")
+                issues.report(
+                    "Conflicting units", "WIDTH UNIT USED", "changed", "Use one unit for both"
+                )
             unit = width_unit
             log.info(f"SVG w,h (unit) is {width},{height} ({unit}).")
 
@@ -901,7 +918,7 @@ class SVGReader:
                 vb_x, vb_y, vb_w, vb_h = nums
                 log.info(f"SVG viewBox ({vb_x},{vb_y},{vb_w},{vb_h}).")
             else:
-                log.error(f"SVG viewBox '{vb}' is not a positive rectangle; ignored")
+                issues.report("Invalid viewBox", "VIEWBOX IGNORED", "changed", "Fix the viewBox")
                 vb = None
 
         # how the viewBox is fitted to the page, which is what
@@ -952,7 +969,7 @@ class SVGReader:
                     self.px2mm *= 10.0
                     log.info("px2mm by svg cm unit")
                 elif require_unit:
-                    raise ValueError("Invalid or no unit in SVG data, must be 'mm', 'cm' or 'in'.")
+                    raise issues.ImportFailed("No unit in SVG", "Set units to mm")
                 elif unit == "px" or unit == "":
                     # no physical units in file
                     # we have to interpret user (px) units
@@ -979,7 +996,9 @@ class SVGReader:
                         # give up in this step
                         self.px2mm = None
                 else:
-                    log.error("SVG with unsupported unit.")
+                    issues.report(
+                        f'Unsupported unit "{unit}"', "UNIT IGNORED", "changed", "Set units to mm"
+                    )
                     self.px2mm = None
 
         # 4. Get px2mm by the ratio of svg size to target size
@@ -989,7 +1008,7 @@ class SVGReader:
 
         # 5. Fall back on px unit DPIs default value
         if not self.px2mm:
-            log.warn("Failed to determin physical dimensions -> defaulting to 90dpi.")
+            issues.report("No size info", "SCALED AT 90 DPI", "changed", "Set units to mm")
             self.px2mm = 25.4 / 90.0
 
         # adjust tolerances to px units
@@ -1026,11 +1045,6 @@ class SVGReader:
 
         if self.rasters:
             parse_results["rasters"] = self.rasters
-
-        # Collect any warnings from text conversion
-        warnings = get_conversion_warnings()
-        if warnings:
-            parse_results["warnings"] = warnings
 
         return parse_results
 
@@ -1144,15 +1158,29 @@ class SVGReader:
         matter where the referenced element sits in the document.
         """
         if use_depth >= self.MAX_USE_DEPTH:
-            log.warn("'use' tags nested too deeply, ignored")
+            issues.report(
+                '"use" nested too deeply',
+                "NOT CUT",
+                "dropped",
+                "Unlink the clone",
+                node.get("where"),
+            )
             return
         href = node.get("href")
         if not href or not href.startswith("#"):
-            log.warn("'use' tag skipped: only same document references are supported")
+            issues.report(
+                'External "use" reference',
+                "NOT CUT",
+                "dropped",
+                "Unlink the clone",
+                node.get("where"),
+            )
             return
         target = self._elements_by_id.get(href[1:])
         if target is None:
-            log.warn(f"'use' tag skipped: no element with id {href[1:]}")
+            issues.report(
+                '"use" target missing', "NOT CUT", "dropped", "Unlink the clone", node.get("where")
+            )
             return
 
         # x/y on the tag translate the referenced element, after its transform

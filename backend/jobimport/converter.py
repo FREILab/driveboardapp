@@ -4,7 +4,7 @@ import json
 
 from config import conf
 
-from . import pathoptimizer
+from . import issues, pathoptimizer
 from .dba import resolve_image_data
 from .dedupe import dedupe_job
 from .dxf_parser import DXFParser
@@ -65,6 +65,12 @@ def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
         if data not in previews:
             previews[data] = preview_image_data(data)
         job["sources"][key] = previews[data]
+    # the mill frontend reads these from the job itself
+    rows = issues.snapshot()
+    if rows:
+        job["head"]["warnings"] = [
+            row["problem"] + (f" ({row['where']})" if row["where"] else "") for row in rows
+        ]
     return job
 
 
@@ -182,10 +188,6 @@ def read_svg(svg_string, tolerance, forced_dpi=None, optimize=True):
     dedupe_job(job)
     if optimize:
         optimize_job(job, tolerance)
-
-    # Include any warnings from conversion
-    if "warnings" in res:
-        job["head"]["warnings"] = res["warnings"]
 
     return job
 

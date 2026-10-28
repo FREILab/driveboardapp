@@ -14,7 +14,8 @@ import platform
 import re
 import xml.etree.ElementTree as ET
 
-from .svg_attribute_reader import parse_color
+from . import issues
+from .svg_attribute_reader import element_label, parse_color
 
 log = logging.getLogger("svg_text_converter")
 
@@ -27,27 +28,11 @@ except ImportError:
     PATHOPS_AVAILABLE = False
     log.debug("pathops not available, overlapping contours won't be removed")
 
-# Global list to collect warnings during conversion
-# This is reset at the start of each convert_text_to_paths call
-_conversion_warnings = []
-
 # cut settings text (=pass1:...=) is read by the tag reader, not outlined
 _re_lasertag = re.compile(r"=pass[0-9]+:")
 # a text element, with or without a namespace prefix, matched against the raw
 # document so one with none never has to be parsed and reserialized
 _re_text_element = re.compile(r"<\s*(?:[\w.-]+:)?(?:text|tspan)[\s/>]")
-
-
-def get_conversion_warnings():
-    """Get the list of warnings from the last conversion."""
-    return _conversion_warnings.copy()
-
-
-def _add_warning(message):
-    """Add a warning message."""
-    if message not in _conversion_warnings:
-        _conversion_warnings.append(message)
-        log.warning(message)
 
 
 # SVG namespace
@@ -258,7 +243,12 @@ class FontManager:
 
             # Warn if this is a specific font that wasn't found
             if font_family.lower() not in generic_families:
-                _add_warning(f"Font '{font_family}' not found, using '{fallback_name}' instead")
+                issues.report(
+                    f'Font "{font_family}" missing',
+                    f"{fallback_name.upper()} USED",
+                    "replaced",
+                    "Convert text to path",
+                )
 
             log.debug(f"Using fallback font: {fallback_path}")
             return fallback_path
@@ -593,9 +583,6 @@ def convert_text_to_paths(svg_string):
         Modified SVG content with text converted to paths,
         or the original svg_string if conversion fails.
     """
-    global _conversion_warnings
-    _conversion_warnings = []  # Reset warnings for this conversion
-
     # Ensure we're working with a string
     is_bytes = isinstance(svg_string, bytes)
     if is_bytes:
@@ -632,6 +619,7 @@ def convert_text_to_paths(svg_string):
         for text_elem in text_elements:
             if _re_lasertag.search("".join(text_elem.itertext())):
                 continue
+            text_where = element_label("text", text_elem.get("id"))
             try:
                 # Get default styling from text element
                 font_family = get_style_attr(text_elem, "font-family", "sans-serif")
@@ -648,13 +636,26 @@ def convert_text_to_paths(svg_string):
                 # Find and load font
                 font_path = fm.find_font(font_family)
                 if not font_path:
-                    log.warning(f"Could not find font for family '{font_family}'")
+                    issues.report(
+                        f'Font "{font_family}" missing',
+                        "TEXT NOT CUT",
+                        "dropped",
+                        "Convert text to path",
+                        text_where,
+                    )
                     continue
 
                 log.info(f"Converting text with font '{font_family}' -> {font_path}")
 
                 font = fm.load_font(font_path)
                 if not font:
+                    issues.report(
+                        f'Font "{font_family}" missing',
+                        "TEXT NOT CUT",
+                        "dropped",
+                        "Convert text to path",
+                        text_where,
+                    )
                     continue
 
                 # Collect path data grouped by color
@@ -756,6 +757,13 @@ def convert_text_to_paths(svg_string):
 
             except Exception as e:
                 log.debug(f"Error converting text element: {e}")
+                issues.report(
+                    "Text conversion failed",
+                    "TEXT NOT CUT",
+                    "dropped",
+                    "Convert text to path",
+                    text_where,
+                )
                 continue
 
         if converted_count > 0:
@@ -769,6 +777,7 @@ def convert_text_to_paths(svg_string):
         log.warning(f"Failed to parse SVG: {e}")
         return svg_string
     except Exception as e:
+        issues.report("Text conversion failed", "TEXT NOT CUT", "dropped", "Convert text to path")
         log.warning(f"Failed to convert text to paths: {e}")
         return svg_string
 

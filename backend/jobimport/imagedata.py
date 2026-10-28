@@ -6,6 +6,8 @@ import logging
 
 from PIL import Image
 
+from . import issues
+
 log = logging.getLogger("svg_reader")
 
 # What a browser will accept in an <img>, which is how the frontend previews a
@@ -43,6 +45,7 @@ def normalize_image_data(data_uri):
         return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8")
     except Exception as e:
         log.warning(f"Failed to normalize image data: {e}")
+        issues.report("Image not readable", "KEPT AS IS", "changed", "Re-embed the image")
         return data_uri
 
 

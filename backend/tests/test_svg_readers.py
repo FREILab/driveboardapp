@@ -16,12 +16,11 @@ from types import SimpleNamespace
 
 import jobimport
 import pytest
-from jobimport import svg_reader, svg_text_converter
+from jobimport import issues, svg_reader, svg_text_converter
 from jobimport.svg_attribute_reader import SVGAttributeReader, parse_color
 from jobimport.svg_text_converter import (
     FontManager,
     convert_text_to_paths,
-    get_conversion_warnings,
     get_font_manager,
     get_style_attr,
     get_text_content,
@@ -120,10 +119,8 @@ def test_parse_color_hex(val, expected):
 
 
 @pytest.mark.parametrize("val", ["#12", "#12345", "#ggg", "#"])
-def test_parse_color_invalid_hex_is_skipped(val, caplog):
-    with caplog.at_level(logging.WARNING, logger="svg_reader"):
-        assert parse_color(val) == "inherit"
-    assert "invalid color" in caplog.text
+def test_parse_color_invalid_hex_is_skipped(val):
+    assert parse_color(val) == "inherit"
 
 
 @pytest.mark.parametrize(
@@ -134,10 +131,8 @@ def test_parse_color_rgb(val, expected):
     assert parse_color(val) == expected
 
 
-def test_parse_color_rgba_warns_and_drops_alpha(caplog):
-    with caplog.at_level(logging.WARNING, logger="svg_reader"):
-        assert parse_color("rgba(1, 2, 3, 0.5)") == "#010203"
-    assert "opacity in rgba is ignored" in caplog.text
+def test_parse_color_rgba_drops_alpha():
+    assert parse_color("rgba(1, 2, 3, 0.5)") == "#010203"
 
 
 @pytest.mark.parametrize(
@@ -161,19 +156,16 @@ def test_parse_color_keywords():
 
 
 @pytest.mark.parametrize(
-    "val,expected,warning",
+    "val,expected",
     [
-        ("hsl(120, 100%, 50%)", None, "hsl/hsla"),
-        ("url(#grad)", None, "url(#id)"),
-        ("rgb(1, 2)", None, None),
-        ("notacolor", "inherit", "invalid color"),
+        ("hsl(120, 100%, 50%)", None),
+        ("url(#grad)", None),
+        ("rgb(1, 2)", None),
+        ("notacolor", "inherit"),
     ],
 )
-def test_parse_color_unsupported(val, expected, warning, caplog):
-    with caplog.at_level(logging.WARNING, logger="svg_reader"):
-        assert parse_color(val) == expected
-    if warning:
-        assert warning in caplog.text
+def test_parse_color_unsupported(val, expected):
+    assert parse_color(val) == expected
 
 
 def test_parse_color_rgb_clamps_channels():
@@ -288,7 +280,8 @@ def test_style_attrib_cannot_recurse():
 def test_d_and_points_attribs():
     assert _read("d", "M10-5.5L1e1 2z")["d"] == ["M", 10.0, -5.5, "L", 10.0, 2.0, "z"]
     assert _read("points", "0,0 1,2 3,4")["points"] == [0.0, 0.0, 1.0, 2.0, 3.0, 4.0]
-    assert "points" not in _read("points", "0,0 1")  # odd count is rejected
+    with pytest.raises(issues.ImportFailed):  # odd count is rejected
+        _read("points", "0,0 1")
 
 
 # ---------------------------------------------------------------------------
@@ -814,18 +807,20 @@ def test_font_manager_prefers_the_regular_variant(monkeypatch, tmp_path):
 
 
 def test_font_manager_generic_family_falls_back_quietly(monkeypatch, tmp_path):
-    monkeypatch.setattr(svg_text_converter, "_conversion_warnings", [])
     fm = _fake_fonts(monkeypatch, tmp_path, ["Zzz.ttf", "DejaVuSans.ttf", "DejaVuSerif.otf"])
-    assert fm.find_font("sans-serif").endswith("DejaVuSans.ttf")
-    assert fm.find_font("serif").endswith("DejaVuSerif.otf")
-    assert get_conversion_warnings() == []
+    with issues.collecting() as c:
+        assert fm.find_font("sans-serif").endswith("DejaVuSans.ttf")
+        assert fm.find_font("serif").endswith("DejaVuSerif.otf")
+    assert c.issues() == []
 
 
 def test_font_manager_unknown_family_warns_and_falls_back(monkeypatch, tmp_path):
-    monkeypatch.setattr(svg_text_converter, "_conversion_warnings", [])
     fm = _fake_fonts(monkeypatch, tmp_path, ["Only.ttf"])
-    assert fm.find_font("Comic Nonexistent").endswith("Only.ttf")
-    assert any("'Comic Nonexistent' not found" in w for w in get_conversion_warnings())
+    with issues.collecting() as c:
+        assert fm.find_font("Comic Nonexistent").endswith("Only.ttf")
+    (row,) = c.issues()
+    assert row["problem"] == 'Font "Comic Nonexistent" missing'
+    assert (row["result"], row["kind"]) == ("ONLY USED", "replaced")
 
 
 def test_font_manager_without_fonts(monkeypatch, tmp_path):
@@ -962,13 +957,15 @@ def test_convert_text_anchor_and_font_size_units(font):
 
 
 def test_convert_text_missing_font_warns_and_still_converts(font):
-    out = convert_text_to_paths(
-        _text_doc('<text x="0" y="10" font-family="NoSuchFontQwerty">Hi</text>')
-    )
+    with issues.collecting() as c:
+        out = convert_text_to_paths(
+            _text_doc('<text x="0" y="10" font-family="NoSuchFontQwerty">Hi</text>')
+        )
     assert "<text" not in out
-    assert any("'NoSuchFontQwerty' not found" in w for w in get_conversion_warnings())
-    convert_text_to_paths(_text_doc("<g/>"))  # warnings are per conversion
-    assert get_conversion_warnings() == []
+    assert [r["problem"] for r in c.issues()] == ['Font "NoSuchFontQwerty" missing']
+    with issues.collecting() as c:
+        convert_text_to_paths(_text_doc("<g/>"))  # issues are per collector
+    assert c.issues() == []
 
 
 def test_convert_text_without_any_font_leaves_the_document(monkeypatch):
