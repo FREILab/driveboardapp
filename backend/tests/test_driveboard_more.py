@@ -959,7 +959,9 @@ def test_mill_z_without_a_z_work_area_is_refused_by_import_check_and_run(loop, m
 
 def _run_mill(loop, items):
     loop._status["offset"] = [0.0, 0.0, 0.0]
-    driveboard.job({"head": {"kind": "mill"}, "defs": [{"data": items}]})
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(conf, "mill_mode", True)
+        driveboard.job({"head": {"kind": "mill"}, "defs": [{"data": items}]})
     return _events(loop.tx_buffer)
 
 
@@ -1425,6 +1427,7 @@ def test_prettify_ignores_a_trailing_blank_after_data_only_chunks(fresh_prettify
 
 
 def test_mill_job_without_a_machine_runs_nowhere_and_leaves_no_dispatch_state(monkeypatch):
+    monkeypatch.setitem(driveboard.conf, "mill_mode", True)
     monkeypatch.setattr(driveboard, "SerialLoop", None)
     # a disconnected job falls over on the first send; locks must still be released
     with contextlib.suppress(AttributeError):

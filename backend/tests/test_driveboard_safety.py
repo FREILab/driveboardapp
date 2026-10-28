@@ -2332,6 +2332,7 @@ def test_job_dispatches_to_laser(loop, monkeypatch):
 
 
 def test_job_dispatches_to_mill(loop, monkeypatch):
+    monkeypatch.setitem(driveboard.conf, "mill_mode", True)
     seen = {}
     monkeypatch.setattr(driveboard, "job_laser", lambda j: seen.setdefault("laser", j))
     monkeypatch.setattr(driveboard, "job_mill", lambda j: seen.setdefault("mill", j))
@@ -2347,7 +2348,8 @@ def test_job_without_head_is_noop(loop, monkeypatch):
     assert seen == {}
 
 
-def test_mill_job_rejects_off_bed_target(loop):
+def test_mill_job_rejects_off_bed_target(loop, monkeypatch):
+    monkeypatch.setitem(driveboard.conf, "mill_mode", True)
     # job_mill validates G0/G1 targets against the work area, like job_laser.
     way_out = conf_workspace_x() + 10_000
     mill_job = {
@@ -2360,7 +2362,8 @@ def test_mill_job_rejects_off_bed_target(loop):
     assert ord(driveboard.CMD_LINE) not in loop.tx_buffer
 
 
-def test_mill_job_rejects_off_bed_z(loop):
+def test_mill_job_rejects_off_bed_z(loop, monkeypatch):
+    monkeypatch.setitem(driveboard.conf, "mill_mode", True)
     # Z is bounded too (workspace[2]); a z move beyond it is rejected.
     way_down = conf_workspace_z() + 10_000
     mill_job = {
@@ -2371,7 +2374,8 @@ def test_mill_job_rejects_off_bed_z(loop):
         driveboard.job(mill_job)
 
 
-def test_mill_job_in_bounds_runs(loop):
+def test_mill_job_in_bounds_runs(loop, monkeypatch):
+    monkeypatch.setitem(driveboard.conf, "mill_mode", True)
     # An in-bounds mill job validates and queues moves (z=0 is within [0, wz]).
     mill_job = {
         "head": {"kind": "mill"},
