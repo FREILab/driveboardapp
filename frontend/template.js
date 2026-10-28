@@ -26,7 +26,7 @@ function template_check_values(params, raw) {
     var v = text === "" ? NaN : Number(text);
     if (!isFinite(v) || v < p.min || v > p.max) {
       // uxmessage inserts its text as html, so the untrusted label is escaped here
-      return { error: issues_escape(p.label) + ": use " + p.min + "–" + p.max };
+      return { error: issues_escape(p.label) + ": use " + issues_escape(p.min) + "–" + issues_escape(p.max) };
     }
     values[p.name] = v;
   }

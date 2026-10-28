@@ -76,10 +76,10 @@ value outside is refused with a message naming the field and the range.
 1. Draw it in Inkscape.
 2. Declare each parameter as a text element:
    `=param:<name>:<default>:<min>:<max>:<label>=`. The label comes last so it
-   may contain spaces. Colons are not allowed in it. Like pass tags, these text
+   may contain spaces, but neither `:` nor `=`. Like pass tags, these text
    elements are neither cut nor outlined.
 3. Put `{{ expression }}` wherever a value goes: in visible text, in pass tags
-   (`=pass3:{{round(v3)}}:{{p1}}:#00ff00=`), and in any attribute, including
+   (`=pass3:{{round(v3)}}:{{round(p1)}}:#00ff00=`), and in any attribute, including
    geometry (`height="{{d}}"`, path data, transforms).
 4. Open the SVG in the app as usual. The import finds the `=param:` tags,
    renders the template with the defaults, converts it as a normal SVG, and
@@ -91,6 +91,18 @@ Keep the source SVG next to the library so it can be edited again in Inkscape.
 Inkscape may rewrite geometry attributes (path data, transforms) on save and
 lose a placeholder there. Set or check placeholders in geometry in a text editor
 after the last Inkscape save.
+
+Limits to keep in mind:
+
+- Text attributes (`fill`, `font-family`, `font-size`, `text-anchor`) are not
+  inherited from a parent `<g>` or `<svg>`. Set them on each `<text>`.
+- A placeholder must sit in one text span or attribute. One split across
+  `<tspan>`s is refused as "Placeholder not closed".
+- Values in pass tags must be integers, so wrap them in `round()`.
+- Results are limited to ±1e6 and are written as an integer or with at most 3
+  decimals.
+- Edits made in the app after an import (pass assignment, fills) are lost when
+  the .dba is generated again from the SVG.
 
 The number of elements is fixed by the template: there are no loops and no
 conditionals. A different grid size means a different template.

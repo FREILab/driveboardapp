@@ -69,3 +69,23 @@ def test_render_rejects_unreadable_pass_tag():
     with pytest.raises(TemplateError) as e:
         template.render("<text>=pass1:{{v/3}}:100:#ff0000=</text>", {"v": 1000})
     assert "round" in e.value.issue["fix"]
+
+def test_render_unclosed_placeholders_are_linear():
+    import time
+    t = time.time()
+    with pytest.raises(TemplateError):
+        template.render("<text>" + "{{" * 100000 + "</text>", {"v": 1})
+    assert time.time() - t < 1
+
+@pytest.mark.parametrize("values", [[1], "v", 5, {"vmin": 10**400}])
+def test_resolve_values_rejects_odd_json(values):
+    with pytest.raises(TemplateError):
+        template.resolve_values(template.parse_params(SVG), values)
+
+@pytest.mark.parametrize("bad", [
+    '=param:v:1:0:10:L</text><rect x="1"/>',   # no closing =
+    '<text>=param:v:1:0:10:A</text><text>=param:w:1:0:10:B=</text>',  # label swallows markup
+])
+def test_parse_params_rejects_unclosed_tag(bad):
+    with pytest.raises(TemplateError):
+        template.parse_params(bad)

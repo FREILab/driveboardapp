@@ -13,9 +13,10 @@ from . import issues
 
 LIMIT = 1e6  # no intermediate or final result may exceed this
 
-_PARAM = re.compile(r"=param:([^=]*)=")
+_PARAM = re.compile(r"=param:([^=<>]*)=")
 _NAME = re.compile(r"[A-Za-z_]\w*")
-_PLACEHOLDER = re.compile(r"\{\{(.*?)\}\}")
+# no braces or tags inside: a run of unclosed "{{" must not rescan to the end of the text
+_PLACEHOLDER = re.compile(r"\{\{([^{}<>]*)\}\}")
 _PASS_TAG = re.compile(r"=pass\d+:[^=]*=")
 _PASS_OK = re.compile(r"=pass\d+:\d*(mm/min)?:\d*%?(:#[0-9a-fA-F]{6}){0,6}=")
 
@@ -51,7 +52,10 @@ def _number(text):
 
 def parse_params(svg):
     params = []
-    for m in _PARAM.finditer(svg):
+    tags = list(_PARAM.finditer(svg))
+    if len(tags) != svg.count("=param:"):
+        raise TemplateError("Parameter tag is not closed", "End it with = on the same text, as =param:name:default:min:max:label=")
+    for m in tags:
         tag = m.group(0)
         parts = m.group(1).split(":")
         if len(parts) != 5:
@@ -73,13 +77,18 @@ def parse_params(svg):
 def resolve_values(params, values):
     by_name = {p["name"]: p for p in params}
     values = values or {}
+    if not isinstance(values, dict):
+        raise TemplateError("Values must be an object", "Send {name: number}")
     for name, value in values.items():
         if name not in by_name:
             raise TemplateError("Unknown parameter", f"Remove {name}", name)
     out = {}
     for p in params:
         value = values.get(p["name"], p["default"])
-        ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        try:
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        except OverflowError:  # a JSON integer beyond float range
+            ok = False
         if not ok:
             raise TemplateError(f"{p['label']} is not a number", f"Use {p['min']}–{p['max']}", p["name"])
         if not p["min"] <= value <= p["max"]:
