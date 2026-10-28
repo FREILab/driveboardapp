@@ -4,6 +4,7 @@ import glob
 import gzip
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import shutil
@@ -22,7 +23,7 @@ import config as config_module
 import driveboard
 import jobimport
 from config import conf, conf_defaults, userconfigurable, write_config_fields
-from jobimport import pathoptimizer
+from jobimport import issues, pathoptimizer
 
 __author__ = "Stefan Hechenberger <stefan@nortd.com>"
 
@@ -32,6 +33,17 @@ time_reconnect_last = 0
 _reconnect_lock = threading.Lock()
 _presets_lock = threading.RLock()
 jog_target_last = None  # last jog target commanded, in offset coordinates
+JOG_SLACK = 0.01  # mm, over one step still queued that is not yet a second
+
+# error text that comes from a file or a job is never served as html
+PLAIN = {"Content-Type": "text/plain"}
+
+
+def _json(value):
+    """A JSON answer, for bodies that carry file or job names (never html)."""
+    bottle.response.content_type = "application/json"
+    return json.dumps(value)
+
 
 if conf["mill_mode"]:
     frontend_path = "frontend_mill"
@@ -53,7 +65,7 @@ def machine_busy_plugin(callback):
         try:
             return callback(*args, **kwargs)
         except driveboard.MachineBusy as e:
-            raise bottle.HTTPResponse(str(e), 409) from e
+            raise bottle.HTTPResponse(str(e), 409, PLAIN) from e
 
     return wrapper
 
@@ -76,7 +88,7 @@ def checkserial(func):
 ### STATIC FILES
 
 
-def _frontend_file(filename, *subdirs):
+def _frontend_file(path):
     """Serve a frontend asset, revalidated on every request.
 
     Without an explicit Cache-Control a browser is free to guess how long the
@@ -85,8 +97,11 @@ def _frontend_file(filename, *subdirs):
     talks to. no-cache still allows the cached copy to be reused, it just has to
     be revalidated first, which costs one 304 per asset.
     """
-    root = os.path.join(conf["rootdir"], frontend_path, *subdirs)
-    response = bottle.static_file(filename, root=root)
+    root = os.path.join(conf["rootdir"], frontend_path)
+    if "/" in path and not os.path.isfile(os.path.join(root, path)):
+        # the mill frontend shares the laser frontend's vendored css/fonts/js/img
+        root = os.path.join(conf["rootdir"], "frontend")
+    response = bottle.static_file(path, root=root)
     response.set_header("Cache-Control", "no-cache")
     return response
 
@@ -101,29 +116,14 @@ def static_bin_handler(file):
     return _frontend_file(file)
 
 
-@bottle.route("/css/<path:path>")
-def static_css_handler(path):
-    return _frontend_file(path, "css")
-
-
-@bottle.route("/fonts/<path:path>")
-def static_font_handler(path):
-    return _frontend_file(path, "fonts")
-
-
-@bottle.route("/js/<path:path>")
-def static_js_handler(path):
-    return _frontend_file(path, "js")
-
-
-@bottle.route("/img/<path:path>")
-def static_img_handler(path):
-    return _frontend_file(path, "img")
+@bottle.route("/<path:re:(?:css|fonts|js|img)/.+>")
+def static_asset_handler(path):
+    return _frontend_file(path)
 
 
 @bottle.route("/favicon.ico")
 def favicon_handler():
-    return _frontend_file("favicon.ico", "img")
+    return _frontend_file("img/favicon.ico")
 
 
 @bottle.route("/temp", method="POST")
@@ -140,7 +140,7 @@ def temp():
     print(job)
     print("file stashed: " + os.path.basename(filename))
     # return os.path.basename(filename)
-    return json.dumps(os.path.basename(filename))
+    return _json(os.path.basename(filename))
 
 
 @bottle.route("/download/<filename>/<dlname>")
@@ -213,6 +213,18 @@ def status():
     return json.dumps(driveboard.status())
 
 
+@bottle.route("/incidents")
+@bottle.auth_basic(checkuser)
+def incidents():
+    """The serial loop's record of unexplained stops, one json object a line."""
+    return bottle.static_file(
+        driveboard.INCIDENTS_FILE,
+        root=conf["confdir"],
+        mimetype="application/x-ndjson",
+        download=driveboard.INCIDENTS_FILE,
+    )
+
+
 @bottle.route("/homing")
 @bottle.auth_basic(checkuser)
 @checkserial
@@ -265,32 +277,36 @@ def retract():
     return "{}"
 
 
-def _jog_target(dx, dy, dz):
-    """Absolute target for a jog step, held inside the work area.
+def _jog_target(stats, delta, clamp):
+    """Target for a jog step in offset coordinates, and whether it was clamped.
 
     Positions and move() targets share the same offset coordinates, in which
     the work area spans [-offset, workspace - offset] on each axis. Z is only
     bounded when the config gives it a non-zero work area, matching
     target_in_workarea, since a machine with no Z axis still has to be able to
     jog the focus.
+
+    A machine that has drained everything sent reports where the next move
+    starts from. While it is still moving the position lags behind, and a
+    burst of jogs has to accumulate onto the last target commanded or every
+    step of the burst clamps against the same stale position. The distance
+    still to that target is the travel queued: past one step, a held key would
+    keep the head running long after it is released, so the step is refused.
     """
     global jog_target_last
-    stats = driveboard.status()
     pos = stats.get("pos") or [0.0, 0.0, 0.0]
     offset = stats.get("offset") or [0.0, 0.0, 0.0]
-    # An idle machine has drained both buffers, so its reported position has
-    # settled and is what the next move starts from. While it is still moving
-    # the position lags behind, and a burst of jogs has to accumulate onto the
-    # last target commanded or every step of the burst clamps against the same
-    # stale position.
-    if stats.get("ready") or jog_target_last is None:
+    # drained also covers a stop, which empties the controller's queue
+    if stats.get("drained") or jog_target_last is None:
         base = pos
     else:
         base = jog_target_last
-    requested = [base[i] + d for i, d in enumerate((dx, dy, dz))]
+        if math.dist(pos, base) > math.hypot(*delta) + JOG_SLACK:
+            raise driveboard.MachineBusy("the previous jog is still running")
+    requested = [base[i] + d for i, d in enumerate(delta)]
     target = list(requested)
     for i in range(3):
-        if i == 2 and not conf["workspace"][2]:
+        if not clamp or (i == 2 and not conf["workspace"][2]):
             continue
         target[i] = max(-offset[i], min(target[i], conf["workspace"][i] - offset[i]))
     jog_target_last = target
@@ -301,19 +317,39 @@ def _jog_target(dx, dy, dz):
 @bottle.auth_basic(checkuser)
 @checkserial
 def jog(x, y, z):
-    global jog_target_last
+    """One jog step.
+
+    Homed, the step is held inside the work area and runs at the seek rate.
+    Unhomed, the reported position is wherever the controller started, so
+    there is no edge to hold it against: it goes out relative, so no
+    direction is refused, and at jog_unhomed_feedrate, slower than the homing
+    approach that runs into the switches by design. jog_soft_limits off jogs
+    a homed machine relative too, at the seek rate.
+    """
     with driveboard.machine_operation():
+        stats = driveboard.status()
+        if stats.get("homing"):
+            # it would be queued behind the cycle and computed in the frame
+            # from before it, which homing clears
+            raise driveboard.MachineBusy("homing in progress")
+        homed = stats.get("homed", False)
+        clamp = homed and conf["jog_soft_limits"]
+        if clamp and not stats.get("offset_settled", True):
+            # a clamp against the reported offset would be in the wrong frame
+            raise driveboard.MachineBusy("waiting for the machine to report its new offset")
+        target, clamped = _jog_target(stats, (x, y, z), clamp)
         driveboard.intensity(0)
-        driveboard.feedrate(conf["seekrate"])
-        if not conf["jog_soft_limits"]:
-            jog_target_last = None  # a relative jog leaves the tracked target behind
+        if homed:
+            driveboard.feedrate(conf["seekrate"])
+        else:
+            driveboard.feedrate(min(conf["seekrate"], conf["jog_unhomed_feedrate"]))
+        if not clamp:
             driveboard.relative()
             driveboard.move(x, y, z)
             driveboard.absolute()
             return "{}"
         # Sent absolute, so the commanded target is inside the work area by
         # construction even if the position it was derived from was stale.
-        target, clamped = _jog_target(x, y, z)
         driveboard.absolute()
         driveboard.move(*target)
     return json.dumps({"clamped": clamped})
@@ -524,12 +560,25 @@ def _get_sorted(globpattern, library=False, stripext=False):
     return files
 
 
+def _job_base(jobname, library=False):
+    # path of a job without extension; the one place a user-supplied name
+    # becomes a path, so a name can never point outside its directory
+    if (
+        not isinstance(jobname, str)
+        or not jobname
+        or jobname in (".", "..")
+        or "/" in jobname
+        or "\\" in jobname
+        or "\0" in jobname
+    ):
+        raise bottle.HTTPResponse("Invalid job name.", 400)
+    base = os.path.join(conf["rootdir"], "library") if library else conf["stordir"]
+    return os.path.join(base, jobname)
+
+
 def _get(jobname, library=False):
     # get job as sting
-    if library:
-        jobpath = os.path.join(conf["rootdir"], "library", jobname.strip("/\\"))
-    else:
-        jobpath = os.path.join(conf["stordir"], jobname.strip("/\\"))
+    jobpath = _job_base(jobname, library)
     with _queue_lock:
         if os.path.exists(jobpath + ".dba"):
             jobpath = jobpath + ".dba"
@@ -543,10 +592,7 @@ def _get(jobname, library=False):
 
 
 def _get_path(jobname, library=False):
-    if library:
-        jobpath = os.path.join(conf["rootdir"], "library", jobname.strip("/\\"))
-    else:
-        jobpath = os.path.join(conf["stordir"], jobname.strip("/\\"))
+    jobpath = _job_base(jobname, library)
     if os.path.exists(jobpath + ".dba"):
         return jobpath + ".dba"
     elif os.path.exists(jobpath + ".dba.starred"):
@@ -556,7 +602,7 @@ def _get_path(jobname, library=False):
 
 
 def _exists(jobname):
-    namepath = os.path.join(conf["stordir"], jobname.strip("/\\"))
+    namepath = _job_base(jobname)
     if os.path.exists(namepath + ".dba") or os.path.exists(namepath + ".dba.starred"):
         raise bottle.HTTPResponse("File name exists.", 400)
 
@@ -580,7 +626,7 @@ def _add(job, name):
     # add job (dba string)
     # overwrites file if already exists, use _unique_name(name) to avoid
     with _queue_lock:
-        namepath = os.path.join(conf["stordir"], name.strip("/\\") + ".dba")
+        namepath = _job_base(name) + ".dba"
         fd, tmppath = tempfile.mkstemp(prefix=".job-", suffix=".tmp", dir=conf["stordir"])
         try:
             with os.fdopen(fd, "w") as fp:
@@ -626,6 +672,9 @@ def _unique_name(jobname):
 CONVERT_TIMEOUT = 600  # seconds, a big raster job legitimately takes minutes
 _convert_pool = None
 _convert_pool_lock = threading.Lock()
+# futures handed to _convert_pool, so a cancel can tell whether the worker is
+# busy with anyone else's import, guarded by _convert_pool_lock
+_convert_busy = set()
 
 
 def _convert_worker(in_path, out_path, quick_path, text, optimize, matrix, conf_overrides):
@@ -646,18 +695,38 @@ def _convert_worker(in_path, out_path, quick_path, text, optimize, matrix, conf_
     if quick_path:
         # gcode is procedural, its order is never optimized (see read_gcode)
         optimize = optimize and jobimport.get_type(job) != "gcode"
-        job = jobimport.convert(job, optimize=False, tolerance=conf["tolerance"], matrix=matrix)
+        with issues.collecting() as found:
+            job = jobimport.convert(job, optimize=False, tolerance=conf["tolerance"], matrix=matrix)
+        _write_issues(out_path, found)
         with open(quick_path + ".tmp", "w") as fp:
             fp.write(jobimport.dumps(jobimport.share_image_data(job)))
         os.replace(quick_path + ".tmp", quick_path)  # appear only when complete
         if optimize:
             jobimport.optimize_job(job, conf["tolerance"])
     else:
-        job = jobimport.convert(job, optimize=optimize, tolerance=conf["tolerance"], matrix=matrix)
+        with issues.collecting() as found:
+            job = jobimport.convert(
+                job, optimize=optimize, tolerance=conf["tolerance"], matrix=matrix
+            )
+        _write_issues(out_path, found)
     # placements of one picture share its payload on the way to disk, see
     # jobimport.share_image_data
     with open(out_path, "w") as fp:
         fp.write(jobimport.dumps(jobimport.share_image_data(job)))
+
+
+def _write_issues(out_path, found):
+    """Leave the import's issues next to its result, for _convert_job."""
+    with open(out_path + ".issues", "w") as fp:
+        json.dump(found.issues(), fp)
+
+
+def _read_issues(out_path):
+    try:
+        with open(out_path + ".issues") as fp:
+            return json.load(fp)
+    except FileNotFoundError:
+        return []
 
 
 def _convert_pool_get():
@@ -669,11 +738,20 @@ def _convert_pool_get():
     return _convert_pool
 
 
-def _convert_pool_drop():
-    """Discard the worker so the next request starts a clean one."""
+def _convert_pool_drop(only_for=None):
+    """Discard the worker so the next request starts a clean one.
+
+    With only_for, a future: only while that future is the one unfinished
+    thing the worker has, so no other import goes down with it. Deciding and
+    detaching under the submit lock means an import submitted meanwhile either
+    counts here or lands on the fresh worker.
+    """
     global _convert_pool
     with _convert_pool_lock:
+        if only_for is not None and [f for f in _convert_busy if not f.done()] != [only_for]:
+            return
         pool, _convert_pool = _convert_pool, None
+        _convert_busy.clear()  # what is left belongs to the discarded worker
     if pool is not None:
         for proc in list(pool._processes.values()):
             proc.kill()
@@ -689,6 +767,7 @@ def _pending_register(future, out_path, tmpdir):
     """Track a still-optimizing load, finish it on a watcher thread."""
     token = uuid.uuid4().hex
     entry = {"event": threading.Event(), "name": None, "error": None, "stale": False}
+    entry["future"] = future
     with _load_pending_lock:
         _load_pending[token] = entry
 
@@ -696,17 +775,22 @@ def _pending_register(future, out_path, tmpdir):
         try:
             future.result(timeout=CONVERT_TIMEOUT)
             with open(out_path) as fp:
-                entry["result"] = fp.read()
+                result = fp.read()
             # the queue entry gets the optimized job under the same name,
             # unless that name has been written since (running a job saves it
             # back with its passes, and this optimize predates them)
             # Keep the staleness decision and publication indivisible from a
             # request that marks this result stale and saves a replacement.
+            # The result is recorded under the lock too, so a commit naming
+            # this entry either sees it (and publishes it) or comes first
+            # (and the name is seen here): never both, never neither.
             with _load_pending_lock:
+                entry["result"] = result
                 if entry["name"] and not entry["stale"]:
                     _add(entry["result"], entry["name"])
         except Exception as e:
-            entry["error"] = str(e)
+            if not entry["stale"]:  # a cancel may have killed the worker under it
+                entry["error"] = str(e)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
             entry["event"].set()
@@ -718,8 +802,9 @@ def _pending_register(future, out_path, tmpdir):
 def _convert_job(job, optimize, matrix, progressive=False):
     """Convert a job to a .dba string, in a worker process where one can be had.
 
-    Returns (dba_string, token): token is None when the string is final, and
-    a /load_result handle when it is the quick parse of a progressive load.
+    Returns (dba_string, token, issues): token is None when the string is
+    final, and a /load_result handle when it is the quick parse of a
+    progressive load. issues are the import's rows (see jobimport.issues).
 
     Spawn rather than fork: this process has the serial and server threads
     running, and a forked child can inherit a held stdout or import lock and
@@ -744,20 +829,23 @@ def _convert_job(job, optimize, matrix, progressive=False):
         try:
             with _convert_pool_lock:
                 future = _convert_pool_get().submit(_convert_worker, *args)
+                _convert_busy.difference_update([f for f in _convert_busy if f.done()])
+                _convert_busy.add(future)
+            deadline = time.monotonic() + CONVERT_TIMEOUT
             try:
                 if progressive:
                     # hand back the parsed job as soon as it appears, the
                     # optimized one follows via /load_result
-                    waited = 0.0
-                    while not future.done() and waited < CONVERT_TIMEOUT:
+                    while not future.done() and time.monotonic() < deadline:
                         if os.path.exists(quick_path):
                             with open(quick_path) as fp:
                                 quick = fp.read()
+                            found = _read_issues(args[1])
                             token = _pending_register(future, args[1], tmpdir)
                             tmpdir = None  # the watcher owns the cleanup now
-                            return quick, token
+                            return quick, token, found
                         time.sleep(0.05)
-                future.result(timeout=CONVERT_TIMEOUT)
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
             except concurrent.futures.TimeoutError:
                 _convert_pool_drop()
                 raise bottle.HTTPResponse("Import timed out.", 504) from None
@@ -766,7 +854,7 @@ def _convert_job(job, optimize, matrix, progressive=False):
             _convert_pool_drop()
             _convert_worker(*args)
         with open(args[1]) as fp:
-            return fp.read(), None
+            return fp.read(), None, _read_issues(args[1])
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -785,7 +873,12 @@ def load():
         optimize: flag whether to optimize (bool)
         overwrite: flag whether to overwite file if present (bool)
         matrix: alignment matrix to apply to dba (3x3 list of lists of float)
+        review_issues: flag to hold a job with import issues for review (bool),
+            answered {"hold", "name", "issues"} and decided via /load_commit
+            or /load_cancel; failures are answered {"fatal": {...}}
     """
+    with _load_pending_lock:
+        _held_purge()
     load_request = json.loads(bottle.request.forms.get("load_request"))
     job = load_request.get("job")  # always a string
     if job in ("upload", "upload_raw"):  # data was passed as a file upload
@@ -816,26 +909,70 @@ def load():
     # sanity check
     if job is None or name is None:
         raise bottle.HTTPResponse("Invalid request data.", 400)
+    _job_base(name)  # reject unsafe names before any work is done
     progressive = bool(load_request.get("progressive"))
+    review = bool(load_request.get("review_issues"))
     # A dba posted back with nothing to do to it is already what convert()
     # would hand back, so it goes to the queue as it stands. This is the run
     # button's path, where the job is the one the frontend was given and can
     # be tens of megabytes: converting it would copy it to the worker and
     # back, re-encode every raster, and queue behind whatever that single
     # worker is still busy with, all to arrive at the same bytes.
-    if not optimize and matrix is None and not progressive and jobimport.get_type(job) == "dba":
-        job, pending = (job.decode("utf-8") if isinstance(job, bytes) else job), None
-    else:
-        # convert, off this process so the serial thread keeps its timing
-        try:
-            job, pending = _convert_job(job, optimize, matrix, progressive)  # a .dba string
-        except TypeError:
+    try:
+        as_is = not optimize and matrix is None and not progressive
+        as_is = as_is and jobimport.get_type(job) == "dba"
+        if not as_is:
+            # convert, off this process so the serial thread keeps its timing
+            job, pending, found = _convert_job(job, optimize, matrix, progressive)  # a .dba
+    except Exception as e:
+        if review:
+            raise _load_fatal(e) from None
+        if isinstance(e, jobimport.UnknownFileType):
             if DEBUG:
                 traceback.print_exc()
-            raise bottle.HTTPResponse("Invalid file type.", 400) from None
-        except ValueError as e:
-            raise bottle.HTTPResponse(str(e), 422) from e
+            raise bottle.HTTPResponse("Invalid file type.", 400, PLAIN) from None
+        if isinstance(e, ValueError):
+            raise bottle.HTTPResponse(str(e), 422, PLAIN) from e
+        raise
+    if as_is:
+        job, pending, found = (job.decode("utf-8") if isinstance(job, bytes) else job), None, []
+    elif review:
+        try:
+            outside = driveboard.job_outside_work_area(json.loads(job))
+        except Exception as e:  # a check, never the reason an import fails
+            print(f"WARN: work area check failed ({type(e).__name__}: {e})")
+            outside = None
+        if outside is not None:
+            found.append(
+                {
+                    "problem": "Outside work area",
+                    "where": outside,
+                    "result": "RUN REFUSED",
+                    "kind": "dropped",
+                    "fix": "Move origin or scale",
+                    "count": 1,
+                }
+            )
 
+    if review and found:
+        # nothing reaches the queue until the operator decides
+        hold = uuid.uuid4().hex
+        with _load_pending_lock:
+            _load_held[hold] = {
+                "job": job,
+                "name": name,
+                "overwrite": overwrite,
+                "pending": pending,
+                "expires": time.time() + CONVERT_TIMEOUT,
+            }
+        bottle.response.content_type = "application/json"  # file text, never html
+        return json.dumps({"hold": hold, "name": name, "issues": found})
+    return _queue_loaded(job, name, overwrite, pending)
+
+
+def _queue_loaded(job, name, overwrite, pending):
+    """Save a converted job to the queue, return the JSON body /load answers."""
+    bottle.response.content_type = "application/json"
     # an optimize still running against this name would land on top of what is
     # about to be written, so it is told to stand down first
     with _load_pending_lock:
@@ -845,15 +982,35 @@ def load():
             if entry.get("name") == name:
                 entry["stale"] = True
         _add(job, name)
-    if pending:
-        with _load_pending_lock:
-            entry = _load_pending[pending]
-            entry["name"] = name
-            # the watcher may have finished before the name was known
-            if entry["event"].is_set() and entry.get("result") and not entry["error"]:
-                _add(entry["result"], name)
-        return json.dumps({"name": name, "pending": pending})
-    return json.dumps(name)
+        if not pending:
+            return json.dumps(name)
+        entry = _load_pending[pending]
+        entry["name"] = name
+        # the watcher may have finished before the name was known, it records
+        # its result under this lock (see _pending_register)
+        if entry.get("result") is not None:
+            _add(entry["result"], name)
+    return json.dumps({"name": name, "pending": pending})
+
+
+def _fatal(status, problem, where, fix):
+    """A {"fatal": issue} answer, for the frontend's fatal dialog."""
+    body = json.dumps({"fatal": {"problem": problem, "where": where, "fix": fix}})
+    return bottle.HTTPResponse(body, status, {"Content-Type": "application/json"})
+
+
+def _load_fatal(e):
+    """The answer for an import that cannot be loaded, from what it raised."""
+    if isinstance(e, issues.ImportFailed):
+        return _fatal(422, **e.issue)
+    if isinstance(e, ValueError):
+        return _fatal(422, "Import failed", str(e), "Check the file")
+    if isinstance(e, jobimport.UnknownFileType):
+        return _fatal(400, "Unknown file type", None, "Use SVG, DXF, G-code or DBA")
+    if isinstance(e, bottle.HTTPResponse) and e.status_code == 504:
+        return _fatal(504, "Import timed out", None, "Simplify or split file")
+    traceback.print_exception(type(e), e, e.__traceback__)
+    return _fatal(500, "Import crashed", f"{type(e).__name__}: {e}", "Report file to admin")
 
 
 @bottle.route("/load_result/<token>")
@@ -872,10 +1029,57 @@ def load_result(token):
     with _load_pending_lock:
         _load_pending.pop(token, None)
     if entry["error"]:
-        raise bottle.HTTPResponse(entry["error"], 422)
+        raise bottle.HTTPResponse(entry["error"], 422, PLAIN)
     if not entry["event"].is_set():
         raise bottle.HTTPResponse("Import timed out.", 504)
-    return json.dumps({"name": entry["name"]})
+    return _json({"name": entry["name"]})
+
+
+# imports with issues awaiting the operator, {hold: {"job", "name",
+# "overwrite", "pending", "expires"}}, guarded by _load_pending_lock
+_load_held = {}
+
+
+def _held_purge():
+    """Forget undecided holds past their time, caller holds _load_pending_lock."""
+    now = time.time()
+    for hold in [h for h, held in _load_held.items() if held["expires"] < now]:
+        _held_drop(_load_held.pop(hold))
+
+
+def _held_drop(held):
+    """Stand down a dropped hold's optimize, caller holds _load_pending_lock."""
+    entry = _load_pending.pop(held["pending"], None) if held["pending"] else None
+    if entry is not None:
+        entry["stale"] = True  # its name is never set either, belt and braces
+        # stale alone leaves the worker busy and the next import waiting behind
+        # it, so a still-running optimize is killed, unless others need the worker
+        if entry.get("future") is not None:
+            _convert_pool_drop(only_for=entry["future"])
+
+
+@bottle.route("/load_commit/<hold>")
+@bottle.auth_basic(checkuser)
+def load_commit(hold):
+    """Queue a held import, answer as /load would have."""
+    with _load_pending_lock:
+        _held_purge()
+        held = _load_held.pop(hold, None)
+    if held is None:
+        raise _fatal(404, "Import expired", None, "Open the file again")
+    return _queue_loaded(held["job"], held["name"], held["overwrite"], held["pending"])
+
+
+@bottle.route("/load_cancel/<hold>")
+@bottle.auth_basic(checkuser)
+def load_cancel(hold):
+    """Discard a held import and its pending optimize, unknown holds included."""
+    with _load_pending_lock:
+        _held_purge()
+        held = _load_held.pop(hold, None)
+        if held is not None:
+            _held_drop(held)
+    return "{}"
 
 
 @bottle.route("/listing")
@@ -892,7 +1096,7 @@ def listing(kind=None):
         files = _get_sorted("*.dba", stripext=True)
     else:
         raise bottle.HTTPResponse("Invalid kind.", 400)
-    return json.dumps(files)
+    return _json(files)
 
 
 @bottle.route("/get/<jobname>")
@@ -956,7 +1160,7 @@ def clear():
 def listing_library():
     """List all library jobs by name."""
     files = _get_sorted("*.dba", library=True, stripext=True)
-    return json.dumps({"files": files, "path": os.path.join(conf["rootdir"], "library")})
+    return _json({"files": files, "path": os.path.join(conf["rootdir"], "library")})
 
 
 @bottle.route("/get_library/<jobname>")
@@ -975,7 +1179,7 @@ def load_library(jobname):
     with _queue_lock:
         jobname = _unique_name(jobname)
         _add(job, jobname)
-    return json.dumps(jobname)
+    return _json(jobname)
 
 
 ### FAVORITES
@@ -1009,7 +1213,7 @@ def listing_presets():
     """List all preset settings."""
     presets = _read_presets()
 
-    return json.dumps({"presets": presets, "path": _get_presets_path()})
+    return _json({"presets": presets, "path": _get_presets_path()})
 
 
 # the pierce_time-less form is kept so an older client or a saved link still saves
@@ -1062,7 +1266,7 @@ def run(jobname):
     try:
         driveboard.job(json.loads(job))
     except ValueError as e:
-        raise bottle.HTTPResponse(str(e), 422) from e
+        raise bottle.HTTPResponse(str(e), 422, PLAIN) from e
     return "{}"
 
 
@@ -1085,7 +1289,7 @@ def run_direct():
     try:
         driveboard.job(json.loads(job))
     except ValueError as e:
-        raise bottle.HTTPResponse(str(e), 422) from e
+        raise bottle.HTTPResponse(str(e), 422, PLAIN) from e
     return "{}"
 
 
@@ -1122,7 +1326,7 @@ def optimize_fill():
         return json.dumps({"data": optimized, "fill_mode": fill_mode})
     except Exception as e:
         traceback.print_exc()
-        raise bottle.HTTPResponse(f"Error optimizing fill: {str(e)}", 400) from e
+        raise bottle.HTTPResponse(f"Error optimizing fill: {e}", 400, PLAIN) from e
 
 
 # The job view's preview, computed off the request thread. The server serves
@@ -1205,7 +1409,7 @@ def job_preview():
         optimize = bool(request_data.get("optimize", True))
     except Exception as e:
         traceback.print_exc()
-        raise bottle.HTTPResponse(f"Error reading job: {str(e)}", 400) from e
+        raise bottle.HTTPResponse(f"Error reading job: {e}", 400, PLAIN) from e
     with _preview_lock:
         _preview_token += 1
         token = _preview_token
@@ -1230,7 +1434,7 @@ def job_preview_result(token):
     if result is None or result[0] != token:
         return json.dumps({"pending": True})
     if "error" in result[1]:
-        raise bottle.HTTPResponse(f"Error computing preview: {result[1]['error']}", 400)
+        raise bottle.HTTPResponse(f"Error computing preview: {result[1]['error']}", 400, PLAIN)
     return json.dumps(result[1])
 
 

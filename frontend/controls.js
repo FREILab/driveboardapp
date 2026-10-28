@@ -387,7 +387,6 @@ function controls_ready() {
     jobview_jogLayer.visible = false;
     $(".tool_extra_btn").hide();
     tools_tselect.activate();
-    $("#addfill_wgt").show();
     jobview_moveLayer.visible = false;
     return true;
   });
@@ -396,11 +395,28 @@ function controls_ready() {
     placement: "right",
     delay: { show: 1000, hide: 100 },
   });
+  // the fill popup is not a bootstrap dropdown: that one closes on any click
+  // in it that is not on the input, it only closes on the x or outside
   $("#addfill_btn").click(function (e) {
-    var idxs = jobview_selection();
-    if (idxs.length == 0) {
-      return true;
+    tools_addfill_init();
+    $("#addfill_wgt").toggleClass("open");
+    return false;
+  });
+  $(document).on("mousedown", function (e) {
+    if (!$(e.target).closest("#addfill_wgt").length) {
+      $("#addfill_wgt").removeClass("open");
     }
+  });
+  $("#addfill_panel").on("click", "#addfill_close", function (e) {
+    $("#addfill_wgt").removeClass("open");
+    return false;
+  });
+  $("#addfill_panel").on("click", ".addfill_color", function (e) {
+    tools_addfill_run([Number($(this).attr("data-idx"))]);
+    return false;
+  });
+  $("#addfill_panel").on("click", "#addfill_selection", function (e) {
+    var idxs = jobview_selection();
     // a fill covers all paths of one color, so fill each color once
     var colors = [];
     var fill_idxs = [];
@@ -418,10 +434,7 @@ function controls_ready() {
       $().uxmessage("notice", "Make sure a path is selected.");
       return false;
     }
-    app_fill_btn.start();
-    fills_add_by_items(fill_idxs, function () {
-      app_fill_btn.stop();
-    });
+    tools_addfill_run(fill_idxs);
     return false;
   });
 

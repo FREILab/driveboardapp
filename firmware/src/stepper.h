@@ -59,8 +59,8 @@ double stepper_get_position_z();
 // never call this while processing blocks, sync first
 void stepper_set_position(double x, double y, double z);
 
-// perform the homing cycle
-void stepper_homing_cycle();
+// perform the homing cycle, false when it was abandoned (any stop stays set)
+bool stepper_homing_cycle();
 
 
 #endif

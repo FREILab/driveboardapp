@@ -4,6 +4,30 @@
 ### New Features
 - New `power_speed_limit` option: running a job is refused when a pass has intensity (%) divided by feedrate (mm/min) at or above the limit. Off by default (0)
 - New `homing_reset_offset` option: the offset is cleared when homing is requested, instead of only once it has started. Off by default
+- New import issues dialog: problems found while importing an SVG, DXF or G-code file are listed before the job is queued, each with what the app does about it (changed, replaced, or not cut) and how to fix the source file. Choose *Load anyway* or *Cancel*; a cancelled import leaves nothing in the queue. Files that cannot be loaded get a dialog with the reason instead of a raw error. Problems repeated many times collapse into one row with a count, and the list is capped at 20 rows, the not-cut ones first
+- The import now checks every job against the work area, and warns when a job would be refused at run time
+- The fill menu is now a popup that stays open while you type and only closes on its × or a click outside. It lists the fills already added with their pxsize, has a *Fill selection* button, and the Fill button is shown with every tool, not only Select
+- New `jog_unhomed_feedrate` option (2000 mm/min): until the machine is homed, jogs run relative at this slower rate instead of being clamped to a work area edge the app cannot know
+- Unexplained stops are now recorded with the last bytes sent and received in `incidents.jsonl` in the config directory (newest 50), downloadable from the status menu, and summarised in the tooltip of the red stop label
+
+### Bug Fixes
+- SVG import now reports or handles text colours and colour alpha, stroke-only text, `<switch>` (first renderable child), `<a>` links, nested clip paths on raster images, and unsupported elements, instead of silently dropping or changing them
+- DXF files without units and unsupported DXF entities are reported instead of only logged
+- G-code: `M6`/`M06` start a new tool pass and `M60`-`M69` no longer do, and lines with `N` line numbers are read instead of dropped
+- An unknown file type is now told apart from a crash inside an importer, and an unknown file sent without optimizing gives a proper error instead of a server error
+- Cancelling or expiring a held import stops its background optimize, so the next import does not wait behind it
+- Raster lines no longer stop hard at the end of every line: the lead-out is now sent ahead of the pixel data
+- Fixed the head stepping on during a dwell or assist block right after a line, which also moved it during a pierce dwell
+- After a pause, the head now ramps up from rest instead of jumping toward its previous speed
+- Fixed the serial link staying dead after a single lost or extra byte, chunk acks being held back until the firmware sent something else, and a stop or resume in the middle of a read replaying stale bytes as commands
+- The host serial loop now ignores stale acks and stop markers right after a resume, and detects a controller reboot during a job
+- Removed about 170,000 lines of unused vendored libraries, the unused `requests` and PyGObject dependencies, and dead code in backend and firmware
+
+### Safety
+- G-code files and mill jobs are refused unless `mill_mode` is on. A laser would have run the spindle speed as beam power, left on during seek moves
+- Homing is abandoned on any stop other than its own limit hit; a user stop or the serial watchdog during homing no longer lets the head carry on
+- Holding an arrow key jogs at most two steps past its release, and jogs are refused while homing
+- Responses that echo file or job names are no longer served as HTML, so a crafted file name cannot inject markup
 
 ## v26.08.1 (August 17, 2026)
 ### New Features

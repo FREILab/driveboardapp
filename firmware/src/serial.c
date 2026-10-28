@@ -68,8 +68,6 @@ volatile uint8_t rx_buffer_processed = 0;
 volatile bool raster_mode = false;
 volatile bool consume_data = false;
 
-uint8_t serial_read();
-
 
 static void set_baud_rate(long baud) {
   uint16_t UBRR0_value = ((F_CPU / 16 + baud / 2) / baud - 1);
@@ -157,32 +155,42 @@ SIGNAL(USART_UDRE_vect) {
   if (chunks_processed > 0) {
     UDR0 = CMD_CHUNK_PROCESSED ;
     chunks_processed--;
-  } else {                    // Send a byte from the buffer
+  } else if (tail != tx_buffer_head) {  // Send a byte from the buffer
+    // (guarded: serial_write's non-atomic UDRIE0 set can re-enable us empty)
     UDR0 = tx_buffer[tail];
     if (++tail == TX_BUFFER_SIZE) {tail = 0;}  // increment
     tx_buffer_tail = tail;
   }
 
-  // disable tx interrupt, if buffer empty
-  if (tail == tx_buffer_head) { UCSR0B &= ~(1 << UDRIE0); }
+  // disable tx interrupt once nothing is left to send. Pending acks count:
+  // holding them until the next serial_write shrinks the host's send window.
+  if (tail == tx_buffer_head && chunks_processed == 0) { UCSR0B &= ~(1 << UDRIE0); }
 }
 
 
-inline uint8_t serial_read() {
-  // return data, advance tail
-  uint8_t data = rx_buffer[rx_buffer_tail];
-  if (++rx_buffer_tail == RX_BUFFER_SIZE) {rx_buffer_tail = 0;}  // increment
-  // Called from both the main loop and the stepper ISR (serial_raster_read),
-  // so this chunk counting must be atomic; otherwise the ISR drops a boundary
-  // mid-increment, fewer CMD_CHUNK_PROCESSED are sent than bytes consumed, and
-  // the host deadlocks mid raster. RESTORESTATE (not FORCEON) keeps interrupts
-  // disabled on exit when called from within the ISR.
+// Returns the next rx byte, or -1 when the buffer is empty. The empty check,
+// the read and the tail advance are one atomic step: CMD_RESUME resets head
+// and tail from the rx ISR, and landing between a reader's check and its tail
+// store it would leave tail one past head, a "full" buffer of stale bytes
+// replayed as commands with the stop already cleared. Called from both the
+// main loop and the stepper ISR (serial_raster_read), so the chunk counting
+// must be atomic too; otherwise the ISR drops a boundary mid-increment, fewer
+// CMD_CHUNK_PROCESSED are sent than bytes consumed, and the host deadlocks mid
+// raster. RESTORESTATE (not FORCEON) keeps interrupts disabled on exit when
+// called from within the ISR.
+static int16_t serial_try_read() {
+  int16_t data = -1;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    rx_buffer_processed++;
-    if (rx_buffer_processed >= RX_CHUNK_SIZE) {
-      chunks_processed++;
-      UCSR0B |=  (1 << UDRIE0);  // enable tx interrupt
-      rx_buffer_processed = 0;
+    uint8_t tail = rx_buffer_tail;  // optimize for volatile
+    if (tail != rx_buffer_head) {
+      data = rx_buffer[tail];
+      rx_buffer_tail = tail + 1;  // wraps, RX_BUFFER_SIZE is 256
+      rx_buffer_processed++;
+      if (rx_buffer_processed >= RX_CHUNK_SIZE) {
+        chunks_processed++;
+        UCSR0B |=  (1 << UDRIE0);  // enable tx interrupt
+        rx_buffer_processed = 0;
+      }
     }
   }
   return data;
@@ -219,11 +227,16 @@ SIGNAL(USART_RX_vect) {
     data_prev = data;
     return;
   } else {  // use, but check with previous
-    first_transmission = true;
     if (data != data_prev) {
       stepper_request_stop(STOPERROR_TRANSMISSION_ERROR);
-      return;  // discard the corrupt byte, don't act on it
+      // Discard the held byte, don't act on either. Keep this one as the
+      // first of a new pair: after a lost or extra wire byte every later pair
+      // would otherwise stay misaligned and not even CMD_RESUME gets through.
+      // Only two equal consecutive bytes are ever accepted.
+      data_prev = data;
+      return;
     }
+    first_transmission = true;
   }
   // handle char
   if (data < 16) {  // handle controls chars
@@ -236,6 +249,7 @@ SIGNAL(USART_RX_vect) {
       consume_data = false;
       rx_buffer_head = rx_buffer_tail = 0;  // reset rx buffer
       rx_buffer_processed = 0;
+      chunks_processed = 0;  // the host zeroes its firmbuf tally on resume
       stepper_stop_resume();
     } else if (data == CMD_PAUSE) {
       // freeze immediately (beam off), retaining buffer/position; bypasses the
@@ -286,7 +300,8 @@ inline uint8_t serial_protocol_read() {
       // If the stepper reaches the end of a block, we consume/ignore all following raster data in the line
       // wait, buffer empty
       buffer_underrun_marked = false;
-      while (rx_buffer_tail == rx_buffer_head) {
+      int16_t data = -1;
+      while (raster_mode && (data = serial_try_read()) < 0) {
         // sleep_mode();
         if (!buffer_underrun_marked) {
           protocol_mark_underrun();
@@ -294,8 +309,9 @@ inline uint8_t serial_protocol_read() {
         }
         protocol_idle();
       }
-      // read a byte from the rx buffer
-      uint8_t data = serial_read();
+      // a stop or CMD_RESUME ends raster mode while waiting (resume also
+      // resets the rx buffer); the next byte belongs to the next job
+      if (!raster_mode) { return CMD_NONE; }
       if (data == CMD_RASTER_DATA_END) {
         raster_mode = false;
       }
@@ -305,24 +321,34 @@ inline uint8_t serial_protocol_read() {
   }
   // wait, buffer empty
   buffer_underrun_marked = false;
-  while (rx_buffer_tail == rx_buffer_head) {
-    // sleep_mode();
-    if (!buffer_underrun_marked) {
-      protocol_mark_underrun();
-      buffer_underrun_marked = true;
+  int16_t data;
+  while (true) {
+    // the plain check only spares the idle loop the atomic block, the read
+    // below decides (a RESUME may have emptied the buffer since)
+    while (rx_buffer_tail == rx_buffer_head) {
+      // sleep_mode();
+      if (!buffer_underrun_marked) {
+        protocol_mark_underrun();
+        buffer_underrun_marked = true;
+      }
+      protocol_idle();
     }
-    protocol_idle();
-  }
-  // read a byte from the rx buffer
-  uint8_t data = serial_read();
-  // we have non-raster data
-  if (data == CMD_RASTER_DATA_START) {
-    raster_mode = true;
-    consume_data = false;
-    // comsume the byte
-    return CMD_NONE;
-  } else {
-    return data;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      data = serial_try_read();
+      if (data >= 0 && stepper_stop_requested()) {
+        // A byte read while stopped is stale, CMD_RESUME flushes all sent
+        // before it. Decided here, with the read: a RESUME landing after it
+        // clears the stop before protocol_loop checks, and the byte would
+        // run as a fresh command.
+        data = CMD_NONE;
+      } else if (data == CMD_RASTER_DATA_START) {
+        // likewise, a RESUME must not land between this and raster_mode
+        raster_mode = true;
+        consume_data = false;
+        data = CMD_NONE;  // consume the byte
+      }
+    }
+    if (data >= 0) { return data; }
   }
 }
 
@@ -343,14 +369,14 @@ inline uint8_t serial_raster_read() {
   *************************************************/
   // called from stepper interrupt
   if (raster_mode && !consume_data) {
-    if (rx_buffer_tail == rx_buffer_head) {
+    int16_t data = serial_try_read();
+    if (data < 0) {
       // oops, no raster data, sending side is flaking
       // rastering too fast or serial transmission too slow
       protocol_mark_underrun();
       return 128;    // 128 encodes 0 intensity
     } else {
-      uint8_t data = serial_read();
-      if ((127 < data) && (data < 256)) {
+      if (127 < data) {
         return data;
       } else if (data == CMD_RASTER_DATA_END) {
         raster_mode = false;
@@ -377,71 +403,3 @@ inline void serial_consume_data() {
   consume_data = true;
 }
 
-
-// void printString(const char *s) {
-//   while (*s) {
-//     serial_write(*s++);
-//   }
-// }
-
-// // Print a string stored in PGM-memory
-// void printPgmString(const char *s) {
-//   char c;
-//   while ((c = pgm_read_byte_near(s++))) {
-//     serial_write(c);
-//   }
-// }
-
-// void printIntegerInBase(unsigned long n, unsigned long base) {
-//   unsigned char buf[8 * sizeof(long)]; // Assumes 8-bit chars.
-//   unsigned long i = 0;
-
-//   if (n == 0) {
-//     serial_write('0');
-//     return;
-//   }
-
-//   while (n > 0) {
-//     buf[i++] = n % base;
-//     n /= base;
-//   }
-
-//   for (; i > 0; i--) {
-//     serial_write(buf[i - 1] < 10 ?
-//     '0' + buf[i - 1] :
-//     'A' + buf[i - 1] - 10);
-//   }
-// }
-
-// void printInteger(long n) {
-//   if (n < 0) {
-//     serial_write('-');
-//     n = -n;
-//   }
-
-//   printIntegerInBase(n, 10);
-// }
-
-// void printFloat(double n) {
-//   if (n < 0) {
-//     serial_write('-');
-//     n = -n;
-//   }
-//   n += 0.5/1000; // Add rounding factor
-
-//   long integer_part;
-//   integer_part = (int)n;
-//   printIntegerInBase(integer_part,10);
-
-//   serial_write('.');
-
-//   n -= integer_part;
-//   int decimals = 3;
-//   uint8_t decimal_part;
-//   while(decimals-- > 0) {
-//     n *= 10;
-//     decimal_part = (int) n;
-//     serial_write('0'+decimal_part);
-//     n -= decimal_part;
-//   }
-// }

@@ -199,6 +199,26 @@ test("a transmission stop shows as itself, not as a limit", () => {
   assert.ok(app.dom.$("#status_limit_x1").hasClass("label-success"));
 });
 
+test("an unexplained stop carries the backend's incident as its tooltip", () => {
+  const app = fresh();
+  const incident = "data stop at 12:00:00, buffer 40. Details: /incidents";
+  app.status_handle_message(
+    machine({ stops: { data: true }, incident: incident }),
+  );
+  assert.ok(app.dom.$("#status_data").hasClass("label-danger"));
+  assert.equal(app.dom.$("#status_data").attr("title"), incident);
+  assert.equal(app.dom.$("#status_buffer").attr("title"), "");
+  app.status_handle_message(machine({ stops: {}, incident: incident }));
+  assert.equal(app.dom.$("#status_data").attr("title"), "");
+});
+
+test("a controller reset shows as its own stop", () => {
+  const app = fresh();
+  app.status_handle_message(machine({ stops: { reset: true } }));
+  assert.ok(app.dom.$("#status_reset").hasClass("label-danger"));
+  assert.equal(app.dom.disabled("#run_btn"), true);
+});
+
 test("an open door warns and holds back the pulse button", () => {
   const app = fresh();
   app.status_handle_message(machine({ info: { door: true } }));

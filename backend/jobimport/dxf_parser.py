@@ -10,9 +10,11 @@ from math import acos, cos, pi, radians, sin, sqrt
 
 import dxfgrabber
 
+from . import issues
+
 
 class DXFParser:
-    """Parse DXF using dxfgrabber >=0.7.4 <=0.8.1
+    """Parse DXF using dxfgrabber >=1.0
 
     Usage:
     reader = DXFParser(tolerance, bedwidth)
@@ -63,9 +65,8 @@ class DXFParser:
         # if we're reading other units we'll do this rounding after
         # conversion to mm
         self.round = 4
-        self.linecount = 0
-        self.line = ""
         self.dxfcode = ""
+        self.where = None  # layer of the entity being converted
 
         # flip/adjust globals
         self.cos180 = round(cos(radians(180)))
@@ -78,9 +79,12 @@ class DXFParser:
 
     def parse(self, dxfInput, forced_unit):
         dxfStream = io.StringIO(str(dxfInput.replace("\r\n", "\n")))
-        dwg = dxfgrabber.read(dxfStream)
+        try:
+            dwg = dxfgrabber.read(dxfStream)
+        except Exception as e:
+            raise issues.ImportFailed("Not a readable DXF", "Export as DXF R12") from e
         if not dwg:
-            raise RuntimeError("dxfgrabber.read() failed")
+            raise issues.ImportFailed("Not a readable DXF", "Export as DXF R12")
 
         # TODO: check DXF version to see if INSUNITS is expected
         # TODO: try and guess mm vs in based on max x/y
@@ -158,8 +162,10 @@ class DXFParser:
         elif self.units == 20:
             self.unitsString = "parsecs"
         else:
-            print(f"DXF units: >{self.units}< unsupported")
-            raise RuntimeError
+            raise issues.ImportFailed("Unsupported DXF units", "Set units to mm", str(self.units))
+
+        if self.units == 0:
+            issues.report("DXF has no units", "READ AS INCHES", "changed", "Set units to mm")
 
         if self.verbose:
             print(("dxfgrabber release: ", self.dxfgrabber_version))
@@ -171,11 +177,13 @@ class DXFParser:
             print(("units: ", self.unitsString))
 
         for entity in dwg.entities:
+            self.where = f'layer "{entity.layer}"'
             if entity.color == dxfgrabber.BYLAYER:
-                layer = dwg.layers[entity.layer]
-                entity.color = layer.color
+                # an entity may sit on a layer missing from the layer table
+                layer = dwg.layers.get(entity.layer, None)
+                entity.color = layer.color if layer else 7
                 if self.debug:
-                    print(f"set entity color to layer color {layer.color:d}")
+                    print(f"set entity color to layer color {entity.color:d}")
 
             if entity.dxftype == "LINE":
                 self.addLine(entity)
@@ -185,12 +193,14 @@ class DXFParser:
                 self.addCircle(entity)
             elif entity.dxftype == "LWPOLYLINE":
                 self.addPolyLine(entity)
-            elif entity.dxftype == "SPLINE":
-                print(("TODO ADD: ", entity.dxftype))
-                # self.addSpline(entity)
             else:
-                if self.verbose:
-                    print(("unknown entity: ", entity.dxftype))
+                issues.report(
+                    f"{entity.dxftype} unsupported",
+                    "NOT CUT",
+                    "dropped",
+                    "Convert to polyline",
+                    self.where,
+                )
 
         print("Done!")
 
@@ -208,8 +218,6 @@ class DXFParser:
             if self.verbose:
                 print("doing shiftPositive")
             self.shiftPositive()
-
-        self.validateBoundaries()
 
         self.returnColorLayers = {}
         for color in self.colorLayers:
@@ -241,13 +249,8 @@ class DXFParser:
         cx = self.unitize(entity.center[0])
         cy = self.unitize(entity.center[1])
         r = self.unitize(entity.radius)
-        # version 0, 8, 0 changed some entity names
-        if self.dxfgrabber_version[1] == 8:
-            theta1deg = entity.start_angle
-            theta2deg = entity.end_angle
-        else:
-            theta1deg = entity.startangle
-            theta2deg = entity.endangle
+        theta1deg = entity.start_angle
+        theta2deg = entity.end_angle
         thetadiff = theta2deg - theta1deg
         if thetadiff < 0:
             thetadiff = thetadiff + 360
@@ -276,9 +279,22 @@ class DXFParser:
         self.add_path_by_color(entity.color, path)
 
     def addPolyLine(self, entity):
-        path = []
-        for point in entity.points:
-            path.append([self.unitize(point[0]), self.unitize(point[1])])
+        pts = [[self.unitize(p[0]), self.unitize(p[1])] for p in entity.points]
+        # the closing segment runs from the last vertex back to the first
+        if entity.is_closed and len(pts) > 1:
+            pts.append(pts[0])
+        path = pts[:1]
+        for i in range(1, len(pts)):
+            (x1, y1), (x2, y2) = pts[i - 1], pts[i]
+            bulge = entity.bulge[i - 1] if i - 1 < len(entity.bulge) else 0.0
+            chord = sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if bulge and chord > 0:
+                # bulge = tan(sweep/4), positive is counter-clockwise
+                r = chord * (bulge**2 + 1) / (4 * abs(bulge))
+                path.pop()  # makeArc emits its own start point
+                self.makeArc(path, x1, y1, r, r, 0, int(abs(bulge) > 1), int(bulge > 0), x2, y2)
+            else:
+                path.append(pts[i])
         self.add_path_by_color(entity.color, path)
 
     def add_path_by_color(self, color, path):
@@ -288,9 +304,13 @@ class DXFParser:
                 print(f"caution: flippedPath {flippedPath} == path {path}")
         hexcolor = self.color_hex.get(color)
         if hexcolor is None:
-            if self.verbose:
-                print(f"unrecognized color {color:d}, setting to cyan")
-            # TODO: we need a better way to handle this
+            issues.report(
+                f"Unknown colour {color:d}",
+                "CUT IN CYAN",
+                "changed",
+                "Use a standard colour",
+                self.where,
+            )
             hexcolor = "#00FFFF"  # cyan
         self.colorLayers[hexcolor].append(flippedPath)
 
@@ -311,15 +331,6 @@ class DXFParser:
             flippedPath.append([x1, y1])
 
         return flippedPath
-
-    def complain_spline(self):
-        print("Encountered a SPLINE at line", self.linecount)
-        print("This program cannot handle splines at present.")
-        print("Convert the spline to an LWPOLYLINE using Save As options in SolidWorks.")
-        raise RuntimeError
-
-    def complain_invalid(self):
-        print("Skipping unrecognized element '" + self.line + "' on line", self.linecount)
 
     def makeArc(self, path, x1, y1, rx, ry, phi, large_arc, sweep, x2, y2):
         # Implemented based on the SVG implementation notes
@@ -398,20 +409,6 @@ class DXFParser:
         _recursiveArc(t1Init, t2Init, c1Init, c5Init, 0, self.tolerance2)
         path.append(c5Init)
 
-    def validateBoundaries(self):
-        for color in self.colorLayers:
-            if len(self.colorLayers[color]) > 0:
-                thisColor = self.colorLayers[color]
-                for i in range(0, len(thisColor)):
-                    if thisColor[i][0][0] < 0 or thisColor[i][0][0] > self.bedwidth[0]:
-                        raise RuntimeError("point outside of bounds x0 ", thisColor[i][0][0])
-                    elif thisColor[i][0][1] < 0 or thisColor[i][0][1] > self.bedwidth[1]:
-                        raise RuntimeError("point outside of bounds y0 ", thisColor[i][0][1])
-                    elif thisColor[i][1][0] < 0 or thisColor[i][1][0] > self.bedwidth[0]:
-                        raise RuntimeError("point outside of bounds x1 ", thisColor[i][1][0])
-                    elif thisColor[i][1][1] < 0 or thisColor[i][1][1] > self.bedwidth[1]:
-                        raise RuntimeError("point outside of bounds y1 ", thisColor[i][1][1])
-
     def shiftPositive(self):
         xShift = 0
         yShift = 0
@@ -459,7 +456,7 @@ class DXFParser:
 
         if y > self.y_min:
             self.y_min = y
-        elif y < self.y_max:
+        if y < self.y_max:
             self.y_max = y
 
     # convert value to mm
@@ -491,6 +488,4 @@ class DXFParser:
         elif self.units == 10:
             return round(value * 914.4, self.round)
         else:
-            raise RuntimeError(
-                f"don't know how to convert INSUNIT value {self.units:d}, {self.unitsString} "
-            )
+            raise issues.ImportFailed("Unsupported DXF units", "Set units to mm", self.unitsString)

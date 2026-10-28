@@ -4,10 +4,90 @@ import logging
 import math
 import re
 
+from PIL import ImageColor
+
+from . import issues
 from .utilities import NUMBER, matrixMult, parseFloats
-from .webcolors import css3_names_to_hex, normalize_hex, rgb_to_hex
 
 log = logging.getLogger("svg_reader")
+
+
+def element_label(tag, node_id=None):
+    """How an issue names an element: `rect "frame"`, or just `rect` without an id."""
+    return f'{tag} "{node_id}"' if node_id else tag
+
+
+def report_alpha(val, where=None):
+    """Report a colour whose alpha is below 1, which cutting ignores."""
+    val = val.strip().lower()
+    alpha = None
+    if val.startswith("rgba"):
+        chans = re.findall(rf"({NUMBER})(%?)", val[5:-1])
+        if len(chans) == 4:
+            num, pct = chans[3]
+            alpha = float(num) / (100 if pct else 1)
+    elif val.startswith("#") and len(val) in (5, 9):
+        digits = 1 if len(val) == 5 else 2
+        alpha = int(val[-digits:], 16) / (16**digits - 1)
+    if alpha is not None and alpha < 1:
+        issues.report(
+            "Colour alpha ignored", "CUT AT FULL OPACITY", "changed", "Use opacity", where
+        )
+
+
+def _hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(*map(int, rgb[:3]))
+
+
+def _rgb_channels(args):
+    """Channels of an rgb() argument list, percentages scaled and all clamped to 0..255."""
+    chans = []
+    for num, pct in re.findall(rf"({NUMBER})(%?)", args):
+        num = float(num)
+        chans.append(min(255, max(0, round(num * 2.55) if pct else num)))
+    return chans
+
+
+def parse_color(val):
+    """Parse a color definition.
+
+    Returns a color in hex format, 'inherit', or 'none'; None for a color
+    that is not supported. 'none' means that the geometry is not to be rendered.
+    Silent: colorAttrib, which has the element, reports what cannot be used.
+    See: http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
+    """
+    # http://www.w3.org/TR/SVG11/color.html
+    # http://www.w3.org/TR/2008/REC-CSS2-20080411/syndata.html#color-units
+    if val[0] == " ":
+        val = val.strip()
+    val = val.lower()  # CSS color syntax is case insensitive
+
+    if val[0] == "#":
+        try:
+            return _hex(ImageColor.getrgb(val))
+        except ValueError:
+            return "inherit"
+    elif val.startswith("rgba"):
+        floats = _rgb_channels(val[5:-1])
+        if len(floats) == 4:
+            return _hex(floats)
+    elif val.startswith("rgb"):
+        floats = _rgb_channels(val[4:-1])
+        if len(floats) == 3:
+            return _hex(floats)
+    elif val == "none":
+        # 'none' means the geometry is not to be filled or stroked
+        # http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
+        return "none"
+    elif val.startswith("hsl") or val.startswith("url"):
+        # same document url(#id) references are taken apart in colorAttrib
+        return None
+    elif val in ImageColor.colormap:  # named colors
+        return _hex(ImageColor.getrgb(val))
+    elif val in ["currentcolor", "inherit"]:
+        return "inherit"
+    else:
+        return "inherit"
 
 
 class SVGAttributeReader:
@@ -85,12 +165,18 @@ class SVGAttributeReader:
         try:
             node[attr] = min(1.0, max(0.0, float(value)))
         except ValueError:
-            log.warn("invalid opacity, default to 1.0")
+            issues.report(
+                f'Invalid opacity "{value.strip()}"',
+                "FULL OPACITY",
+                "changed",
+                "Set a valid opacity",
+                node.get("where"),
+            )
             node[attr] = 1.0
 
     def dimensionAttrib(self, node, attr, value):
         """Read a dimension attribute."""
-        node[attr] = self._parseUnit(value)
+        node[attr] = self._parseUnit(value, node.get("where"))
 
     def colorAttrib(self, node, attr, value):
         # http://www.w3.org/TR/SVG11/color.html
@@ -106,9 +192,38 @@ class SVGAttributeReader:
             node[attr] = None
             return
         node.pop(attr + "-ref", None)
-        col = self._parseColor(value)
+        col = parse_color(value)
+        where = node.get("where")
+        if col is None:
+            # hsl, a url() to elsewhere or a malformed rgb(): no paint is set
+            issues.report(
+                f'Unsupported colour "{value.strip()}"',
+                "NOT CUT",
+                "dropped",
+                "Use a hex colour",
+                where,
+            )
+        elif col == "inherit" and value.strip().lower() not in ("inherit", "currentcolor"):
+            issues.report(
+                f'Invalid colour "{value.strip()}"',
+                "DEFAULT COLOUR",
+                "changed",
+                "Set a valid colour",
+                where,
+            )
+        else:
+            report_alpha(value, where)
         if col != "inherit":
             node[attr] = col
+
+    def _skip_transform(self, node, kind):
+        issues.report(
+            f'Invalid "{kind}" transform',
+            "TRANSFORM IGNORED",
+            "changed",
+            "Fix the transform",
+            node.get("where"),
+        )
 
     def transformAttrib(self, node, attr, value):
         # http://www.w3.org/TR/SVG11/coords.html#EstablishingANewUserSpace
@@ -128,7 +243,7 @@ class SVGAttributeReader:
                 elif len(params) == 2:
                     xforms.append([1, 0, 0, 1, params[0], params[1]])
                 else:
-                    log.warn("translate skipped; invalid num of params")
+                    self._skip_transform(node, "translate")
             # rotate
             elif xformKind == "rotate":
                 if len(params) == 3:
@@ -158,7 +273,7 @@ class SVGAttributeReader:
                         ]
                     )
                 else:
-                    log.warn("rotate skipped; invalid num of params")
+                    self._skip_transform(node, "rotate")
             # scale
             elif xformKind == "scale":
                 if len(params) == 1:
@@ -166,27 +281,27 @@ class SVGAttributeReader:
                 elif len(params) == 2:
                     xforms.append([params[0], 0, 0, params[1], 0, 0])
                 else:
-                    log.warn("scale skipped; invalid num of params")
+                    self._skip_transform(node, "scale")
             # matrix
             elif xformKind == "matrix":
                 if len(params) == 6:
                     xforms.append(params)
                 else:
-                    log.warn("matrix skipped; invalid num of params")
+                    self._skip_transform(node, "matrix")
             # skewX
             elif xformKind == "skewX":
                 if len(params) == 1:
                     angle = params[0] * self.DEG_TO_RAD
                     xforms.append([1, 0, math.tan(angle), 1, 0, 0])
                 else:
-                    log.warn("skewX skipped; invalid num of params")
+                    self._skip_transform(node, "skewX")
             # skewY
             elif xformKind == "skewY":
                 if len(params) == 1:
                     angle = params[0] * self.DEG_TO_RAD
                     xforms.append([1, math.tan(angle), 0, 1, 0, 0])
                 else:
-                    log.warn("skewY skipped; invalid num of params")
+                    self._skip_transform(node, "skewY")
 
         # calculate combined transformation matrix
         xform_combined = [1, 0, 0, 1, 0, 0]
@@ -234,9 +349,9 @@ class SVGAttributeReader:
         if len(floats) % 2 == 0:
             node[attr] = floats
         else:
-            log.error("odd number of vertices")
+            raise issues.ImportFailed("Odd number of points", "Fix the points", node.get("where"))
 
-    def _parseUnit(self, val):
+    def _parseUnit(self, val, where=None):
         if val is not None:
             vals = self.re_findall_unitparts(val)
             # [('123', 'em'), ('-10', 'cm')]
@@ -260,51 +375,20 @@ class SVGAttributeReader:
                 elif unit == "in":
                     num *= dpi
                 elif unit == "%" or unit == "em" or unit == "ex":
-                    log.error("%, em, ex dimension units not supported, use px or mm instead")
+                    issues.report(
+                        f'Unsupported unit "{unit}"',
+                        "TREATED AS PX",
+                        "changed",
+                        "Use px or mm",
+                        where,
+                    )
 
                 return num
-            log.error("invalid dimension")
+            issues.report(
+                f'Invalid dimension "{val.strip()}"',
+                "TREATED AS 0",
+                "changed",
+                "Set a valid size",
+                where,
+            )
         return None
-
-    def _parseColor(self, val):
-        """Parse a color definition.
-
-        Returns a color in hex format, 'inherit', or 'none'.
-        'none' means that the geometry is not to be rendered.
-        See: http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
-        """
-        # http://www.w3.org/TR/SVG11/color.html
-        # http://www.w3.org/TR/2008/REC-CSS2-20080411/syndata.html#color-units
-        if val[0] == " ":
-            val = val.strip()
-
-        if val[0] == "#":
-            return normalize_hex(val)
-        elif val.startswith("rgba"):
-            floats = parseFloats(val[5:-1])
-            if len(floats) == 4:
-                log.warn(
-                    "opacity in rgba is ignored, \
-                              use stroke-opacity/fill-opacity instead"
-                )
-                return rgb_to_hex(tuple(floats[:3]))
-        elif val.startswith("rgb"):
-            floats = parseFloats(val[4:-1])
-            if len(floats) == 3:
-                return rgb_to_hex(tuple(floats))
-        elif val == "none":
-            # 'none' means the geometry is not to be filled or stroked
-            # http://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint
-            return "none"
-        elif val.startswith("hsl"):
-            log.warn("hsl/hsla color spaces are not supported")
-        elif val.startswith("url"):
-            # same document references are taken apart in colorAttrib
-            log.warn("only same document url(#id) paint references are supported")
-        elif val in css3_names_to_hex:  # named colors
-            return css3_names_to_hex[val]
-        elif val in ["currentColor", "inherit"]:
-            return "inherit"
-        else:
-            log.warn("invalid color, skipped: " + str(val))
-            return "inherit"

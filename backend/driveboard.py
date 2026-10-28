@@ -1,5 +1,6 @@
 # -*- coding: UTF-8 -*-
 import base64
+import collections
 import contextlib
 import copy
 import datetime
@@ -8,6 +9,7 @@ import io
 import itertools
 import json
 import math
+import os
 import platform
 import sys
 import threading
@@ -17,12 +19,7 @@ import serial
 import serial.tools.list_ports
 from config import conf, write_config_fields
 from jobtime import JobTimer
-
-if not conf["mill_mode"]:
-    try:
-        from PIL import Image
-    except ImportError:
-        print("Pillow module missing, raster mode will fail.")
+from PIL import Image
 
 __author__ = "Stefan Hechenberger <stefan@nortd.com>"
 
@@ -244,6 +241,43 @@ markers_rx = {
     "k": "INFO_DEBUG",
 }
 
+# stop error marker -> (status stops key, what to print)
+STOP_MARKERS = {
+    ERROR_LIMIT_HIT_X1: ("x1", None),
+    ERROR_LIMIT_HIT_X2: ("x2", None),
+    ERROR_LIMIT_HIT_Y1: ("y1", None),
+    ERROR_LIMIT_HIT_Y2: ("y2", None),
+    ERROR_LIMIT_HIT_Z1: ("z1", None),
+    ERROR_LIMIT_HIT_Z2: ("z2", None),
+    ERROR_SERIAL_STOP_REQUEST: ("requested", "INFO firmware: stop request"),
+    ERROR_RX_BUFFER_OVERFLOW: ("buffer", "ERROR firmware: rx buffer overflow"),
+    ERROR_INVALID_MARKER: ("marker", "ERROR firmware: invalid marker"),
+    ERROR_INVALID_DATA: ("data", "ERROR firmware: invalid data"),
+    ERROR_INVALID_COMMAND: ("command", "ERROR firmware: invalid command"),
+    ERROR_INVALID_PARAMETER: ("parameter", "ERROR firmware: invalid parameter"),
+    ERROR_TRANSMISSION_ERROR: ("transmission", "ERROR firmware: transmission"),
+    ERROR_SERIAL_WATCHDOG: ("watchdog", "ERROR firmware: serial watchdog (host comms lost)"),
+}
+LIMIT_STOPS = {"x1", "x2", "y1", "y2", "z1", "z2"}
+# Stops with an obvious cause: someone asked for it, or the head ran into a
+# limit. Every other one is a fault worth a record.
+EXPLAINED_STOPS = {"requested"} | LIMIT_STOPS
+# Status the controller only reports in a super frame.
+SUPER_STATUS = ("offset", "firmver", "feedrate", "intensity", "duration", "pixelwidth")
+# How close to the origin a homing cycle leaves the head, in mm: the origin
+# move lands on a whole step, half a step off at most.
+HOMED_AT_ORIGIN = 0.1
+
+# Unexplained stops are logged here, in the config directory, the newest last.
+INCIDENTS_FILE = "incidents.jsonl"
+INCIDENTS_KEEP = 50
+
+
+def _hexlog(ring):
+    """Bytes as hex, control bytes bracketed so commands stand out."""
+    return " ".join(f"[{b:02x}]" if b < 32 else f"{b:02x}" for b in ring)
+
+
 SerialLoop = None
 fallback_msg_thread = None
 # One job goes onto the wire at a time, see job(). _dispatch_thread is the
@@ -311,6 +345,44 @@ class SerialLoopClass(threading.Thread):
         # Idle is reported only with an empty rx buffer, the one proof the
         # tally has drained.
         self.last_firmware_idle = 0.0
+        # Kept free on top of a chunk. A stall resync zeroes the tally while
+        # the controller may hold up to 15 bytes read but not yet acked (it
+        # acks every 16, firmware/src/serial.c), so the tally can later run
+        # that far low. The margin keeps such a drift from overflowing.
+        self.FIRMBUF_MARGIN = 16
+        # CMD_RESUME resets the controller's rx buffer when it arrives, not
+        # when sent: acks and status frames already in the pipe still describe
+        # the old buffer. Hold sends and ignore those for a little longer than
+        # the pipe takes to empty (255 doubled bytes ~90ms, plus USB latency).
+        self.RESUME_SETTLE = 0.25  # seconds
+        self.resume_settle_until = 0.0
+        # The controller rebooted under a live session, see _controller_reset.
+        # Stands as a stop until the machine is homed.
+        self.controller_reset = False
+        # Whether the head position is known. Only a homing cycle seen through
+        # to its end proves it, see _track_frame. A limit hit loses it again,
+        # the gantry coasts on past the switch after the dead stop, and so does
+        # a controller reset. Unknown at start, the controller may have been
+        # running since before this app.
+        self.homed = False
+        self.homing_pending = False  # CMD_HOMING sent, the cycle not over yet
+        self.homing_ran = False  # a busy frame came from the cycle
+        # Status frames received since bytes last went out. The first may have
+        # left the controller before those bytes arrived, only from the second
+        # on does an idle frame prove they have been consumed.
+        self.frames_since_write = 0
+        self._frame_idle = False
+        self._frame_super = False
+        # What went over the wire last and the anomalies counted, for the
+        # incident record written when an unexplained stop shows up.
+        self.tx_log = collections.deque(maxlen=64)
+        self.rx_log = collections.deque(maxlen=64)
+        self.acks_after_resume = 0
+        self.hello_midsession = 0
+        self.negative_tally_clamps = 0
+        self.last_resume_t = 0.0
+        self.stop_episode = False  # a stop was seen since the last resume
+        self.incident = None  # summary of the latest incident
         # The controller stops itself when it hears nothing for this long
         # (its serial watchdog, firmware/src/serial.c). A gap past the stall
         # mark means it has stopped, or is about to.
@@ -362,6 +434,8 @@ class SerialLoopClass(threading.Thread):
         self.lock = threading.Lock()
 
     def reset_status(self):
+        # the offset is back to 0.0 below until a super frame reports it
+        self.offset_stale = True
         self._status = {
             "ready": False,  # is hardware idle (and not stop mode)
             "serial": False,  # is serial connected
@@ -417,6 +491,8 @@ class SerialLoopClass(threading.Thread):
         if self.discard_writes:
             return  # stopped, see discard_writes
         self._guard_foreign_write()
+        if command in (CMD_OFFSET_RESTORE, CMD_HOMING):
+            self.offset_stale = True  # see _track_frame
         self.tx_buffer.append(ord(command))
         # Do not admit a job on the strength of a status frame from before
         # this command was queued. Firmware idle will set ready again after
@@ -438,6 +514,8 @@ class SerialLoopClass(threading.Thread):
         if num < 0 or num > (1 << 28) - 1:
             print(f"WARN: param {param} value {val} out of range, clamping")
             num = max(0, min(num, (1 << 28) - 1))
+        if param in (PARAM_OFFSET_X, PARAM_OFFSET_Y, PARAM_OFFSET_Z):
+            self.offset_stale = True  # see _track_frame
         char0 = (num & 127) + 128
         char1 = ((num & (127 << 7)) >> 7) + 128
         char2 = ((num & (127 << 14)) >> 14) + 128
@@ -527,19 +605,31 @@ class SerialLoopClass(threading.Thread):
         if conf["print_serial_data"] and chunk != b"":
             timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
             print(timestamp + " Receiving: " + prettify_serial(chunk, markers=markers_rx))
+        self.rx_log.extend(chunk)
+        # see RESUME_SETTLE: what arrives now was sent before the resume landed
+        settling = time.time() < self.resume_settle_until
         for data_num in chunk:
             data_char = chr(data_num)
             if data_num < 32:  ### flow
                 if data_char == CMD_CHUNK_PROCESSED:
+                    if settling:
+                        self.acks_after_resume += 1
+                        continue  # acks bytes the resume already discarded
                     self.firmbuf_used -= self.TX_CHUNK_SIZE
                     self.last_tx_progress = time.time()
                     if self.firmbuf_used < 0:
-                        print("ERROR: firmware buffer tracking too low")
+                        # more acked than sent: the tally drifted, and a low
+                        # tally is the one that overflows the controller
+                        self.negative_tally_clamps += 1
+                        print("ERROR: firmware buffer tracking too low, clamping to 0")
+                        self.firmbuf_used = 0
                 elif data_char == STATUS_END:
                     # status frame complete, compile status
                     self._status, self._s = self._s, self._status  # flip
                     self._status["paused"] = self._paused
                     self._status["serial"] = bool(self.device)
+                    if self.controller_reset:
+                        self._status["stops"]["reset"] = True  # until homed
                     if self.job_size == 0:
                         self._status["progress"] = 1.0
                         self._status["remaining"] = [0.0, 0.0]
@@ -558,56 +648,29 @@ class SerialLoopClass(threading.Thread):
                     self._s["ready"] = False
                     self._s["underruns"] = self._status["underruns"]
                     self._s["stackclear"] = self._status["stackclear"]
+                    # only a super frame writes these, so the buffer about to
+                    # assemble has to start from the newest, not from its own
+                    # copy two frames old
+                    for key in SUPER_STATUS:
+                        self._s[key] = copy.copy(self._status[key])
+                    self.frames_since_write += 1
+                    self._track_frame()
+                    self._frame_idle = self._frame_super = False
             elif 31 < data_num < 65:  ### stop error markers
+                if settling:
+                    continue  # a frame from before the resume landed
                 # chr is in [!-@], process flag
-                if data_char == ERROR_LIMIT_HIT_X1:
-                    self._s["stops"]["x1"] = True
-                elif data_char == ERROR_LIMIT_HIT_X2:
-                    self._s["stops"]["x2"] = True
-                elif data_char == ERROR_LIMIT_HIT_Y1:
-                    self._s["stops"]["y1"] = True
-                elif data_char == ERROR_LIMIT_HIT_Y2:
-                    self._s["stops"]["y2"] = True
-                elif data_char == ERROR_LIMIT_HIT_Z1:
-                    self._s["stops"]["z1"] = True
-                elif data_char == ERROR_LIMIT_HIT_Z2:
-                    self._s["stops"]["z2"] = True
-                elif data_char == ERROR_SERIAL_STOP_REQUEST:
-                    self._s["stops"]["requested"] = True
-                    print("INFO firmware: stop request")
-                elif data_char == ERROR_RX_BUFFER_OVERFLOW:
-                    self._s["stops"]["buffer"] = True
-                    print("ERROR firmware: rx buffer overflow")
-                elif data_char == ERROR_INVALID_MARKER:
-                    self._s["stops"]["marker"] = True
-                    print("ERROR firmware: invalid marker")
-                elif data_char == ERROR_INVALID_DATA:
-                    self._s["stops"]["data"] = True
-                    print("ERROR firmware: invalid data")
-                elif data_char == ERROR_INVALID_COMMAND:
-                    self._s["stops"]["command"] = True
-                    print("ERROR firmware: invalid command")
-                elif data_char == ERROR_INVALID_PARAMETER:
-                    self._s["stops"]["parameter"] = True
-                    print("ERROR firmware: invalid parameter")
-                elif data_char == ERROR_TRANSMISSION_ERROR:
-                    self._s["stops"]["transmission"] = True
-                    print("ERROR firmware: transmission")
-                elif data_char == ERROR_SERIAL_WATCHDOG:
-                    self._s["stops"]["watchdog"] = True
-                    print("ERROR firmware: serial watchdog (host comms lost)")
-                else:
-                    print("ERROR: invalid stop error marker")
+                key, msg = STOP_MARKERS.get(data_char, (None, "ERROR: invalid stop error marker"))
+                if key:
+                    self._s["stops"][key] = True
+                if msg:
+                    print(msg)
+                if not self.stop_episode:
+                    self.stop_episode = True
+                    if key not in EXPLAINED_STOPS:
+                        self._record_incident(data_char, key or "unknown")
                 # in stop mode, print recent transmission, unless stop request, or limit
-                if (
-                    data_char != ERROR_SERIAL_STOP_REQUEST
-                    and data_char != ERROR_LIMIT_HIT_X1
-                    and data_char != ERROR_LIMIT_HIT_X2
-                    and data_char != ERROR_LIMIT_HIT_Y1
-                    and data_char != ERROR_LIMIT_HIT_Y2
-                    and data_char != ERROR_LIMIT_HIT_Z1
-                    and data_char != ERROR_LIMIT_HIT_Z2
-                ):
+                if key not in EXPLAINED_STOPS:
                     recent_data = self.tx_buffer[max(0, self.tx_pos - 128) : self.tx_pos]
                     print("RECENT TX BUFFER:")
                     for data_num in recent_data:
@@ -635,6 +698,7 @@ class SerialLoopClass(threading.Thread):
                     # only claimed with an empty rx buffer, so this proves the
                     # firmware consumed everything sent
                     self.last_firmware_idle = time.time()
+                    self._frame_idle = True
                     if not self.tx_buffer:
                         self._s["ready"] = True
                         # Only firmware idle proves its rx buffer and planner
@@ -692,6 +756,7 @@ class SerialLoopClass(threading.Thread):
                 # super status
                 elif data_char == INFO_OFFSET_X:
                     self._s["offset"][0] = num
+                    self._frame_super = True
                 elif data_char == INFO_OFFSET_Y:
                     self._s["offset"][1] = num
                 elif data_char == INFO_OFFSET_Z:
@@ -717,11 +782,120 @@ class SerialLoopClass(threading.Thread):
                     self.pdata_count += 1
                 else:
                     print("ERROR: invalid data")
+            elif data_char == INFO_HELLO:
+                self._controller_reset()
             else:
                 print(data_num)
                 print(data_char)
                 print("ERROR: invalid marker")
                 self.pdata_count = 0
+
+    def _controller_reset(self):
+        """The controller said hello again: it rebooted mid-session.
+
+        Brown-out, a reset button, a USB glitch toggling DTR. Whatever it was,
+        the controller lost its position, offsets and rx buffer, so the job on
+        the wire is gone and streaming the rest would run it at the wrong
+        place. Hold it in stop mode and stand a "reset" stop until homed.
+        """
+        print("ERROR: controller reset mid-session, job aborted, home the machine")
+        self.hello_midsession += 1
+        self.tx_buffer = bytearray()
+        self.tx_pos = 0
+        self.job_size = 0
+        self.timer.reset()
+        self.job_active = False
+        self._paused = False
+        self.firmbuf_used = 0  # a fresh controller has an empty rx buffer
+        self.pdata_count = 0
+        # cut off a job still being queued, as stop() does, until it exits
+        self.discard_writes = _dispatch_thread is not None
+        self.clear_discard_after_dispatch = self.discard_writes
+        self.request_stop = True
+        self.controller_reset = True
+        self.homed = self.homing_pending = False  # the position is gone too
+        self._status["stops"]["reset"] = True
+        self.stop_episode = True
+        self._record_incident(INFO_HELLO, "reset")
+        self.incident = "Controller rebooted, home the machine. " + self.incident
+
+    def _track_frame(self):
+        """Follow homing and the offset through the frame just completed.
+
+        Homed takes an idle, drained frame at the origin after a busy one. The
+        busy one has to come first because a frame from before CMD_HOMING
+        arrived can still be on its way in, idle wherever the head was. And
+        idle alone does not end the cycle: between two of its moves the
+        controller reports idle for the one stepper tick its planner is empty
+        while the stepper is still flagged as processing (homing_move in
+        firmware/src/stepper.c). The head then sits a back-off from a switch,
+        never on the origin, which only the origin move at the end reaches.
+
+        Limit stops are how every approach of the cycle ends, and a switch
+        still pressed during a back-off is reported as one too, so only other
+        stops abort it. Outside homing, a limit stop loses the position.
+        """
+        st = self._status
+        drained = st["ready"] and self.frames_since_write >= 2
+        if drained and self._frame_super:
+            self.offset_stale = False
+        if not self.homing_pending:
+            if LIMIT_STOPS & st["stops"].keys():
+                self.homed = False
+        elif st["stops"].keys() - LIMIT_STOPS:
+            self.homing_pending = False  # stopped, the cycle was abandoned
+        elif not self._frame_idle:
+            if not self.tx_buffer and self.frames_since_write >= 2:
+                self.homing_ran = True  # sent after CMD_HOMING went out
+        elif self.homing_ran and drained:
+            if max(abs(v) for v in st["pos"]) < HOMED_AT_ORIGIN:
+                self.homed, self.homing_pending = True, False
+
+    def _record_incident(self, code, label):
+        """Keep a record of an unexplained stop for someone to look at later.
+
+        Goes to incidents.jsonl in the config directory, the newest last, and
+        as a one line summary into the status.
+        """
+        now = time.time()
+        pos = self.tx_pos
+        record = {
+            "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "stop": label,
+            "code": code,
+            "job_active": self.job_active,
+            "tx_pos": pos,
+            "job_size": self.job_size,
+            "firmbuf_used": self.firmbuf_used,
+            # sent a raster data start with no end after it yet
+            "mid_raster": self.tx_buffer.rfind(16, 0, pos) > self.tx_buffer.rfind(17, 0, pos),
+            "since_resume": round(now - self.last_resume_t, 3) if self.last_resume_t else None,
+            "acks_after_resume": self.acks_after_resume,
+            "hello_midsession": self.hello_midsession,
+            "negative_tally_clamps": self.negative_tally_clamps,
+            "tx": _hexlog(self.tx_log),
+            "rx": _hexlog(self.rx_log),
+        }
+        summary = f"{label} stop at {record['time'][11:]}"
+        if self.job_size:
+            summary += f", job byte {pos}/{self.job_size}"
+        summary += f", buffer {self.firmbuf_used}"
+        if record["mid_raster"]:
+            summary += ", mid raster"
+        if record["since_resume"] is not None:
+            summary += f", {record['since_resume']}s after resume"
+        self.incident = summary + ". Details: /incidents"
+        path = os.path.join(conf["confdir"], INCIDENTS_FILE)
+        try:
+            lines = []
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fp:
+                    lines = fp.readlines()
+            lines.append(json.dumps(record) + "\n")
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.writelines(lines[-INCIDENTS_KEEP:])
+        except (OSError, TypeError) as e:
+            print(f"WARN: could not write {path}: {e}")
 
     def _catch_watchdog_stall(self):
         """Pre-empt a serial-watchdog stop this host provoked by going quiet.
@@ -771,8 +945,7 @@ class SerialLoopClass(threading.Thread):
             self.request_stop = False
 
         if self.request_resume:
-            self._send_char(CMD_RESUME)
-            self.firmbuf_used = 0  # a resume resets the hardware's rx buffer
+            self._send_resume()
             self.request_resume = False
             self.reset_status()
             self.request_status = 2  # super request
@@ -781,8 +954,7 @@ class SerialLoopClass(threading.Thread):
             # Same command, but the machine kept position and settings through
             # the watchdog stop, so the cached status stays valid and is left
             # standing. Only the stop flag goes.
-            self._send_char(CMD_RESUME)
-            self.firmbuf_used = 0  # a resume resets the hardware's rx buffer
+            self._send_resume()
             self.request_watchdog_resume = False
             self._s["stops"].pop("watchdog", None)
             self._status["stops"].pop("watchdog", None)
@@ -801,8 +973,10 @@ class SerialLoopClass(threading.Thread):
             self.request_unpause = False
         ### send buffer chunk
         if self.tx_buffer and len(self.tx_buffer) > self.tx_pos:
-            if not self._paused:
-                if (self.FIRMBUF_SIZE - self.firmbuf_used) > self.TX_CHUNK_SIZE:
+            if not self._paused and time.time() >= self.resume_settle_until:
+                if (
+                    self.FIRMBUF_SIZE - self.firmbuf_used
+                ) > self.TX_CHUNK_SIZE + self.FIRMBUF_MARGIN:
                     self.last_tx_progress = time.time()
                     assumedSent = 0  # bytes that made it out; stays 0 on failure
                     try:
@@ -831,6 +1005,8 @@ class SerialLoopClass(threading.Thread):
                             print("ERROR: write did not complete")
                         else:
                             assumedSent = expectedSent
+                            self.frames_since_write = 0
+                            self.tx_log.extend(to_send[::2])  # undoubled
                             self.firmbuf_used += assumedSent
                             if self.firmbuf_used > self.FIRMBUF_SIZE:
                                 print("ERROR: firmware buffer tracking too high")
@@ -860,7 +1036,15 @@ class SerialLoopClass(threading.Thread):
                 self.tx_pos = 0
                 self.timer.reset()
 
+    def _send_resume(self):
+        self._send_char(CMD_RESUME)
+        self.firmbuf_used = 0  # a resume resets the hardware's rx buffer
+        self.last_resume_t = time.time()
+        self.resume_settle_until = self.last_resume_t + self.RESUME_SETTLE
+        self.stop_episode = False
+
     def _send_char(self, char):
+        self.tx_log.append(ord(char))
         try:
             t_prewrite = time.time()
             self.last_tx_time = t_prewrite  # feeds the firmware watchdog
@@ -1231,6 +1415,13 @@ def status():
         with SerialLoop.lock:
             stats = copy.deepcopy(SerialLoop._status)
             stats["serial"] = connected()  # make sure serial flag is up-to-date
+            if SerialLoop.incident:
+                stats["incident"] = SerialLoop.incident
+            stats["homed"] = SerialLoop.homed
+            stats["homing"] = SerialLoop.homing_pending
+            stats["offset_settled"] = not SerialLoop.offset_stale
+            # ready, and from a frame sent after the last bytes went out
+            stats["drained"] = stats["ready"] and SerialLoop.frames_since_write >= 2
         return stats
     else:
         return {"serial": False, "ready": False}
@@ -1251,6 +1442,9 @@ def homing():
         # goes out ahead of it, to recover from a stop mode
         SerialLoop.send_command(CMD_HOMING)
         SerialLoop.request_resume = True
+        SerialLoop.controller_reset = False  # homing is what a reset asks for
+        SerialLoop.homed = SerialLoop.homing_ran = False
+        SerialLoop.homing_pending = True
 
 
 def _clamp_param(name, val, lo, hi):
@@ -1602,6 +1796,9 @@ def job(jobdict):
             if "defs" not in jobdict:
                 print("ERROR: invalid job")
                 return
+            if not conf["mill_mode"]:
+                # a laser would fire the spindle S word as beam power, on during seeks
+                raise ValueError("mill job refused: mill_mode is off")
             job_mill_validate(jobdict)
         else:
             if "defs" not in jobdict or "items" not in jobdict:
@@ -1825,6 +2022,60 @@ def job_laser_validate(jobdict):
                             absolute_motion_seen = True
 
 
+def job_outside_work_area(jobdict):
+    """
+    Check every item of a job (passes are not needed) against the work area.
+
+    Returns None if all points fit, else a short description of the first
+    excess like "x 1450 > 1220 mm". Limits are in offset coordinates, as in
+    job_laser_validate; a mill job's moves are in machine coordinates, as in
+    job_mill_validate.
+    """
+    global SerialLoop
+
+    if jobdict.get("head", {}).get("kind") == "mill":
+        points = (
+            item[1] for def_ in jobdict["defs"] for item in def_["data"] if item[0] in ("G0", "G1")
+        )
+        limits = [(i, axis, 0, conf["workspace"][i]) for i, axis in enumerate("xyz")]
+        return _first_outside(points, limits)
+    if SerialLoop is None:
+        offsets = [0.0, 0.0, 0.0]  # no machine, no job origin
+    else:
+        with SerialLoop.lock:
+            offsets = list(SerialLoop._status["offset"])
+    limits = []  # (i, axis, lo, hi)
+    for i, axis in enumerate("xyz"):
+        if i < 2 or conf["workspace"][2]:
+            limits.append((i, axis, -offsets[i], conf["workspace"][i] - offsets[i]))
+
+    def points():
+        for item in jobdict["items"]:
+            def_ = jobdict["defs"][item["def"]]
+            if def_["kind"] == "image":
+                pos, size = def_["pos"], def_["size"]
+                yield from (pos[:2], [pos[0] + size[0], pos[1] + size[1]])
+            else:
+                yield from (pos for polyline in def_["data"] for pos in polyline)
+
+    return _first_outside(points(), limits)
+
+
+def _first_outside(points, limits):
+    """The first coordinate beyond its (i, axis, lo, hi) limit, or None.
+    Missing and None coordinates (an axis a move leaves alone) are skipped."""
+    for point in points:
+        for i, axis, lo, hi in limits:
+            v = point[i] if i < len(point) else None
+            if v is None:
+                continue
+            if v < lo:
+                return f"{axis} {round(v)} < {round(lo)} mm"
+            if v > hi:
+                return f"{axis} {round(v)} > {round(hi)} mm"
+    return None
+
+
 def _emit_raster_segment(orientation, seekrate, feedrate_, intensity_, exit_y=None):
     """Stream one raster segment: seek to lead-in, ramp in, raster move with
     pixel data, ramp out. `orientation` describes one engraving direction of a
@@ -1839,6 +2090,13 @@ def _emit_raster_segment(orientation, seekrate, feedrate_, intensity_, exit_y=No
     exit_y ends the lead-out on the next segment's scanline instead of this
     one, see _raster_exit_y. The beam is already off by then, so the tilt only
     changes where the head comes to rest.
+
+    The lead-out goes ahead of the pixel data, the order serial_raster_read in
+    firmware/src/serial.c relies on. The controller reads no command while
+    raster data streams, and that lasts until the raster move has run, so a
+    lead-out sent after the data is planned only once the head has already
+    stopped dead at full speed at the end of the line. Sent first, it is in the
+    planner while the raster move runs and the move carries straight on into it.
     """
     line_y = orientation["line_y"]
     intensity(0.0)  # intensity for seek and lead-in
@@ -1848,9 +2106,9 @@ def _emit_raster_segment(orientation, seekrate, feedrate_, intensity_, exit_y=No
     move(orientation["start"], line_y)  # lead-in
     intensity(intensity_)  # intensity for raster move
     rastermove(orientation["end"], line_y)  # raster move
-    rasterdata(orientation["data"], orientation["lo"], orientation["hi"])  # stream raster data
     intensity(0.0)  # intensity for lead-out
     move(orientation["leadout"], line_y if exit_y is None else exit_y)  # lead-out
+    rasterdata(orientation["data"], orientation["lo"], orientation["hi"])  # stream raster data
 
 
 # How far off its own scanline a lead-out may finish, as a fraction of the x
@@ -3146,7 +3404,8 @@ def job_mill_validate(jobdict):
     message on the first out-of-bounds move.
 
     NOTE: the Z bound is conf["workspace"][2]; a mill must configure a non-zero Z
-    work-area dimension for any Z move to validate.
+    work-area dimension for any Z move to validate. Unlike a laser job, Z is not
+    skipped when it is 0: move() sends Z and every firmware board steps it.
     """
     limits = conf["workspace"]
     axes = ("x", "y", "z")
@@ -3157,6 +3416,8 @@ def job_mill_validate(jobdict):
                 target = item[1]
                 for i, axis in enumerate(axes):
                     val = target[i]
+                    if val is None:
+                        continue  # axis never set: move() does not send it
                     if val < 0 or val > limits[i]:
                         raise ValueError(
                             f"def {defidx}: {item[0]} {axis}={val} beyond "
@@ -3190,6 +3451,8 @@ def job_mill(jobdict):
     if "defs" not in jobdict:
         print("ERROR: invalid job")
         return
+    if not conf["mill_mode"]:
+        raise ValueError("mill job refused: mill_mode is off")
     # raises ValueError if any move falls outside the work area
     job_mill_validate(jobdict)
     # prime job

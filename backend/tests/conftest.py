@@ -33,6 +33,18 @@ def library_dir():
     return LIBRARY_DIR
 
 
+@pytest.fixture(autouse=True)
+def _incidents_elsewhere(tmp_path_factory, monkeypatch):
+    """Keep the serial loop's incident log (incidents.jsonl) out of the
+    developer's real config directory. Any test feeding a stop marker would
+    otherwise append to it."""
+    from config import conf
+
+    path = tmp_path_factory.getbasetemp() / "confdir"
+    path.mkdir(exist_ok=True)
+    monkeypatch.setitem(conf, "confdir", str(path))
+
+
 @pytest.fixture
 def isolated_config(tmp_path):
     """Point config.conf at throwaway conf/stor directories.

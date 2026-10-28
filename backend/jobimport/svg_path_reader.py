@@ -35,6 +35,12 @@ class SVGPathReader:
         # http://www.w3.org/TR/SVG11/paths.html#PathData
         # Store the color to use for paths added during this call
         self._current_color = color if color else node.get("stroke")
+        # a fill in its stroke's colour traces the same outline: one cut, and
+        # not a stacked copy for dedupe to report
+        drawn = node.setdefault("drawn", set())
+        if (id(d), self._current_color) in drawn:
+            return
+        drawn.add((id(d), self._current_color))
         self._current_node = node
 
         def _matrixExtractScale(mat):
@@ -82,6 +88,9 @@ class SVGPathReader:
             cmd = _getNext(d, idx)
             if cmd is None:
                 break
+            if not subpath and cmd in ("L", "l", "H", "h", "V", "v"):
+                # after closepath a lineto starts a new subpath at the current point
+                subpath.append([x, y])
             if cmd == "M":  # moveto absolute
                 # start new subpath
                 if subpath:
@@ -222,6 +231,8 @@ class SVGPathReader:
                     subpath.append([x3, y3])
                     x = x3
                     y = y3
+                    xPrevCp = x2
+                    yPrevCp = y2
             elif cmd == "q":  # curveto quadratic relative
                 while _nextIsNum(d, idx, 4):
                     x2 = x + _getNext(d, idx)
@@ -233,6 +244,8 @@ class SVGPathReader:
                     subpath.append([x3, y3])
                     x = x3
                     y = y3
+                    xPrevCp = x2
+                    yPrevCp = y2
             elif cmd == "T":  # curveto quadratic absolute shorthand
                 while _nextIsNum(d, idx, 2):
                     if cmdPrev in "QqTt":
@@ -382,6 +395,13 @@ class SVGPathReader:
         # plus some recursive sugar for incrementally refining the
         # arc resolution until the requested tolerance is met.
         # http://www.w3.org/TR/SVG/implnote.html#ArcImplementationNotes
+        rx = abs(rx)
+        ry = abs(ry)
+        if rx == 0 or ry == 0:
+            # F.6.2: a zero radius makes the arc a straight line
+            subpath.append([x1, y1])
+            subpath.append([x2, y2])
+            return
         phi = phi / 360.0 * 2 * math.pi
         cp = math.cos(phi)
         sp = math.sin(phi)
@@ -389,6 +409,11 @@ class SVGPathReader:
         dy = 0.5 * (y1 - y2)
         x_ = cp * dx + sp * dy
         y_ = -sp * dx + cp * dy
+        lam = (x_ / rx) ** 2 + (y_ / ry) ** 2
+        if lam > 1:
+            # F.6.6: radii too small for the endpoints, scale them up
+            rx *= math.sqrt(lam)
+            ry *= math.sqrt(lam)
         r2 = ((rx * ry) ** 2 - (rx * y_) ** 2 - (ry * x_) ** 2) / ((rx * y_) ** 2 + (ry * x_) ** 2)
         if r2 < 0:
             r2 = 0

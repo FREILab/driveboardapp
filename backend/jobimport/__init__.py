@@ -6,6 +6,7 @@ itself. This only names what the rest of the app uses.
 """
 
 from .converter import (
+    UnknownFileType,
     apply_alignment_matrix,
     convert,
     get_type,
@@ -21,6 +22,7 @@ __author__ = "Stefan Hechenberger <stefan@nortd.com>"
 
 __all__ = [
     "COORD_DECIMALS",
+    "UnknownFileType",
     "apply_alignment_matrix",
     "convert",
     "dedupe_job",

@@ -90,7 +90,6 @@ static volatile bool stop_requested;          // when set to true stepper interr
 static volatile uint8_t stop_status;          // yields the reason for a stop request
 static volatile bool paused;                  // when set, stepping is frozen (beam off) but block buffer/position are retained, so motion can resume exactly
 static volatile uint8_t resume_state;         // 0 none, 1 ramp requested, 2 ramping. eases the speed back up after a pause
-static uint32_t resume_rate_target;           // rate to ramp back up to when resuming from a pause
 static volatile uint8_t disable_limits;       // option to disable limts for homing cycle
 
 #if PWM_MODE == SYNCED_FREQ
@@ -107,7 +106,7 @@ static void adjust_speed( uint32_t steps_per_minute );
 static void adjust_beam_dynamics( uint32_t steps_per_minute );
 static uint32_t config_step_timer(uint32_t cycles);
 static void homing_delimit();
-static void homing_move(double xfar, double yfar, double zfar,
+static bool homing_move(double xfar, double yfar, double zfar,
                         double xback, double yback, double zback,
                         double feedrate);
 
@@ -171,6 +170,7 @@ void stepper_stop_processing() {
   // abandoning one part way would carry the remaining count into the next
   // dwell, which would then burn for the wrong time at the wrong tick rate.
   dwell_counter = 0;
+  resume_state = 0;  // the buffer ran dry or was flushed, the next move plans from rest
   // Disable stepper driver interrupt
   TIMSK1 &= ~(1<<OCIE1A);
   control_laser_intensity(0);
@@ -385,6 +385,10 @@ ISR(TIMER1_COMPA_vect) {
     return;
   }
   STEPPING_PORT = (STEPPING_PORT & ~STEPPING_MASK) | out_bits;
+  // each step is pulsed once. Only line blocks set new step bits, so a
+  // dwell or assist block after a line would otherwise repeat its last step
+  // on every tick. The direction bits stay, so no spurious direction change.
+  out_bits &= ~STEPPING_MASK;
   // prime for reset pulse in CONFIG_PULSE_MICROSECONDS
   TCNT2 = -(((CONFIG_PULSE_MICROSECONDS-2)*CYCLES_PER_MICROSECOND) >> 3); // Reload timer counter
   TCCR2B = (1<<CS21); // Begin timer2. Full speed, 1/8 prescaler
@@ -407,7 +411,13 @@ ISR(TIMER1_COMPA_vect) {
     }
     if (current_block->type == TYPE_LINE || current_block->type == TYPE_RASTER_LINE) {
       // starting on new line block
-      adjusted_rate = current_block->initial_rate;
+      if (resume_state == 2 && adjusted_rate < current_block->initial_rate) {
+        // still easing up after a pause: carry on from the actual speed
+        // rather than step up to the planned junction speed
+      } else {
+        adjusted_rate = current_block->initial_rate;
+        if (resume_state == 2) { resume_state = 0; }  // back on the plan
+      }
       acceleration_tick_counter = CYCLES_PER_ACCELERATION_TICK/2; // start halfway, midpoint rule.
       if (current_block->type == TYPE_RASTER_LINE) {
         // reset before the beam dynamics call below reads them
@@ -419,7 +429,6 @@ ISR(TIMER1_COMPA_vect) {
       counter_y = counter_x;
       counter_z = counter_x;
       step_events_completed = 0;
-      resume_state = 0;  // new block starts at initial_rate, no resume ramp
     }
   }
 
@@ -472,23 +481,28 @@ ISR(TIMER1_COMPA_vect) {
       if (step_events_completed < current_block->step_event_count) {  // block not finished
 
         if (resume_state == 1) {
-          // resuming from a pause: drop to the block's start rate, then ramp
-          // back up to the pre-pause rate rather than jumping there directly
-          resume_rate_target = adjusted_rate;
-          adjusted_rate = current_block->initial_rate;
-          if (adjusted_rate > resume_rate_target) {
-            adjusted_rate = resume_rate_target;
-          }
+          // resuming from a pause: the head is at rest wherever in the block
+          // it stopped, so the planned profile no longer applies. Ramp from
+          // rest (adjust_speed clamps to MINIMUM_STEPS_PER_MINUTE).
+          adjusted_rate = 0;
           acceleration_tick_counter = CYCLES_PER_ACCELERATION_TICK/2;
           adjust_laser_speed_beam_dynamics( adjusted_rate );
           resume_state = 2;
         } else if (resume_state == 2) {
-          // ramping back up to the pre-pause rate
+          // own trapezoid for the rest of the block: accelerate toward
+          // nominal_rate, capped by the speed from which the remaining steps
+          // still brake to final_rate (v^2 = vf^2 + 2*a*steps_left)
           if ( acceleration_tick() ) {
             adjusted_rate += current_block->rate_delta;
-            if (adjusted_rate >= resume_rate_target) {
-              adjusted_rate = resume_rate_target;
-              resume_state = 0;
+            if (adjusted_rate > current_block->nominal_rate) {
+              adjusted_rate = current_block->nominal_rate;
+            }
+            float final_rate = current_block->final_rate;
+            uint32_t brake_rate = sqrt( final_rate*final_rate +
+                2.0*current_block->rate_delta*ACCELERATION_TICKS_PER_SECOND*60 *
+                (current_block->step_event_count - step_events_completed) );
+            if (adjusted_rate > brake_rate) {
+              adjusted_rate = brake_rate;
             }
             adjust_laser_speed_beam_dynamics( adjusted_rate );
           }
@@ -589,25 +603,15 @@ ISR(TIMER1_COMPA_vect) {
       break;
 
     case TYPE_AIR_ASSIST_ENABLE:
-      control_air_assist(true);
-      current_block = NULL;
-      planner_discard_current_block();
-      break;
-
     case TYPE_AIR_ASSIST_DISABLE:
-      control_air_assist(false);
+      control_air_assist(current_block->type == TYPE_AIR_ASSIST_ENABLE);
       current_block = NULL;
       planner_discard_current_block();
       break;
 
     case TYPE_AUX_ASSIST_ENABLE:
-      control_aux_assist(true);
-      current_block = NULL;
-      planner_discard_current_block();
-      break;
-
     case TYPE_AUX_ASSIST_DISABLE:
-      control_aux_assist(false);
+      control_aux_assist(current_block->type == TYPE_AUX_ASSIST_ENABLE);
       current_block = NULL;
       planner_discard_current_block();
       break;
@@ -698,7 +702,6 @@ inline void adjust_beam_dynamics( uint32_t steps_per_minute ) {
         (PWM_MODE == STATIC_FREQ_PD5) || (PWM_MODE == STATIC_FREQ_PD6)
       uint8_t adjusted_intensity = current_block->nominal_laser_intensity *
                                    ((float)steps_per_minute/(float)current_block->nominal_rate);
-      adjusted_intensity = max(adjusted_intensity, 0);
     #elif PWM_MODE == SYNCED_FREQ
       uint8_t adjusted_intensity = current_block->nominal_laser_intensity *
                      (CONFIG_BEAMDYNAMICS_START + (1.0-CONFIG_BEAMDYNAMICS_START)*
@@ -711,7 +714,8 @@ inline void adjust_beam_dynamics( uint32_t steps_per_minute ) {
 }
 
 
-inline void homing_move(double xfar, double yfar, double zfar,
+// Returns false, leaving any stop set, when homing has to be abandoned.
+inline bool homing_move(double xfar, double yfar, double zfar,
                         double xback, double yback, double zback,
                         double feedrate) {
   // wait until planner buffer empty and executed
@@ -723,6 +727,18 @@ inline void homing_move(double xfar, double yfar, double zfar,
   planner_line(xfar, yfar, zfar, feedrate, 0, 0.0);
   // wait for limit hit
   while(stepper_processing()) { protocol_idle(); }
+  // A limit hit is the only normal end of the approach. Any other stop (user,
+  // watchdog, ...) must stay set, not be resumed into a back-off with the
+  // limits disabled and the remaining axes. No stop at all (resumed part way)
+  // found no limit either.
+  switch (stepper_stop_status()) {
+    case STOPERROR_LIMIT_HIT_X1: case STOPERROR_LIMIT_HIT_X2:
+    case STOPERROR_LIMIT_HIT_Y1: case STOPERROR_LIMIT_HIT_Y2:
+    case STOPERROR_LIMIT_HIT_Z1: case STOPERROR_LIMIT_HIT_Z2:
+      break;
+    default:
+      return false;
+  }
   // reset, relative moves
   planner_set_position(0.0, 0.0, 0.0);
   clear_vector(stepper_position);
@@ -733,6 +749,7 @@ inline void homing_move(double xfar, double yfar, double zfar,
   // wait for move to finish
   while(stepper_processing()) { protocol_idle(); }
   disable_limits = false;
+  return !stepper_stop_requested();  // stopped during the back-off
 }
 
 
@@ -770,7 +787,7 @@ inline void homing_delimit() {
 }
 
 
-inline void stepper_homing_cycle() {
+inline bool stepper_homing_cycle() {
   // homing direction
   #if (CONFIG_INVERT_X_HOMING == 1)
     double xdir = -1.0;
@@ -798,16 +815,17 @@ inline void stepper_homing_cycle() {
   // execute homing moves
   #ifdef ENABLE_3AXES
     // z-axis, first for save retract
-    homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 10.0*zdir, 0.4*CONFIG_SEEKRATE);
-    homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 4.0*zdir, 0.1*CONFIG_SEEKRATE);
+    if (!homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 10.0*zdir, 0.4*CONFIG_SEEKRATE)) { return false; }
+    if (!homing_move(0.0, 0.0, -999999*zdir, 0.0, 0.0, 4.0*zdir, 0.1*CONFIG_SEEKRATE)) { return false; }
   #endif
   // x-axis
-  homing_move(-999999*xdir, 0.0, 0.0, 10.0*xdir, 0.0, 0.0, 0.4*CONFIG_SEEKRATE);
-  homing_move(-999999*xdir, 0.0, 0.0, 4.0*xdir, 0.0, 0.0, 0.1*CONFIG_SEEKRATE);
+  if (!homing_move(-999999*xdir, 0.0, 0.0, 10.0*xdir, 0.0, 0.0, 0.4*CONFIG_SEEKRATE)) { return false; }
+  if (!homing_move(-999999*xdir, 0.0, 0.0, 4.0*xdir, 0.0, 0.0, 0.1*CONFIG_SEEKRATE)) { return false; }
   // y-axis
-  homing_move(0.0, -999999*ydir, 0.0, 0.0, 10.0*ydir, 0.0, 0.4*CONFIG_SEEKRATE);
-  homing_move(0.0, -999999*ydir, 0.0, 0.0, 4.0*ydir, 0.0, 0.1*CONFIG_SEEKRATE);
+  if (!homing_move(0.0, -999999*ydir, 0.0, 0.0, 10.0*ydir, 0.0, 0.4*CONFIG_SEEKRATE)) { return false; }
+  if (!homing_move(0.0, -999999*ydir, 0.0, 0.0, 4.0*ydir, 0.0, 0.1*CONFIG_SEEKRATE)) { return false; }
 
   planner_set_position(0.0, 0.0, 0.0);
   clear_vector(stepper_position);
+  return true;
 }

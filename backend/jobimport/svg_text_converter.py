@@ -14,6 +14,9 @@ import platform
 import re
 import xml.etree.ElementTree as ET
 
+from . import issues
+from .svg_attribute_reader import element_label, parse_color, report_alpha
+
 log = logging.getLogger("svg_text_converter")
 
 # Try to import pathops for removing overlapping contours
@@ -25,25 +28,11 @@ except ImportError:
     PATHOPS_AVAILABLE = False
     log.debug("pathops not available, overlapping contours won't be removed")
 
-# Global list to collect warnings during conversion
-# This is reset at the start of each convert_text_to_paths call
-_conversion_warnings = []
-
+# cut settings text (=pass1:...=) is read by the tag reader, not outlined
+_re_lasertag = re.compile(r"=pass[0-9]+:")
 # a text element, with or without a namespace prefix, matched against the raw
 # document so one with none never has to be parsed and reserialized
 _re_text_element = re.compile(r"<\s*(?:[\w.-]+:)?(?:text|tspan)[\s/>]")
-
-
-def get_conversion_warnings():
-    """Get the list of warnings from the last conversion."""
-    return _conversion_warnings.copy()
-
-
-def _add_warning(message):
-    """Add a warning message."""
-    if message not in _conversion_warnings:
-        _conversion_warnings.append(message)
-        log.warning(message)
 
 
 # SVG namespace
@@ -254,7 +243,12 @@ class FontManager:
 
             # Warn if this is a specific font that wasn't found
             if font_family.lower() not in generic_families:
-                _add_warning(f"Font '{font_family}' not found, using '{fallback_name}' instead")
+                issues.report(
+                    f'Font "{font_family}" missing',
+                    f"{fallback_name.upper()} USED",
+                    "replaced",
+                    "Convert text to path",
+                )
 
             log.debug(f"Using fallback font: {fallback_path}")
             return fallback_path
@@ -589,9 +583,6 @@ def convert_text_to_paths(svg_string):
         Modified SVG content with text converted to paths,
         or the original svg_string if conversion fails.
     """
-    global _conversion_warnings
-    _conversion_warnings = []  # Reset warnings for this conversion
-
     # Ensure we're working with a string
     is_bytes = isinstance(svg_string, bytes)
     if is_bytes:
@@ -601,12 +592,6 @@ def convert_text_to_paths(svg_string):
 
     if not _re_text_element.search(svg_str):
         log.debug("No text elements found in SVG")
-        return svg_string
-
-    try:
-        import fontTools.ttLib  # noqa: F401
-    except ImportError:
-        log.warning("fonttools not installed, text will not be converted to paths")
         return svg_string
 
     try:
@@ -632,6 +617,9 @@ def convert_text_to_paths(svg_string):
         parent_map = {child: parent for parent in root.iter() for child in parent}
 
         for text_elem in text_elements:
+            if _re_lasertag.search("".join(text_elem.itertext())):
+                continue
+            text_where = element_label("text", text_elem.get("id"))
             try:
                 # Get default styling from text element
                 font_family = get_style_attr(text_elem, "font-family", "sans-serif")
@@ -648,13 +636,26 @@ def convert_text_to_paths(svg_string):
                 # Find and load font
                 font_path = fm.find_font(font_family)
                 if not font_path:
-                    log.warning(f"Could not find font for family '{font_family}'")
+                    issues.report(
+                        f'Font "{font_family}" missing',
+                        "TEXT NOT CUT",
+                        "dropped",
+                        "Convert text to path",
+                        text_where,
+                    )
                     continue
 
                 log.info(f"Converting text with font '{font_family}' -> {font_path}")
 
                 font = fm.load_font(font_path)
                 if not font:
+                    issues.report(
+                        f'Font "{font_family}" missing',
+                        "TEXT NOT CUT",
+                        "dropped",
+                        "Convert text to path",
+                        text_where,
+                    )
                     continue
 
                 # Collect path data grouped by color
@@ -662,8 +663,7 @@ def convert_text_to_paths(svg_string):
                 path_groups = []
 
                 # Default color from text element
-                default_color = get_style_attr(text_elem, "fill", "#000000")
-                default_color = normalize_color(default_color)
+                default_color = _text_color(text_elem, text_where) or "#000000"
 
                 # Process direct text content of the text element
                 if text_elem.text and text_elem.text.strip():
@@ -691,11 +691,7 @@ def convert_text_to_paths(svg_string):
                             tspan_font_size = font_size
 
                         # Get tspan-specific color (falls back to parent's color)
-                        tspan_color = get_style_attr(child, "fill")
-                        if tspan_color:
-                            tspan_color = normalize_color(tspan_color)
-                        else:
-                            tspan_color = default_color
+                        tspan_color = _text_color(child, text_where, text_elem) or default_color
 
                         # Get tspan text content
                         tspan_text = child.text or ""
@@ -756,6 +752,13 @@ def convert_text_to_paths(svg_string):
 
             except Exception as e:
                 log.debug(f"Error converting text element: {e}")
+                issues.report(
+                    "Text conversion failed",
+                    "TEXT NOT CUT",
+                    "dropped",
+                    "Convert text to path",
+                    text_where,
+                )
                 continue
 
         if converted_count > 0:
@@ -769,6 +772,7 @@ def convert_text_to_paths(svg_string):
         log.warning(f"Failed to parse SVG: {e}")
         return svg_string
     except Exception as e:
+        issues.report("Text conversion failed", "TEXT NOT CUT", "dropped", "Convert text to path")
         log.warning(f"Failed to convert text to paths: {e}")
         return svg_string
 
@@ -783,53 +787,40 @@ def get_text_content(elem):
     return text
 
 
-def normalize_color(color):
+def normalize_color(color, where=None):
     """Convert a color value to a hex color code.
 
-    Handles:
-    - Hex colors (#rgb, #rrggbb)
-    - Named colors (red, blue, etc.)
-    - rgb() format
-
-    Args:
-        color: Color string in any supported format
-
     Returns:
-        Hex color code (e.g., '#ff0000') or '#000000' if conversion fails
+        Hex color code (e.g., '#ff0000') or '#000000' if conversion fails;
+        a color that is invalid or unsupported is reported against `where`.
     """
-    if not color or color == "none":
-        return "#000000"
-
-    color = color.strip().lower()
-
-    # Already a hex color
-    if color.startswith("#"):
-        # Handle 3-digit hex (#rgb -> #rrggbb)
-        if len(color) == 4:
-            return "#" + color[1] * 2 + color[2] * 2 + color[3] * 2
-        return color
-
-    # Try to convert named color to hex using webcolors
+    raw = (color or "").strip().lower()
     try:
-        from . import webcolors
+        color = parse_color(raw) if raw else None
+    except ValueError:
+        color = None
+    if raw and (color is None or (color == "inherit" and raw not in ("inherit", "currentcolor"))):
+        issues.report(
+            f'Invalid colour "{raw}"', "DEFAULT COLOUR", "changed", "Set a valid colour", where
+        )
+    elif raw:
+        report_alpha(raw, where)
+    return color if color and color.startswith("#") else "#000000"
 
-        return webcolors.name_to_hex(color)
-    except (ValueError, KeyError):
-        pass
 
-    # Handle rgb() format
-    if color.startswith("rgb(") and color.endswith(")"):
-        try:
-            rgb_str = color[4:-1]
-            parts = [p.strip() for p in rgb_str.split(",")]
-            if len(parts) == 3:
-                r, g, b = [int(p) for p in parts]
-                return f"#{r:02x}{g:02x}{b:02x}"
-        except ValueError:
-            pass
-
-    # Default to black
-    return "#000000"
+def _text_color(elem, where, parent=None):
+    """The colour an element's text is cut in: its fill, or its stroke when it
+    has no fill (stroke-only text); None when it sets neither. A tspan that
+    sets no fill of its own (`parent` is its text) keeps the fill it inherits."""
+    fill = get_style_attr(elem, "fill")
+    stroke = get_style_attr(elem, "stroke")
+    if fill is None and parent is not None:
+        parent_fill = get_style_attr(parent, "fill")
+        if parent_fill and parent_fill.strip().lower() != "none":
+            stroke = None
+    if (not fill or fill.strip().lower() == "none") and stroke and stroke.strip().lower() != "none":
+        return normalize_color(stroke, where)
+    return normalize_color(fill, where) if fill else None
 
 
 def get_style_attr(elem, attr_name, default=None):

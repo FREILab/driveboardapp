@@ -865,7 +865,8 @@ def test_gcode_reader_minimal():
     assert job["defs"][0]["data"], "expected motion actions recorded"
 
 
-def test_convert_gcode_via_dispatch():
+def test_convert_gcode_via_dispatch(monkeypatch):
+    monkeypatch.setitem(jobimport.converter.conf, "mill_mode", True)
     gcode = "T1 M6\nG0 X0 Y0\nG1 X5 Y5 F800\n"
     job = jobimport.convert(gcode)
     assert "defs" in job
@@ -1191,7 +1192,7 @@ def test_a_translate_with_no_y_moves_in_x_only():
     segments = [seg for d in job["defs"] if d["kind"] == "path" for seg in d["data"]]
     assert len(segments) == 2
     corners = sorted((min(p[0] for p in s), min(p[1] for p in s)) for s in segments)
-    assert corners == pytest.approx([(10.0, 10.0), (60.0, 10.0)])
+    assert [c for xy in corners for c in xy] == pytest.approx([10.0, 10.0, 60.0, 10.0])
 
 
 def test_dedupe_drops_a_stacked_copy_from_an_svg():

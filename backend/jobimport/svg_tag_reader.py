@@ -4,7 +4,8 @@ import hashlib
 import logging
 import re
 
-from .svg_attribute_reader import SVGAttributeReader
+from . import issues
+from .svg_attribute_reader import SVGAttributeReader, element_label
 from .svg_path_reader import SVGPathReader
 from .utilities import matrixMult, parseFloats, parsePreserveAspectRatio, viewboxMatrix
 
@@ -23,6 +24,8 @@ class SVGTagReader:
 
         self._handlers = {
             "g": self.g,
+            "a": self.g,  # a link is a group to a cutter
+            "switch": self.g,  # draws one child, see SVGReader.parse_element
             "path": self.path,
             "polygon": self.polygon,
             "polyline": self.polyline,
@@ -65,6 +68,8 @@ class SVGTagReader:
             # Parse style attribute LAST so inline styles take precedence
             # over presentation attributes (CSS specificity rules)
             style_value = None
+            # issues name the element, and attributes can come in any order
+            node["where"] = element_label(tagName, tag.get("id"))
             for attr, value in list(tag.attrib.items()):
                 # log.debug("considering attrib: " + attr)
                 if attr == "style" or attr.endswith("}style"):
@@ -207,20 +212,15 @@ class SVGTagReader:
     def line(self, node):
         # http://www.w3.org/TR/SVG11/shapes.html#LineElement
         # has transform and style attributes
-        # Note: lines can't really have fills, but we check anyway for consistency
-        has_stroke = self._has_valid_stroke(node)
-        has_fill = self._has_valid_fill(node)
-        if not has_stroke and not has_fill:
+        # a line has no interior, so fill does not apply (unlike polyline)
+        if not self._has_valid_stroke(node):
             return
         x1 = node.get("x1") or 0.0
         y1 = node.get("y1") or 0.0
         x2 = node.get("x2") or 0.0
         y2 = node.get("y2") or 0.0
         d = ["M", x1, y1, "L", x2, y2]
-        if has_stroke:
-            self._pathReader.add_path(d, node)
-        if has_fill:
-            self._pathReader.add_path(d, node, color=node.get("fill"))
+        self._pathReader.add_path(d, node)
 
     def circle(self, node):
         # http://www.w3.org/TR/SVG11/shapes.html#CircleElement
@@ -348,13 +348,17 @@ class SVGTagReader:
             return
 
         if data is None:
-            log.error("image tag skipped: no href attribute found")
+            issues.report(
+                "Image without data", "NOT CUT", "dropped", "Embed the image", node.get("where")
+            )
             return
 
         if not data.startswith("data:image/"):
             # only the svg content reaches here, never the file it came from,
             # so a href has no base path to resolve against
-            log.error("image tag skipped: only embedded images are supported, not linked ones")
+            issues.report(
+                "Linked image", "NOT CUT", "dropped", "Embed the image", node.get("where")
+            )
             return
 
         # Clean base64 data: remove whitespace that may have been introduced
@@ -408,7 +412,13 @@ class SVGTagReader:
                     viewboxMatrix(nums, (x, y, width, height), align, meet_or_slice),
                 )
                 return
-            log.error(f"nested svg viewBox '{vb}' is not a positive rectangle; ignored")
+            issues.report(
+                "Invalid viewBox",
+                "VIEWBOX IGNORED",
+                "changed",
+                "Fix the viewBox",
+                node.get("where"),
+            )
         if x or y:
             node["xformToWorld"] = matrixMult(node["xformToWorld"], [1, 0, 0, 1, x, y])
 
@@ -510,7 +520,13 @@ class SVGTagReader:
         if not fill_opacity:
             return False
         if not self._svgreader.is_pattern(ref):
-            log.warn(f"fill url(#{ref}) is not a pattern, shape left unpainted")
+            issues.report(
+                f'Unsupported fill "url(#{ref})"',
+                "FILL NOT CUT",
+                "dropped",
+                "Use a solid fill",
+                node.get("where"),
+            )
             return False
         return True
 

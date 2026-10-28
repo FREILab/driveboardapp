@@ -110,6 +110,33 @@ div.log_error {
 }
 
 
+.addfill_panel {
+    padding: 6px 10px;
+    min-width: 240px;
+}
+.addfill_head {
+    font-weight: bold;
+    margin: 4px 0 6px;
+}
+.addfill_row {
+    margin-bottom: 8px;
+}
+.addfill_swatch {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    margin-right: 4px;
+    border: 1px solid #888;
+    vertical-align: middle;
+}
+.addfill_fills {
+    max-height: 200px;
+    overflow-y: auto;
+}
+.addfill_fill {
+    margin-bottom: 4px;
+}
+
 .pass_color_dropdown > li > a:hover {
     background-color: transparent;
     background-image: none;
@@ -135,4 +162,65 @@ div.log_error {
 .pass_entry_highlight {
   outline: 2px solid #0084ff;
   outline-offset: 1px;
+}
+
+/* Import issues dialogs
+-------------------------------------------------- */
+.issues-dialog .modal-header.issues-warn {
+  background: #fcf8e3;
+  color: #8a6d3b;
+}
+.issues-dialog .modal-header.issues-fatal {
+  background: #f2dede;
+  color: #a94442;
+}
+.issues-dialog .modal-title {
+  color: #333;
+  font-weight: normal;
+}
+.issues-dialog .issues-warn .glyphicon {
+  color: #8a6d3b;
+}
+.issues-dialog .issues-fatal .glyphicon {
+  color: #a94442;
+}
+#import_issues_modal .modal-dialog {
+  width: 720px;
+  max-width: 95%;
+}
+.issues-table {
+  margin-bottom: 0;
+}
+.issues-table > tbody > tr > td {
+  vertical-align: middle;
+}
+.issues-dialog .where {
+  font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+  font-size: 12px;
+  color: #777;
+}
+.issue-tag {
+  display: inline-block;
+  padding: 2px 7px;
+  border: 1px solid;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.issue-changed {
+  background: #fcf8e3;
+  border-color: #faebcc;
+  color: #8a6d3b;
+}
+.issue-replaced {
+  background: #d9edf7;
+  border-color: #bce8f1;
+  color: #31708f;
+}
+.issue-dropped {
+  background: #f2dede;
+  border-color: #ebccd1;
+  color: #a94442;
 }

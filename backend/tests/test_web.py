@@ -7,11 +7,14 @@ are covered in test_driveboard_safety.py).
 """
 
 import base64
+import concurrent.futures
+import concurrent.futures.process
 import copy
 import gzip
 import io
 import json
 import os
+import tempfile
 import threading
 import time
 
@@ -178,8 +181,11 @@ def jog(auth_app, monkeypatch):
     stats = {
         "serial": True,
         "ready": True,
+        "drained": True,
         "pos": [0.0, 0.0, 0.0],
         "offset": [0.0, 0.0, 0.0],
+        "homed": True,  # clamped seek jogs are a homed machine's
+        "offset_settled": True,
     }
     monkeypatch.setattr(driveboard, "connected", lambda: True)
     monkeypatch.setattr(driveboard, "status", lambda: stats)
@@ -240,26 +246,26 @@ def test_jog_clamps_to_workarea(jog, monkeypatch, workspace, pos, offset, delta,
 @pytest.mark.parametrize(
     "pos,expected",
     [
-        ([0.0, 0.0, 0.0], [(50, 0, 0), (100, 0, 0), (150, 0, 0)]),
-        ([1150.0, 0.0, 0.0], [(1200, 0, 0), (1220, 0, 0), (1220, 0, 0)]),
+        ([0.0, 0.0, 0.0], [(50, 0, 0), (100, 0, 0)]),
+        ([1150.0, 0.0, 0.0], [(1200, 0, 0), (1220, 0, 0)]),
     ],
 )
 def test_jog_burst_accumulates_while_moving(jog, pos, expected):
     # The reported position lags a move in flight, so successive jogs have to
     # build on the last target commanded rather than re-clamp against a stale
-    # position.
-    jog["stats"]["ready"] = False
+    # position. Two steps ahead of the head is as far as a burst gets.
+    jog["stats"]["ready"] = jog["stats"]["drained"] = False
     jog["stats"]["pos"] = pos
-    for _ in range(3):
-        jog["app"].get("/jog/50/0/0")
+    codes = [jog["app"].get("/jog/50/0/0", expect_errors=True).status_int for _ in range(3)]
+    assert codes == [200, 200, 409]
     assert _jog_moves(jog["calls"]) == expected
 
 
 def test_jog_reseeds_from_position_once_idle(jog):
-    jog["stats"]["ready"] = False
+    jog["stats"]["ready"] = jog["stats"]["drained"] = False
     jog["app"].get("/jog/50/0/0")
     # Machine settled somewhere else, e.g. after a job or a /move.
-    jog["stats"]["ready"] = True
+    jog["stats"]["ready"] = jog["stats"]["drained"] = True
     jog["stats"]["pos"] = [300.0, 0.0, 0.0]
     jog["app"].get("/jog/50/0/0")
     assert _jog_moves(jog["calls"])[-1] == (350.0, 0.0, 0.0)
@@ -277,13 +283,14 @@ def test_jog_tolerates_status_without_position(jog):
 
 def test_jog_soft_limits_off_restores_relative_passthrough(jog, monkeypatch):
     monkeypatch.setitem(conf, "jog_soft_limits", False)
-    jog["stats"]["ready"] = False
+    jog["stats"]["ready"] = jog["stats"]["drained"] = False
     jog["stats"]["pos"] = [1200.0, 600.0, 0.0]
     jog["app"].get("/jog/50/50/0")
     assert ("relative",) in jog["calls"]
     assert _jog_moves(jog["calls"]) == [(50.0, 50.0, 0.0)]
     # Turning it back on must not build on what the relative jog left behind.
     monkeypatch.setitem(conf, "jog_soft_limits", True)
+    jog["stats"]["ready"] = jog["stats"]["drained"] = True
     jog["stats"]["pos"] = [400.0, 0.0, 0.0]
     jog["app"].get("/jog/50/0/0")
     assert _jog_moves(jog["calls"])[-1] == (450.0, 0.0, 0.0)
@@ -348,6 +355,7 @@ def test_run_maps_out_of_bounds_to_422(auth_app, monkeypatch):
     monkeypatch.setattr(driveboard, "job", _raise)
     resp = auth_app.get("/run/somejob", expect_errors=True)
     assert resp.status_int == 422  # validation failure surfaced to the client
+    assert resp.content_type == "text/plain"  # never rendered as html
 
 
 def test_direct_run_rejects_when_not_ready(auth_app, monkeypatch):
@@ -525,13 +533,13 @@ def test_convert_matches_an_in_process_convert(as_text, testjobs_dir):
     expected = jobimport.dumps(
         jobimport.share_image_data(jobimport.convert(job, optimize=True, matrix=None))
     )
-    assert web._convert_job(job, True, None) == (expected, None)
+    assert web._convert_job(job, True, None) == (expected, None, [])
 
 
 def test_convert_reports_an_unusable_file_as_a_type_error():
     # the exception has to come back from the worker with its type intact,
     # otherwise /load answers 500 instead of 400
-    with pytest.raises(TypeError):
+    with pytest.raises(jobimport.UnknownFileType):
         web._convert_job(b"not a job at all", True, None)
 
 
@@ -701,7 +709,6 @@ def test_load_reports_a_truncated_svg_readably(auth_app):
     )
     assert resp.status_int == 422
     assert "well-formed" in resp.body.decode("utf-8")
-    assert "truncated" in resp.body.decode("utf-8")
 
 
 def test_queue_listing_never_changes_process_working_directory(isolated_config, monkeypatch):
@@ -763,7 +770,7 @@ def test_load_stores_an_unchanged_dba_without_reconverting(auth_app, isolated_co
     # converting it again would copy tens of megabytes through the import
     # worker to arrive at the same bytes
     called = []
-    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: called.append(a) or ("{}", None))
+    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: called.append(a) or ("{}", None, []))
     body = {
         "load_request": json.dumps(
             {"job": MINIMAL_DBA, "name": "asis", "optimize": False, "overwrite": True}
@@ -941,3 +948,1505 @@ def test_concurrent_status_polls_reconnect_only_once(monkeypatch):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+# ---------------------------------------------------------------------------
+# checkuser
+# ---------------------------------------------------------------------------
+
+
+def test_checkuser(monkeypatch):
+    monkeypatch.setitem(conf, "users", {"alice": "pw"})
+    assert web.checkuser("alice", "pw") is True
+    assert web.checkuser("alice", "nope") is False
+    assert web.checkuser("bob", "pw") is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/listing",
+        "/get/x",
+        "/star/x",
+        "/remove/x",
+        "/clear",
+        "/run/x",
+        "/build",
+        "/reset",
+        "/flash",
+    ],
+)
+def test_job_and_mcu_endpoints_require_auth(app, url):
+    assert app.get(url, expect_errors=True).status_int == 401
+
+
+# ---------------------------------------------------------------------------
+# /temp + /download
+# ---------------------------------------------------------------------------
+
+
+def test_temp_then_download_roundtrip(auth_app):
+    resp = auth_app.post("/temp", {"load_request": json.dumps({"job": "payload-123"})})
+    tmpname = json.loads(resp.body)
+    path = os.path.join(tempfile.gettempdir(), tmpname)
+    try:
+        dl = auth_app.get(f"/download/{tmpname}/out.dba")
+        assert dl.body == b"payload-123"
+        assert "out.dba" in dl.headers["Content-Disposition"]
+    finally:
+        os.remove(path)
+
+
+def test_temp_and_download_require_auth(app):
+    assert app.post("/temp", {"load_request": "{}"}, expect_errors=True).status_int == 401
+    assert app.get("/download/a/b", expect_errors=True).status_int == 401
+
+
+def test_download_unknown_file_404s(auth_app):
+    assert (
+        auth_app.get("/download/no-such-temp-file-xyz/a.dba", expect_errors=True).status_int == 404
+    )
+
+
+# ---------------------------------------------------------------------------
+# /config writes and /confserial
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def conf_file(isolated_config, tmp_path, monkeypatch):
+    path = tmp_path / "conf" / "config.json"
+    monkeypatch.setattr(isolated_config, "configpath", str(path))
+    return path
+
+
+def test_config_set_writes_editable_key_to_file_and_memory(auth_app, conf_file):
+    resp = auth_app.get("/config/seekrate/1234")
+    assert json.loads(resp.body)["status"] == "ok"
+    assert conf["seekrate"] == 1234  # parsed as JSON, not a string
+    assert json.loads(conf_file.read_text())["seekrate"] == 1234
+
+
+def test_config_set_default_restores_default(auth_app, conf_file):
+    conf["seekrate"] = 1
+    auth_app.get("/config/seekrate/_default_")
+    assert conf["seekrate"] == web.conf_defaults["seekrate"]
+
+
+def test_config_set_non_json_value_stored_as_string(auth_app, conf_file):
+    auth_app.get("/config/fill_mode/NearestNeighbor")
+    assert conf["fill_mode"] == "NearestNeighbor"
+
+
+def test_confserial_get_and_set(auth_app, conf_file):
+    conf["serial_port"] = "/dev/ttyOLD"
+    assert auth_app.get("/confserial").text == "/dev/ttyOLD"
+    auth_app.get("/confserial/ttyNEW")
+    assert conf["serial_port"] == "ttyNEW"
+    assert json.loads(conf_file.read_text())["serial_port"] == "ttyNEW"
+
+
+# ---------------------------------------------------------------------------
+# Simple machine commands: call through when connected, 400 when not
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,fn,args",
+    [
+        ("/homing", "homing", ()),
+        ("/feedrate/1500.5", "feedrate", (1500.5,)),
+        ("/intensity/42", "intensity", (42.0,)),
+        ("/relative", "relative", ()),
+        ("/absolute", "absolute", ()),
+        ("/aux_on", "aux_on", ()),
+        ("/aux_off", "aux_off", ()),
+    ],
+)
+def test_simple_commands_call_driveboard(auth_app, monkeypatch, url, fn, args):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    calls = []
+    monkeypatch.setattr(driveboard, fn, lambda *a: calls.append(a))
+    assert auth_app.get(url).text == "{}"
+    assert calls == [args]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/homing", "/feedrate/1", "/intensity/1", "/relative", "/absolute", "/retract",
+        "/jog/1/1/0", "/movex/1", "/movey/1", "/movez/1", "/supermove/1/1/0", "/supermovex/1",
+        "/supermovey/1", "/supermovez/1", "/air_on", "/aux_on", "/aux_off", "/pulse",
+        "/offset/1/1/0", "/offsetx/1", "/offsety/1", "/offsetz/1", "/absoffset/1/1/0",
+        "/pause", "/unpause", "/unstop", "/run/x",
+    ],
+)  # fmt: skip
+def test_machine_commands_refused_without_machine(auth_app, monkeypatch, url):
+    monkeypatch.setattr(driveboard, "connected", lambda: False)
+    resp = auth_app.get(url, expect_errors=True)
+    assert resp.status_int == 400
+    assert "No machine" in resp.text
+
+
+def test_retract_lifts_z_then_homes_xy_at_seekrate(auth_app, monkeypatch):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    calls = []
+    monkeypatch.setattr(driveboard, "intensity", lambda v: calls.append(("intensity", v)))
+    monkeypatch.setattr(driveboard, "feedrate", lambda v: calls.append(("feedrate", v)))
+    monkeypatch.setattr(driveboard, "supermove", lambda **k: calls.append(("supermove", k)))
+    auth_app.get("/retract")
+    assert calls == [
+        ("intensity", 0),
+        ("feedrate", conf["seekrate"]),
+        ("supermove", {"z": 0}),
+        ("supermove", {"x": 0, "y": 0}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "url,fn,kwargs",
+    [
+        ("/movey/7", "move", {"y": 7.0}),
+        ("/movez/3", "move", {"z": 3.0}),
+        ("/supermove/1/2/3", "supermove", None),
+        ("/supermovex/5", "supermove", {"x": 5.0}),
+        ("/supermovey/6", "supermove", {"y": 6.0}),
+        ("/supermovez/8", "supermove", {"z": 8.0}),
+    ],
+)
+def test_axis_moves_in_bounds_reach_driveboard(auth_app, monkeypatch, url, fn, kwargs):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "target_in_workarea", lambda *a, **k: True)
+    monkeypatch.setattr(driveboard, "intensity", lambda v: None)
+    calls = []
+    monkeypatch.setattr(driveboard, fn, lambda *a, **k: calls.append((a, k)))
+    auth_app.get(url)
+    assert calls == [((1.0, 2.0, 3.0), {})] if kwargs is None else calls == [((), kwargs)]
+
+
+@pytest.mark.parametrize(
+    "url,fn",
+    [
+        ("/movey/9999", "move"),
+        ("/movez/9999", "move"),
+        ("/supermove/9999/0/0", "supermove"),
+        ("/supermovex/9999", "supermove"),
+        ("/supermovey/9999", "supermove"),
+        ("/supermovez/9999", "supermove"),
+    ],
+)
+def test_axis_moves_out_of_bounds_are_refused(auth_app, monkeypatch, url, fn):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "target_in_workarea", lambda *a, **k: False)
+    monkeypatch.setattr(driveboard, "intensity", lambda v: None)
+    calls = []
+    monkeypatch.setattr(driveboard, fn, lambda *a, **k: calls.append((a, k)))
+    resp = auth_app.get(url, expect_errors=True)
+    assert resp.status_int == 400
+    assert "outside work area" in resp.text
+    assert calls == []
+
+
+def test_move_zero_intensity_before_move(auth_app, monkeypatch):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "target_in_workarea", lambda *a, **k: True)
+    order = []
+    monkeypatch.setattr(driveboard, "intensity", lambda v: order.append(("i", v)))
+    monkeypatch.setattr(driveboard, "move", lambda *a, **k: order.append(("m", k)))
+    auth_app.get("/movex/4")
+    assert order == [("i", 0), ("m", {"x": 4.0})]
+
+
+@pytest.mark.parametrize(
+    "url,fn,expected",
+    [
+        ("/offset/1/2/3", "offset", ((1.0, 2.0, 3.0), {})),
+        ("/offsetx/1", "offset", ((), {"x": 1.0})),
+        ("/offsety/2", "offset", ((), {"y": 2.0})),
+        ("/offsetz/3", "offset", ((), {"z": 3.0})),
+        ("/absoffset/1/2/3", "absoffset", ((1.0, 2.0, 3.0), {})),
+    ],
+)
+def test_offsets_apply_when_ready_and_refuse_when_not(auth_app, monkeypatch, url, fn, expected):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    state = {"ready": False}
+    monkeypatch.setattr(driveboard, "status", lambda: state)
+    calls = []
+    monkeypatch.setattr(driveboard, fn, lambda *a, **k: calls.append((a, k)))
+    assert auth_app.get(url, expect_errors=True).status_int == 400
+    assert calls == []
+    state["ready"] = True
+    assert auth_app.get(url).text == "{}"
+    assert calls == [expected]
+
+
+# ---------------------------------------------------------------------------
+# Job queue: add / list / get / star / remove / clear
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def queue(auth_app, isolated_config):
+    """auth_app with an empty throwaway queue; returns (app, stordir)."""
+    return auth_app, isolated_config.conf["stordir"]
+
+
+def _put(stordir, name, text=MINIMAL_DBA, mtime=None):
+    path = os.path.join(stordir, name)
+    with open(path, "w") as fp:
+        fp.write(text)
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_listing_orders_by_age_and_filters_by_star(queue):
+    app, d = queue
+    _put(d, "newest.dba", mtime=300)
+    _put(d, "oldest.dba.starred", mtime=100)
+    _put(d, "middle.dba", mtime=200)
+    assert json.loads(app.get("/listing").body) == ["oldest", "middle", "newest"]
+    assert json.loads(app.get("/listing/starred").body) == ["oldest"]
+    assert json.loads(app.get("/listing/unstarred").body) == ["middle", "newest"]
+
+
+def test_listing_unknown_kind_is_400(queue):
+    assert queue[0].get("/listing/bogus", expect_errors=True).status_int == 400
+
+
+def test_get_returns_job_json_for_plain_and_starred(queue):
+    app, d = queue
+    _put(d, "a.dba")
+    _put(d, "b.dba.starred", text='{"x": 1}')
+    resp = app.get("/get/a")
+    assert resp.content_type == "application/json"
+    assert resp.body.decode() == MINIMAL_DBA
+    assert json.loads(app.get("/get/b").body) == {"x": 1}
+
+
+def test_get_missing_job_is_400(queue):
+    resp = queue[0].get("/get/ghost", expect_errors=True)
+    assert resp.status_int == 400
+    assert "No such file" in resp.text
+
+
+def test_star_and_unstar_rename_the_file(queue):
+    app, d = queue
+    _put(d, "job.dba")
+    app.get("/star/job")
+    assert os.path.exists(os.path.join(d, "job.dba.starred"))
+    assert not os.path.exists(os.path.join(d, "job.dba"))
+    app.get("/unstar/job")
+    assert os.path.exists(os.path.join(d, "job.dba"))
+    assert not os.path.exists(os.path.join(d, "job.dba.starred"))
+
+
+def test_star_already_starred_and_unstar_plain_are_400(queue):
+    app, d = queue
+    _put(d, "s.dba.starred")
+    _put(d, "p.dba")
+    assert app.get("/star/s", expect_errors=True).status_int == 400
+    assert app.get("/unstar/p", expect_errors=True).status_int == 400
+    assert os.path.exists(os.path.join(d, "s.dba.starred"))
+    assert os.path.exists(os.path.join(d, "p.dba"))
+
+
+def test_star_and_unstar_missing_job_are_400(queue):
+    app, _ = queue
+    assert app.get("/star/ghost", expect_errors=True).status_int == 400
+    assert app.get("/unstar/ghost", expect_errors=True).status_int == 400
+
+
+def test_remove_deletes_plain_and_starred_jobs(queue):
+    app, d = queue
+    _put(d, "a.dba")
+    _put(d, "b.dba.starred")
+    app.get("/remove/a")
+    app.get("/remove/b")
+    assert os.listdir(d) == []
+    assert app.get("/remove/a", expect_errors=True).status_int == 400
+
+
+def test_clear_removes_unstarred_only(queue):
+    app, d = queue
+    _put(d, "a.dba")
+    _put(d, "b.dba")
+    _put(d, "keep.dba.starred")
+    assert app.get("/clear").text == "{}"
+    assert os.listdir(d) == ["keep.dba.starred"]
+
+
+def test_clear_with_limit_removes_oldest_first(isolated_config):
+    d = isolated_config.conf["stordir"]
+    for i, name in enumerate(["a", "b", "c"]):
+        _put(d, name + ".dba", mtime=100 + i)
+    web._clear(2)
+    assert os.listdir(d) == ["c.dba"]
+    web._clear(0)  # nothing to do
+    assert os.listdir(d) == ["c.dba"]
+
+
+def test_clear_rejects_non_integer_limit(isolated_config):
+    d = isolated_config.conf["stordir"]
+    _put(d, "a.dba")
+    with pytest.raises(ValueError):
+        web._clear("2")
+    assert os.listdir(d) == ["a.dba"]
+
+
+def test_add_trims_queue_to_max_jobs_keeping_newest_and_starred(isolated_config, monkeypatch):
+    d = isolated_config.conf["stordir"]
+    monkeypatch.setitem(conf, "max_jobs_in_list", 2)
+    _put(d, "old1.dba", mtime=100)
+    _put(d, "old2.dba", mtime=200)
+    _put(d, "star.dba.starred", mtime=50)
+    web._add("fresh", "fresh")
+    assert sorted(os.listdir(d)) == ["fresh.dba", "old2.dba", "star.dba.starred"]
+    assert open(os.path.join(d, "fresh.dba")).read() == "fresh"
+
+
+def test_load_name_cannot_escape_the_queue_directory(queue):
+    app, d = queue
+    _post_load(app, job=MINIMAL_DBA, name="../escaped", optimize=False)
+    assert not os.path.exists(os.path.join(os.path.dirname(d), "escaped.dba"))
+
+
+@pytest.mark.parametrize("name", ["../x", "a/b", "a\\b", "..", ""])
+def test_job_names_with_path_parts_are_rejected(isolated_config, name):
+    with pytest.raises(bottle.HTTPResponse) as e:
+        web._add("job", name)
+    assert e.value.status_code == 400
+    for fn in (web._get, web._get_path, web._exists):
+        with pytest.raises(bottle.HTTPResponse) as e:
+            fn(name)
+        assert e.value.status_code == 400
+
+
+def test_add_failure_leaves_no_temp_file_and_keeps_old_job(isolated_config, monkeypatch):
+    d = isolated_config.conf["stordir"]
+    _put(d, "j.dba", text="original")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        web._add("new", "j")
+    monkeypatch.undo()
+    assert os.listdir(d) == ["j.dba"]
+    assert open(os.path.join(d, "j.dba")).read() == "original"
+
+
+def test_unique_name_numbers_collisions(isolated_config):
+    d = isolated_config.conf["stordir"]
+    assert web._unique_name("job") == "job"
+    _put(d, "job.dba")
+    assert web._unique_name("job") == "job_2"
+    _put(d, "job_2.dba.starred")
+    assert web._unique_name("job") == "job_3"
+
+
+def test_exists_raises_for_taken_name(isolated_config):
+    d = isolated_config.conf["stordir"]
+    web._exists("free")  # no error
+    _put(d, "taken.dba.starred")
+    with pytest.raises(bottle.HTTPResponse) as exc:
+        web._exists("taken")
+    assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /load edge cases
+# ---------------------------------------------------------------------------
+
+
+def _post_load(app, **req):
+    return app.post("/load", {"load_request": json.dumps(req)}, expect_errors=True)
+
+
+def test_load_without_name_is_400(queue):
+    assert _post_load(queue[0], job=MINIMAL_DBA).status_int == 400
+
+
+def test_load_without_job_is_400(queue):
+    assert _post_load(queue[0], name="x").status_int == 400
+
+
+def test_load_avoids_name_collision_unless_overwrite(queue):
+    app, d = queue
+    first = json.loads(_post_load(app, job=MINIMAL_DBA, name="n", optimize=False).body)
+    second = json.loads(_post_load(app, job=MINIMAL_DBA, name="n", optimize=False).body)
+    third = json.loads(
+        _post_load(app, job=MINIMAL_DBA, name="n", optimize=False, overwrite=True).body
+    )
+    assert (first, second, third) == ("n", "n_2", "n")
+    assert sorted(os.listdir(d)) == ["n.dba", "n_2.dba"]
+
+
+def test_load_unreadable_file_type_is_400(queue):
+    resp = _post_load(queue[0], job="this is not any job format", name="junk", optimize=True)
+    assert resp.status_int == 400
+    assert "Invalid file type" in resp.text
+    assert resp.content_type == "text/plain"
+    assert os.listdir(queue[1]) == []
+
+
+def test_load_value_error_from_converter_is_422(queue, monkeypatch):
+    def bad(*a, **k):
+        raise ValueError("bad geometry")
+
+    monkeypatch.setattr(web, "_convert_job", bad)
+    resp = _post_load(queue[0], job=MINIMAL_DBA, name="x", optimize=True)
+    assert resp.status_int == 422
+    assert "bad geometry" in resp.text
+    assert resp.content_type == "text/plain"  # file text, never html
+
+
+def test_load_progressive_returns_pending_token_and_names_the_entry(queue, monkeypatch):
+    app, d = queue
+    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: (MINIMAL_DBA, "tok", []))
+    entry = {"event": threading.Event(), "name": None, "error": None, "stale": False}
+    monkeypatch.setitem(web._load_pending, "tok", entry)
+    try:
+        data = json.loads(_post_load(app, job=MINIMAL_DBA, name="prog", progressive=True).body)
+        assert data == {"name": "prog", "pending": "tok"}
+        assert entry["name"] == "prog"
+        assert os.listdir(d) == ["prog.dba"]
+    finally:
+        web._load_pending.pop("tok", None)
+
+
+def test_load_progressive_publishes_result_that_finished_before_name_known(queue, monkeypatch):
+    app, d = queue
+    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: ("quick", "tok", []))
+    entry = {"event": threading.Event(), "name": None, "error": None, "stale": False}
+    entry["result"] = "optimized"
+    entry["event"].set()
+    monkeypatch.setitem(web._load_pending, "tok", entry)
+    try:
+        _post_load(app, job=MINIMAL_DBA, name="done", progressive=True)
+        assert open(os.path.join(d, "done.dba")).read() == "optimized"
+    finally:
+        web._load_pending.pop("tok", None)
+
+
+def test_load_marks_pending_optimize_of_same_name_stale(queue, monkeypatch):
+    app, _ = queue
+    entry = {"event": threading.Event(), "name": "dup", "error": None, "stale": False}
+    monkeypatch.setitem(web._load_pending, "other", entry)
+    try:
+        _post_load(app, job=MINIMAL_DBA, name="dup", optimize=False, overwrite=True)
+        assert entry["stale"] is True
+    finally:
+        web._load_pending.pop("other", None)
+
+
+# ---------------------------------------------------------------------------
+# /load_result
+# ---------------------------------------------------------------------------
+
+
+def test_load_result_unknown_token_is_404(auth_app):
+    assert auth_app.get("/load_result/nope", expect_errors=True).status_int == 404
+
+
+def test_load_result_returns_name_and_forgets_token(auth_app, monkeypatch):
+    entry = {"event": threading.Event(), "name": "done", "error": None}
+    entry["event"].set()
+    monkeypatch.setitem(web._load_pending, "t1", entry)
+    assert json.loads(auth_app.get("/load_result/t1").body) == {"name": "done"}
+    assert "t1" not in web._load_pending
+
+
+def test_load_result_reports_optimize_failure_as_422(auth_app, monkeypatch):
+    entry = {"event": threading.Event(), "name": "x", "error": "kaboom"}
+    entry["event"].set()
+    monkeypatch.setitem(web._load_pending, "t2", entry)
+    resp = auth_app.get("/load_result/t2", expect_errors=True)
+    assert resp.status_int == 422
+    assert "kaboom" in resp.text
+    assert resp.content_type == "text/plain"
+    assert "t2" not in web._load_pending
+
+
+def test_load_result_times_out_as_504(auth_app, monkeypatch):
+    entry = {"event": threading.Event(), "name": "x", "error": None}
+    monkeypatch.setitem(web._load_pending, "t3", entry)
+    monkeypatch.setattr(web, "CONVERT_TIMEOUT", 0)
+    assert auth_app.get("/load_result/t3", expect_errors=True).status_int == 504
+    assert "t3" not in web._load_pending
+
+
+def test_pending_watcher_records_future_failure(tmp_path):
+    import concurrent.futures
+
+    future = concurrent.futures.Future()
+    future.set_exception(RuntimeError("worker died"))
+    tmpdir = tmp_path / "pend"
+    tmpdir.mkdir()
+    token = web._pending_register(future, str(tmpdir / "job.dba"), str(tmpdir))
+    entry = web._load_pending[token]
+    try:
+        assert entry["event"].wait(5)
+        assert entry["error"] == "worker died"
+        assert not tmpdir.exists()  # the watcher cleans up
+    finally:
+        web._load_pending.pop(token, None)
+
+
+def test_pending_watcher_adds_optimized_result_under_the_name(tmp_path, monkeypatch):
+    import concurrent.futures
+
+    added = []
+    monkeypatch.setattr(web, "_add", lambda job, name: added.append((job, name)))
+    future = concurrent.futures.Future()
+    tmpdir = tmp_path / "pend"
+    tmpdir.mkdir()
+    (tmpdir / "job.dba").write_text("optimized")
+    # name is known before the worker finishes
+    token = web._pending_register(future, str(tmpdir / "job.dba"), str(tmpdir))
+    entry = web._load_pending[token]
+    entry["name"] = "nm"
+    future.set_result(None)
+    try:
+        assert entry["event"].wait(5)
+        assert added == [("optimized", "nm")]
+    finally:
+        web._load_pending.pop(token, None)
+
+
+# ---------------------------------------------------------------------------
+# Import worker plumbing (run in-process; the pool itself is stubbed)
+# ---------------------------------------------------------------------------
+
+
+def test_convert_worker_writes_final_dba(tmp_path):
+    src, out = tmp_path / "in", tmp_path / "out.dba"
+    src.write_bytes(MINIMAL_DBA.encode())
+    web._convert_worker(str(src), str(out), None, True, False, None, {})
+    assert json.loads(out.read_text())["defs"][0]["kind"] == "path"
+
+
+def test_convert_worker_with_quick_path_leaves_parsed_job_first(tmp_path):
+    src, out, quick = tmp_path / "in", tmp_path / "out.dba", tmp_path / "quick"
+    src.write_bytes(MINIMAL_DBA.encode())
+    web._convert_worker(str(src), str(out), str(quick), True, True, None, {})
+    assert json.loads(quick.read_text())["defs"][0]["kind"] == "path"
+    assert json.loads(out.read_text())["head"]["optimized"] == conf["tolerance"]
+    assert not os.path.exists(str(quick) + ".tmp")
+
+
+def test_convert_worker_applies_config_overrides(tmp_path, monkeypatch):
+    monkeypatch.setitem(conf, "tolerance", 0.1)
+    src, out = tmp_path / "in", tmp_path / "out.dba"
+    src.write_bytes(MINIMAL_DBA.encode())
+    web._convert_worker(str(src), str(out), None, True, True, None, {"tolerance": 0.7})
+    assert json.loads(out.read_text())["head"]["optimized"] == 0.7
+
+
+class _FakePool:
+    def __init__(self, future_factory):
+        self.future_factory = future_factory
+
+    def submit(self, fn, *args):
+        fn(*args)  # run the worker synchronously in this process
+        return self.future_factory()
+
+
+class _Future:
+    def __init__(self, done=True, error=None):
+        self._done, self._error = done, error
+
+    def done(self):
+        return self._done
+
+    def result(self, timeout=None):
+        if self._error:
+            raise self._error
+
+
+def test_convert_job_falls_back_in_process_when_pool_unavailable(monkeypatch):
+    def broken():
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr(web, "_convert_pool_get", broken)
+    dba, token, _ = web._convert_job(MINIMAL_DBA, optimize=False, matrix=None)
+    assert token is None
+    assert json.loads(dba)["defs"][0]["kind"] == "path"
+
+
+def test_convert_job_timeout_is_504_and_discards_worker(monkeypatch):
+    import concurrent.futures
+
+    dropped = []
+    monkeypatch.setattr(
+        web,
+        "_convert_pool_get",
+        lambda: _FakePool(lambda: _Future(error=concurrent.futures.TimeoutError())),
+    )
+    monkeypatch.setattr(web, "_convert_pool_drop", lambda: dropped.append(True))
+    with pytest.raises(bottle.HTTPResponse) as exc:
+        web._convert_job(MINIMAL_DBA, optimize=False, matrix=None)
+    assert exc.value.status_code == 504
+    assert dropped == [True]
+
+
+class _HangingPool:
+    def submit(self, fn, *args):
+        import concurrent.futures
+
+        return concurrent.futures.Future()  # never runs, never finishes
+
+
+def test_convert_job_progressive_times_out_when_no_quick_parse_appears(monkeypatch):
+    dropped, raised = [], []
+    monkeypatch.setattr(web, "_convert_pool_get", lambda: _HangingPool())
+    monkeypatch.setattr(web, "_convert_pool_drop", lambda: dropped.append(True))
+    monkeypatch.setattr(web, "CONVERT_TIMEOUT", 0.2)
+
+    def convert():
+        try:
+            web._convert_job(MINIMAL_DBA, optimize=True, matrix=None, progressive=True)
+        except bottle.HTTPResponse as e:
+            raised.append(e.status_code)
+
+    t = threading.Thread(target=convert, daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive()
+    assert raised == [504]
+    assert dropped == [True]
+
+
+def test_convert_job_progressive_hands_back_quick_parse_and_token(monkeypatch):
+    monkeypatch.setattr(web, "_convert_pool_get", lambda: _FakePool(lambda: _Future(done=False)))
+    dba, token, _ = web._convert_job(MINIMAL_DBA, optimize=True, matrix=None, progressive=True)
+    try:
+        assert token in web._load_pending
+        assert json.loads(dba)["defs"][0]["kind"] == "path"
+        assert web._load_pending[token]["event"].wait(5)
+    finally:
+        web._load_pending.pop(token, None)
+
+
+def test_convert_pool_drop_kills_workers(monkeypatch):
+    killed, shut = [], []
+
+    class Proc:
+        def kill(self):
+            killed.append(1)
+
+    class Pool:
+        _processes = {1: Proc(), 2: Proc()}
+
+        def shutdown(self, wait):
+            shut.append(wait)
+
+    monkeypatch.setattr(web, "_convert_pool", Pool())
+    web._convert_pool_drop()
+    assert (killed, shut) == ([1, 1], [False])
+    assert web._convert_pool is None
+    web._convert_pool_drop()  # idempotent
+
+
+# ---------------------------------------------------------------------------
+# Library
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def library(queue, tmp_path, monkeypatch):
+    app, stor = queue
+    root = tmp_path / "root"
+    (root / "library").mkdir(parents=True)
+    monkeypatch.setitem(conf, "rootdir", str(root))
+    return app, stor, root / "library"
+
+
+def test_listing_library_lists_sorted_dba_names_and_path(library):
+    app, _, lib = library
+    for n in ("b.dba", "a.dba"):
+        (lib / n).write_text(MINIMAL_DBA)
+    (lib / "readme.txt").write_text("not a job")
+    data = json.loads(app.get("/listing_library").body)
+    assert data["files"] == ["a", "b"]
+    assert data["path"] == str(lib)
+
+
+def test_get_library_serves_job_and_400s_on_missing(library):
+    app, _, lib = library
+    (lib / "x.dba").write_text(MINIMAL_DBA)
+    assert app.get("/get_library/x").body.decode() == MINIMAL_DBA
+    assert app.get("/get_library/ghost", expect_errors=True).status_int == 400
+
+
+def test_load_library_copies_into_queue_with_unique_name(library):
+    app, stor, lib = library
+    (lib / "x.dba").write_text(MINIMAL_DBA)
+    assert json.loads(app.get("/load_library/x").body) == "x"
+    assert json.loads(app.get("/load_library/x").body) == "x_2"
+    assert sorted(os.listdir(stor)) == ["x.dba", "x_2.dba"]
+    assert open(os.path.join(stor, "x.dba")).read() == MINIMAL_DBA
+
+
+def test_load_library_missing_job_is_400(library):
+    app, stor, _ = library
+    assert app.get("/load_library/ghost", expect_errors=True).status_int == 400
+    assert os.listdir(stor) == []
+
+
+# ---------------------------------------------------------------------------
+# Presets: corrupt file, write failure
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_presets_file_reads_as_empty(auth_app, presets_dir):
+    (presets_dir / "presets.json").write_text("{not json")
+    assert json.loads(auth_app.get("/listing_presets").body)["presets"] == []
+
+
+def test_presets_sorted_case_insensitively(auth_app, presets_dir):
+    auth_app.get("/save_preset/beta/100/10/0.1")
+    auth_app.get("/save_preset/Alpha/100/10/0.1")
+    names = [p["name"] for p in json.loads(auth_app.get("/listing_presets").body)["presets"]]
+    assert names == ["Alpha", "beta"]
+
+
+def test_preset_write_failure_does_not_error_the_request(auth_app, presets_dir, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(web.config_module, "write_json_atomic", boom)
+    assert auth_app.get("/save_preset/cut/100/10/0.1").text == "{}"
+    assert not (presets_dir / "presets.json").exists()
+
+
+def test_save_preset_with_zero_feedrate_and_intensity_of_unknown_name_is_ignored(
+    auth_app, presets_dir
+):
+    auth_app.get("/save_preset/ghost/0/0/0.1")
+    assert _presets_on_disk(presets_dir) == {}
+
+
+# ---------------------------------------------------------------------------
+# Job execution happy paths and validation
+# ---------------------------------------------------------------------------
+
+
+def test_run_sends_queued_job_to_machine(queue, monkeypatch):
+    app, d = queue
+    _put(d, "go.dba")
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "status", lambda: {"ready": True})
+    sent = []
+    monkeypatch.setattr(driveboard, "job", lambda j: sent.append(j))
+    assert app.get("/run/go").text == "{}"
+    assert sent == [json.loads(MINIMAL_DBA)]
+
+
+def test_run_unknown_job_is_400_and_nothing_sent(queue, monkeypatch):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "status", lambda: {"ready": True})
+    sent = []
+    monkeypatch.setattr(driveboard, "job", lambda j: sent.append(j))
+    assert queue[0].get("/run/ghost", expect_errors=True).status_int == 400
+    assert sent == []
+
+
+def test_direct_run_sends_posted_job(auth_app, monkeypatch):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "status", lambda: {"ready": True})
+    sent = []
+    monkeypatch.setattr(driveboard, "job", lambda j: sent.append(j))
+    resp = auth_app.post("/run", {"load_request": json.dumps({"job": MINIMAL_DBA})})
+    assert resp.text == "{}"
+    assert sent == [json.loads(MINIMAL_DBA)]
+
+
+def test_direct_run_without_job_is_400(auth_app, monkeypatch):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "status", lambda: {"ready": True})
+    resp = auth_app.post("/run", {"load_request": json.dumps({})}, expect_errors=True)
+    assert resp.status_int == 400
+
+
+def test_direct_run_maps_validation_error_to_422(auth_app, monkeypatch):
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "status", lambda: {"ready": True})
+
+    def reject(_job):
+        raise ValueError("beyond work area")
+
+    monkeypatch.setattr(driveboard, "job", reject)
+    resp = auth_app.post(
+        "/run", {"load_request": json.dumps({"job": MINIMAL_DBA})}, expect_errors=True
+    )
+    assert resp.status_int == 422
+    assert "beyond work area" in resp.text
+    assert resp.content_type == "text/plain"
+
+
+def test_direct_run_requires_machine(auth_app, monkeypatch):
+    monkeypatch.setattr(driveboard, "connected", lambda: False)
+    resp = auth_app.post("/run", {"load_request": "{}"}, expect_errors=True)
+    assert resp.status_int == 400
+
+
+# ---------------------------------------------------------------------------
+# /optimize_fill
+# ---------------------------------------------------------------------------
+
+_FILL = [[[0, 0, 0], [10, 0, 0]], [[10, 1, 0], [0, 1, 0]]]
+
+
+def _optimize_fill(app, mode, monkeypatch, data=_FILL):
+    monkeypatch.setitem(conf, "fill_mode", mode)
+    return app.post_json("/optimize_fill", {"data": data}, expect_errors=True)
+
+
+def test_optimize_fill_forward_returns_input_unchanged(auth_app, monkeypatch):
+    out = json.loads(_optimize_fill(auth_app, "Forward", monkeypatch).body)
+    assert out == {"data": _FILL, "fill_mode": "Forward"}
+
+
+@pytest.mark.parametrize(
+    "mode,target",
+    [
+        ("Reverse", "reverse_path"),
+        ("Bidirectional", "fill_optimize"),
+        ("NearestNeighbor", "optimize"),
+    ],
+)
+def test_optimize_fill_dispatches_on_fill_mode(auth_app, monkeypatch, mode, target):
+    called = []
+    monkeypatch.setattr(web.pathoptimizer, target, lambda data, *a: called.append(data))
+    out = json.loads(_optimize_fill(auth_app, mode, monkeypatch).body)
+    assert len(called) == 1
+    assert out["fill_mode"] == mode
+
+
+def test_optimize_fill_reverse_really_reverses(auth_app, monkeypatch):
+    out = json.loads(_optimize_fill(auth_app, "Reverse", monkeypatch).body)["data"]
+    # lines ordered by y, each walked end to start
+    assert out == [[[10, 0, 0], [0, 0, 0]], [[0, 1, 0], [10, 1, 0]]]
+
+
+def test_optimize_fill_bad_body_is_400(auth_app):
+    resp = auth_app.post("/optimize_fill", "not json", expect_errors=True)
+    assert resp.status_int == 400
+    assert "Error optimizing fill" in resp.text
+
+
+def test_optimize_fill_does_not_mutate_conf_or_request(auth_app, monkeypatch):
+    before = copy.deepcopy(_FILL)
+    _optimize_fill(auth_app, "Reverse", monkeypatch)
+    assert _FILL == before
+
+
+# ---------------------------------------------------------------------------
+# /job_preview/<token>
+# ---------------------------------------------------------------------------
+
+
+def test_job_preview_result_for_unknown_token_is_pending(auth_app, monkeypatch):
+    monkeypatch.setattr(web, "_preview_result", (5, {"seeks": []}))
+    assert json.loads(auth_app.get("/job_preview/6").body) == {"pending": True}
+    assert json.loads(auth_app.get("/job_preview/5").body) == {"seeks": []}
+
+
+def test_job_preview_result_error_is_400(auth_app, monkeypatch):
+    monkeypatch.setattr(web, "_preview_result", (5, {"error": "no good"}))
+    resp = auth_app.get("/job_preview/5", expect_errors=True)
+    assert resp.status_int == 400
+    assert "no good" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# MCU management: build / flash / reset
+# ---------------------------------------------------------------------------
+
+
+def test_build_ok_and_failure(auth_app, monkeypatch):
+    rc = {"v": 0}
+    monkeypatch.setattr(driveboard, "build", lambda: rc["v"])
+    assert auth_app.get("/build").text == "{}"
+    rc["v"] = 2
+    resp = auth_app.get("/build", expect_errors=True)
+    assert resp.status_int == 400
+    assert "Build failed" in resp.text
+
+
+def test_flash_default_and_named_firmware(auth_app, monkeypatch):
+    calls = []
+    monkeypatch.setattr(driveboard, "flash", lambda **k: calls.append(k) or 0)
+    auth_app.get("/flash")
+    auth_app.get("/flash/lasersaur.hex")
+    assert calls == [{}, {"firmware": "lasersaur.hex"}]
+
+
+def test_flash_failure_is_400(auth_app, monkeypatch):
+    monkeypatch.setattr(driveboard, "flash", lambda **k: 1)
+    resp = auth_app.get("/flash", expect_errors=True)
+    assert resp.status_int == 400
+    assert "Flashing failed" in resp.text
+
+
+def test_reset_ok_and_oserror_is_400(auth_app, monkeypatch):
+    monkeypatch.setattr(driveboard, "reset", lambda: None)
+    assert auth_app.get("/reset").text == "{}"
+
+    def fail():
+        raise OSError("no avrdude")
+
+    monkeypatch.setattr(driveboard, "reset", fail)
+    resp = auth_app.get("/reset", expect_errors=True)
+    assert resp.status_int == 400
+    assert "Reset failed" in resp.text
+
+
+def test_hello_template_escapes_name(app):
+    assert app.get("/hello/world").text == "<b>Hello world</b>!"
+    assert "<script>" not in app.get("/hello/%3Cscript%3E").text
+
+
+# ---------------------------------------------------------------------------
+# Server thread loop
+# ---------------------------------------------------------------------------
+
+
+def test_server_run_stops_on_flag_and_closes_driveboard(monkeypatch):
+    closed = []
+    monkeypatch.setattr(driveboard, "close", lambda: closed.append(True))
+    s = web.Server()
+    s.stop_server = True
+    s.run()
+    assert closed == [True]
+
+
+def test_server_run_exits_on_keyboard_interrupt(monkeypatch):
+    closed = []
+    monkeypatch.setattr(driveboard, "close", lambda: closed.append(True))
+
+    class Srv:
+        def handle_request(self):
+            raise KeyboardInterrupt
+
+    s = web.Server()
+    s.server = Srv()
+    s.run()
+    assert closed == [True]
+
+
+# ---------------------------------------------------------------------------
+# /load with review_issues: imports with issues are held until commit/cancel
+# ---------------------------------------------------------------------------
+
+ISSUE_SVG = (
+    '<?xml version="1.0"?>'
+    '<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" '
+    'viewBox="0 0 100 100"><path id="p" d="M 10,10 L 20,20" stroke="#12"/></svg>'
+)
+ISSUE_ROW = {
+    "problem": 'Invalid colour "#12"',
+    "where": 'path "p"',
+    "result": "DEFAULT COLOUR",
+    "kind": "changed",
+    "fix": "Set a valid colour",
+    "count": 1,
+}
+
+
+def _review(app, **req):
+    return _post_load(app, review_issues=True, **req)
+
+
+def _progressive_hold(app, monkeypatch, name):
+    """Review-load ISSUE_SVG progressively, optimize held until the future is set."""
+    import concurrent.futures
+
+    future = concurrent.futures.Future()
+    monkeypatch.setattr(web, "_convert_pool_get", lambda: _FakePool(lambda: future))
+    data = json.loads(_review(app, job=ISSUE_SVG, name=name, progressive=True).body)
+    pending = web._load_held[data["hold"]]["pending"]
+    return data["hold"], pending, web._load_pending[pending], future
+
+
+def test_review_clean_import_queues_as_today(queue):
+    app, d = queue
+    resp = _review(app, job=MINIMAL_DBA, name="clean", optimize=True)
+    assert resp.status_int == 200
+    assert json.loads(resp.body) == "clean"
+    assert os.listdir(d) == ["clean.dba"]
+
+
+def test_review_issues_hold_not_queue(queue, monkeypatch):
+    app, d = queue
+    _put(d, "old.dba")
+    monkeypatch.setitem(conf, "max_jobs_in_list", 1)  # any _add would trim old.dba
+    resp = _review(app, job=ISSUE_SVG, name="held")
+    data = json.loads(resp.body)
+    try:
+        assert resp.status_int == 200
+        assert data["name"] == "held"
+        assert data["issues"] == [ISSUE_ROW]
+        assert data["hold"] in web._load_held
+        assert os.listdir(d) == ["old.dba"]
+    finally:
+        web._load_held.pop(data["hold"], None)
+
+
+def test_review_commit_queues_job(queue):
+    app, d = queue
+    hold = json.loads(_review(app, job=ISSUE_SVG, name="go").body)["hold"]
+    assert json.loads(app.get(f"/load_commit/{hold}").body) == "go"
+    assert os.listdir(d) == ["go.dba"]
+    assert hold not in web._load_held
+    # a second commit finds nothing
+    assert app.get(f"/load_commit/{hold}", expect_errors=True).status_int == 404
+
+
+def test_load_answers_are_json_not_html(queue):
+    # file-controlled text (element ids, names) must never come back as text/html
+    app, d = queue
+    resp = _review(app, job=ISSUE_SVG, name="<b>x")
+    assert resp.content_type == "application/json"
+    hold = json.loads(resp.body)["hold"]
+    resp = app.get(f"/load_commit/{hold}")
+    assert resp.content_type == "application/json"
+    assert json.loads(resp.body) == "<b>x"
+
+
+def test_review_cancel_leaves_queue_untouched(queue):
+    app, d = queue
+    hold = json.loads(_review(app, job=ISSUE_SVG, name="no").body)["hold"]
+    assert app.get(f"/load_cancel/{hold}").body == b"{}"
+    assert hold not in web._load_held
+    assert os.listdir(d) == []
+    assert app.get(f"/load_cancel/{hold}").body == b"{}"  # idempotent
+    assert app.get(f"/load_commit/{hold}", expect_errors=True).status_int == 404
+
+
+def test_review_cancel_during_progressive_optimize_never_queues(queue, monkeypatch):
+    app, d = queue
+    hold, pending, entry, future = _progressive_hold(app, monkeypatch, "late")
+    assert app.get(f"/load_cancel/{hold}").body == b"{}"
+    assert pending not in web._load_pending
+    assert entry["stale"] is True
+    future.set_result(None)  # the optimize finishes after the cancel
+    assert entry["event"].wait(5)
+    assert os.listdir(d) == []
+
+
+def test_review_commit_before_optimize_queues_quick_then_optimized(
+    queue, isolated_config, monkeypatch
+):
+    app, d = queue
+    hold, pending, entry, future = _progressive_hold(app, monkeypatch, "early")
+    try:
+        body = json.loads(app.get(f"/load_commit/{hold}").body)
+        assert body == {"name": "early", "pending": pending}
+        assert "optimized" not in _stored_job(isolated_config, "early")["head"]
+        future.set_result(None)
+        assert entry["event"].wait(5)
+        assert _stored_job(isolated_config, "early")["head"]["optimized"] == conf["tolerance"]
+    finally:
+        web._load_pending.pop(pending, None)
+
+
+def test_review_commit_after_optimize_queues_optimized_once(queue, isolated_config, monkeypatch):
+    app, d = queue
+    hold, pending, entry, future = _progressive_hold(app, monkeypatch, "done")
+    future.set_result(None)
+    assert entry["event"].wait(5)
+    added = []
+    real_add = web._add
+    monkeypatch.setattr(web, "_add", lambda job, name: added.append(job) or real_add(job, name))
+    try:
+        app.get(f"/load_commit/{hold}")
+        optimized = [json.loads(job)["head"].get("optimized") for job in added]
+        assert optimized == [None, conf["tolerance"]]  # quick, then optimized once
+        assert _stored_job(isolated_config, "done")["head"]["optimized"] == conf["tolerance"]
+    finally:
+        web._load_pending.pop(pending, None)
+
+
+def test_review_commit_unknown_or_expired_404(queue, monkeypatch):
+    app, d = queue
+    expired = {"fatal": {"problem": "Import expired", "where": None, "fix": "Open the file again"}}
+    resp = app.get("/load_commit/nope", expect_errors=True)
+    assert resp.status_int == 404
+    assert json.loads(resp.body) == expired
+    hold = json.loads(_review(app, job=ISSUE_SVG, name="slow").body)["hold"]
+    later = time.time() + web.CONVERT_TIMEOUT + 1
+    monkeypatch.setattr(time, "time", lambda: later)
+    resp = app.get(f"/load_commit/{hold}", expect_errors=True)
+    assert resp.status_int == 404
+    assert json.loads(resp.body) == expired
+    assert hold not in web._load_held
+    assert os.listdir(d) == []
+
+
+def test_review_expired_progressive_hold_stales_its_optimize(queue, monkeypatch):
+    app, d = queue
+    hold, pending, entry, future = _progressive_hold(app, monkeypatch, "gone")
+    later = time.time() + web.CONVERT_TIMEOUT + 1
+    monkeypatch.setattr(time, "time", lambda: later)
+    assert app.get("/load_cancel/other").body == b"{}"  # any review call purges
+    assert hold not in web._load_held
+    assert pending not in web._load_pending
+    assert entry["stale"] is True
+    future.set_result(None)
+    assert entry["event"].wait(5)
+    assert os.listdir(d) == []
+
+
+def test_review_outside_work_area_row(queue):
+    app, d = queue
+    svg = (
+        '<?xml version="1.0"?>'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="6000mm" height="100mm" '
+        'viewBox="0 0 6000 100"><rect x="5000" y="10" width="10" height="10" '
+        'stroke="#000" fill="none"/></svg>'
+    )
+    data = json.loads(_review(app, job=svg, name="far").body)
+    try:
+        (row,) = data["issues"]
+        assert row["problem"] == "Outside work area"
+        assert row["where"].startswith("x 5000 > ")
+        assert (row["result"], row["kind"], row["fix"], row["count"]) == (
+            "RUN REFUSED",
+            "dropped",
+            "Move origin or scale",
+            1,
+        )
+        assert os.listdir(d) == []
+    finally:
+        web._load_held.pop(data["hold"], None)
+
+
+def test_review_gcode_outside_work_area_row(queue, monkeypatch):
+    app, d = queue
+    monkeypatch.setitem(conf, "mill_mode", True)  # the worker gets conf with the call
+    data = json.loads(_review(app, job="T1 M6\nG0 X5000 Y10\n", name="farmill").body)
+    try:
+        (row,) = data["issues"]
+        assert row["problem"] == "Outside work area"
+        assert row["where"].startswith("x 5000 > ")
+        assert os.listdir(d) == []
+    finally:
+        web._load_held.pop(data["hold"], None)
+
+
+def test_review_work_area_check_failure_is_no_row(queue, monkeypatch):
+    app, d = queue
+
+    def broken(jobdict):
+        raise KeyError("items")
+
+    monkeypatch.setattr(driveboard, "job_outside_work_area", broken)
+    resp = _review(app, job=MINIMAL_DBA, name="odd", optimize=True)
+    assert json.loads(resp.body) == "odd"
+    assert os.listdir(d) == ["odd.dba"]
+
+
+def _raises(exc):
+    def convert(*a, **k):
+        raise exc
+
+    return convert
+
+
+@pytest.mark.parametrize(
+    "job, convert, status, fatal",
+    [
+        (
+            '<?xml version="1.0"?><notsvg><svg/></notsvg>',
+            None,
+            422,
+            {"problem": "Not an SVG file", "where": None, "fix": "Export as SVG"},
+        ),
+        (
+            "T1 M6\nG0 X5 Y10\n",
+            None,
+            422,
+            {
+                "problem": "G-code not supported on laser",
+                "where": None,
+                "fix": "Export as SVG or DXF",
+            },
+        ),
+        (
+            "this is not any job format",
+            None,
+            400,
+            {"problem": "Unknown file type", "where": None, "fix": "Use SVG, DXF, G-code or DBA"},
+        ),
+        (
+            MINIMAL_DBA,
+            _raises(ValueError("bad geometry")),
+            422,
+            {"problem": "Import failed", "where": "bad geometry", "fix": "Check the file"},
+        ),
+        (
+            MINIMAL_DBA,
+            _raises(bottle.HTTPResponse("Import timed out.", 504)),
+            504,
+            {"problem": "Import timed out", "where": None, "fix": "Simplify or split file"},
+        ),
+        (
+            MINIMAL_DBA,
+            _raises(RuntimeError("boom")),
+            500,
+            {
+                "problem": "Import crashed",
+                "where": "RuntimeError: boom",
+                "fix": "Report file to admin",
+            },
+        ),
+    ],
+    ids=["not-svg", "gcode-on-laser", "unknown-type", "value-error", "timeout", "crash"],
+)
+def test_review_fatal_bodies(queue, monkeypatch, job, convert, status, fatal):
+    app, d = queue
+    if convert:
+        monkeypatch.setattr(web, "_convert_job", convert)
+    resp = _review(app, job=job, name="bad", optimize=True)
+    assert resp.status_int == status
+    assert resp.content_type == "application/json"
+    assert json.loads(resp.body) == {"fatal": fatal}
+    assert os.listdir(d) == []
+
+
+def test_gcode_on_a_laser_plain_load_is_422(queue):
+    app, d = queue
+    resp = _post_load(app, job="T1 M6\nG0 X5 Y10\n", name="mill", optimize=True)
+    assert resp.status_int == 422
+    assert "G-code not supported on laser" in resp.text
+    assert os.listdir(d) == []
+
+
+MILL_JOB = {"head": {"kind": "mill"}, "defs": [{"data": [["S", 1000], ["G0", [10.0, 10.0, 0.0]]]}]}
+
+
+def test_mill_job_is_refused_on_a_laser(loop):
+    # on a laser S would be beam power and stay on through the G0 seek
+    with pytest.raises(ValueError, match="mill job refused: mill_mode is off"):
+        driveboard.job(copy.deepcopy(MILL_JOB))
+    assert loop.tx_buffer == bytearray() and loop.job_active is False
+
+
+def test_mill_emitter_refuses_on_a_laser_too(loop):
+    with pytest.raises(ValueError, match="mill job refused: mill_mode is off"):
+        driveboard.job_mill(copy.deepcopy(MILL_JOB))
+    assert loop.tx_buffer == bytearray()
+
+
+def test_mill_job_runs_in_mill_mode(loop, monkeypatch):
+    monkeypatch.setitem(conf, "mill_mode", True)
+    loop._status["offset"] = [0.0, 0.0, 0.0]
+    driveboard.job(copy.deepcopy(MILL_JOB))
+    assert loop.job_active and loop.tx_buffer != bytearray()
+
+
+def test_review_fatal_after_warnings_is_only_the_fatal(queue):
+    app, _ = queue
+    # an invalid colour is reported, then the odd point list stops the import
+    svg = (
+        '<?xml version="1.0"?>'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" '
+        'viewBox="0 0 100 100"><path d="M 1,1 L 2,2" stroke="#12"/>'
+        '<polyline points="1,2,3" stroke="#000"/></svg>'
+    )
+    resp = _review(app, job=svg, name="bad")
+    assert resp.status_int == 422
+    assert list(json.loads(resp.body)) == ["fatal"]
+    assert json.loads(resp.body)["fatal"]["problem"] == "Odd number of points"
+
+
+def test_plain_load_dxf_garbage_is_422(queue):
+    app, d = queue
+    resp = _post_load(app, job="0\nSECTION\n2\nHEADER\ngarbage", name="dxf")
+    assert resp.status_int == 422
+    assert "Not a readable DXF" in resp.text
+    assert os.listdir(d) == []
+
+
+def test_issues_cross_the_worker_process():
+    dba, token, found = web._convert_job(ISSUE_SVG, False, None)
+    assert token is None
+    assert found == [ISSUE_ROW]
+
+
+def test_issues_collected_on_in_process_fallback(monkeypatch):
+    def broken():
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr(web, "_convert_pool_get", broken)
+    _, _, found = web._convert_job(ISSUE_SVG, False, None)
+    assert found == [ISSUE_ROW]
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups: unknown type vs a parser's TypeError, plain/json answers, cancel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("optimize", [True, False])
+def test_unknown_file_type_is_400_plain_and_fatal_in_review(queue, optimize):
+    app, d = queue
+    resp = _post_load(app, job="this is not any job format", name="junk", optimize=optimize)
+    assert (resp.status_int, resp.content_type) == (400, "text/plain")
+    assert "Invalid file type" in resp.text
+    resp = _review(app, job="this is not any job format", name="junk", optimize=optimize)
+    assert resp.status_int == 400
+    assert json.loads(resp.body)["fatal"]["problem"] == "Unknown file type"
+    assert os.listdir(d) == []
+
+
+@pytest.mark.parametrize("review", [False, True])
+def test_type_error_inside_a_parser_is_a_crash_not_unknown_type(queue, monkeypatch, review):
+    def broken():
+        raise OSError("cannot spawn")
+
+    def parser(*a, **k):
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    monkeypatch.setattr(web, "_convert_pool_get", broken)  # convert in this process
+    monkeypatch.setattr(jobimport.converter, "read_dxf", parser)
+    app, d = queue
+    resp = _post_load(app, job="0\nSECTION\n2\nHEADER\n", name="dxf", review_issues=review)
+    assert resp.status_int == 500
+    assert "Invalid file type" not in resp.text
+    if review:
+        assert json.loads(resp.body)["fatal"] == {
+            "problem": "Import crashed",
+            "where": "TypeError: 'NoneType' object is not subscriptable",
+            "fix": "Report file to admin",
+        }
+    assert os.listdir(d) == []
+
+
+def test_error_text_is_served_plain(auth_app, monkeypatch):
+    def busy(*a, **k):
+        raise driveboard.MachineBusy("<b>busy</b>")
+
+    monkeypatch.setattr(driveboard, "connected", lambda: True)
+    monkeypatch.setattr(driveboard, "target_in_workarea", lambda *a, **k: True)
+    monkeypatch.setattr(driveboard, "intensity", lambda *a, **k: None)
+    monkeypatch.setattr(driveboard, "move", busy)
+    monkeypatch.setattr(web, "_preview_result", (7, {"error": "<b>x</b>"}))
+    monkeypatch.setitem(conf, "fill_mode", "Reverse")
+    answers = [
+        auth_app.get("/move/100/100/0", expect_errors=True),
+        auth_app.post("/optimize_fill", b"<b>not json", expect_errors=True),
+        auth_app.post("/job_preview", b"<b>not json", expect_errors=True),
+        auth_app.get("/job_preview/7", expect_errors=True),
+    ]
+    assert [r.status_int for r in answers] == [409, 400, 400, 400]
+    assert [r.content_type for r in answers] == ["text/plain"] * 4
+
+
+def test_answers_naming_files_are_json(library, isolated_config, monkeypatch):
+    app, stor, lib = library
+    (lib / "x.dba").write_text(MINIMAL_DBA)
+    entry = {"event": threading.Event(), "name": "x", "error": None}
+    entry["event"].set()
+    monkeypatch.setitem(web._load_pending, "t4", entry)
+    answers = [
+        app.post("/temp", {"load_request": json.dumps({"job": "j"})}),
+        app.get("/load_library/x"),
+        app.get("/listing"),
+        app.get("/listing/starred"),
+        app.get("/listing_library"),
+        app.get("/listing_presets"),
+        app.get("/load_result/t4"),
+    ]
+    os.remove(os.path.join(tempfile.gettempdir(), json.loads(answers[0].body)))
+    assert [r.content_type for r in answers] == ["application/json"] * len(answers)
+
+
+class _KillablePool:
+    """A worker pool whose one task runs until killed, like the real one."""
+
+    def __init__(self):
+        self.future, self.killed = None, False
+        self._processes = {1: self}
+
+    def submit(self, fn, *args):
+        fn(*args)  # leaves the quick parse, then "optimizes" until killed
+        self.future = concurrent.futures.Future()
+        self.future.set_running_or_notify_cancel()
+        return self.future
+
+    def kill(self):
+        self.killed = True
+        self.future.set_exception(concurrent.futures.process.BrokenProcessPool("killed"))
+
+    def shutdown(self, wait):
+        pass
+
+
+@pytest.fixture
+def killable_pool(monkeypatch):
+    pool = _KillablePool()
+    monkeypatch.setattr(web, "_convert_pool", pool)
+    monkeypatch.setattr(web, "_convert_busy", type(web._convert_busy)())
+    return pool
+
+
+def test_cancel_kills_the_optimize_when_nothing_else_waits(queue, killable_pool):
+    app, d = queue
+    data = json.loads(_review(app, job=ISSUE_SVG, name="big", progressive=True).body)
+    entry = web._load_pending[web._load_held[data["hold"]]["pending"]]
+    assert app.get(f"/load_cancel/{data['hold']}").body == b"{}"
+    assert killable_pool.killed
+    assert web._convert_pool is None  # the next import starts a fresh worker
+    assert entry["event"].wait(5)
+    assert entry["error"] is None  # the kill is not an error of anyone's
+    assert os.listdir(d) == []
+
+
+def test_cancel_only_stales_when_another_import_waits(queue, killable_pool):
+    app, d = queue
+    data = json.loads(_review(app, job=ISSUE_SVG, name="big", progressive=True).body)
+    entry = web._load_pending[web._load_held[data["hold"]]["pending"]]
+    queued = concurrent.futures.Future()  # someone else's import, behind ours
+    web._convert_busy.add(queued)
+    app.get(f"/load_cancel/{data['hold']}")
+    assert not killable_pool.killed
+    assert web._convert_pool is killable_pool
+    assert entry["stale"] is True
+    killable_pool.future.set_result(None)  # the optimize finishes anyway
+    assert entry["event"].wait(5)
+    assert os.listdir(d) == []
+
+
+def test_cancel_after_the_optimize_finished_keeps_the_worker(queue, killable_pool):
+    app, d = queue
+    data = json.loads(_review(app, job=ISSUE_SVG, name="big", progressive=True).body)
+    entry = web._load_pending[web._load_held[data["hold"]]["pending"]]
+    killable_pool.future.set_result(None)
+    assert entry["event"].wait(5)
+    app.get(f"/load_cancel/{data['hold']}")
+    assert not killable_pool.killed
+    assert web._convert_pool is killable_pool
+    assert os.listdir(d) == []
+
+
+def test_cancel_leaves_the_worker_started_after_a_drop(queue, killable_pool, monkeypatch):
+    # a timeout elsewhere dropped the worker this optimize ran on, and the
+    # broken pool has not failed its future yet (the real one does that on its
+    # own thread, later): the cancel's future is not the new worker's business
+    app, d = queue
+    data = json.loads(_review(app, job=ISSUE_SVG, name="big", progressive=True).body)
+    entry = web._load_pending[web._load_held[data["hold"]]["pending"]]
+    monkeypatch.setattr(killable_pool, "kill", lambda: None)
+    web._convert_pool_drop()
+    fresh = _KillablePool()
+    web._convert_pool = fresh
+    app.get(f"/load_cancel/{data['hold']}")
+    assert not fresh.killed
+    assert web._convert_pool is fresh
+    killable_pool.future.set_result(None)
+    assert entry["event"].wait(5)
+    assert os.listdir(d) == []

@@ -27,7 +27,8 @@ function status_init() {
     stops: { dirty: true },
     // possible keys:
     // x1, x2, y1, y2, z1, z2,
-    // requested, buffer, marker, data, command, parameter, transmission
+    // requested, buffer, marker, data, command, parameter, transmission,
+    // reset (controller rebooted, cleared by homing)
 
     info: { dirty: true },
     // possible keys: door, chiller
@@ -423,6 +424,7 @@ var status_handlers = {
     $("#status_transmission")
       .removeClass("label-danger")
       .addClass("label-success");
+    $("#status_reset").removeClass("label-danger").addClass("label-success");
     $("#run_btn").removeClass("disabled");
     $("#boundary_btn").removeClass("disabled");
     $("#pause_btn").removeClass("disabled");
@@ -498,6 +500,12 @@ var status_handlers = {
           .removeClass("label-success")
           .addClass("label-danger");
       }
+      if (status.stops.reset) {
+        // the controller rebooted mid-session, only homing clears it
+        $("#status_reset")
+          .removeClass("label-success")
+          .addClass("label-danger");
+      }
       if (!$.isEmptyObject(status.stops)) {
         $("#run_btn").addClass("disabled");
         $("#boundary_btn").addClass("disabled");
@@ -511,6 +519,19 @@ var status_handlers = {
         $("#addfill_btn").addClass("disabled");
       }
     }
+    // what the backend recorded about an unexplained stop, on hover
+    [
+      "buffer",
+      "marker",
+      "data",
+      "command",
+      "parameter",
+      "transmission",
+      "reset",
+    ].forEach(function (key) {
+      var stopped = status.stops && status.stops[key];
+      $("#status_" + key).attr("title", stopped ? status.incident || "" : "");
+    });
     status_set_main_button(status);
   },
   info: function (status) {

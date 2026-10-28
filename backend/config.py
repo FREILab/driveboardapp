@@ -45,6 +45,9 @@ conf = {
     "tolerance": 0.01,
     "workspace": [1220, 610, 0],
     "jog_soft_limits": True,
+    # mm/min. Below the homing approach, 0.4 x firmware CONFIG_SEEKRATE, which
+    # runs into the switches by design (3200 on the laser boards).
+    "jog_unhomed_feedrate": 2000,
     "grid_mm": 100,
     "seekrate": 6000,
     "feedrate": 2000,
@@ -88,7 +91,8 @@ conf_defaults = copy.deepcopy(conf)
 
 userconfigurable = {
     "workspace": "[x,y,z] dimensions of machine's work area in mm.",
-    "jog_soft_limits": "Hold jog moves inside the work area so they cannot run into a limit switch.",
+    "jog_soft_limits": "Once the machine is homed, hold jog moves inside the work area so they cannot run into a limit switch. Off, a homed machine jogs unclamped at the seek rate.",
+    "jog_unhomed_feedrate": "Jog feed rate in mm/min until the machine is homed. Without homing the work area edges are unknown, so jogs are not held inside it and run at this slower rate instead.",
     "grid_mm": "Visual grid of UI in mm.",
     "seekrate": "Seek rate in mm/min.",
     "feedrate": "Default feed rate in mm/min.",
@@ -350,6 +354,8 @@ def load(configname):
         with open(path) as fp:
             try:
                 userconf = json.load(fp)
+                if not isinstance(userconf, dict):
+                    raise ValueError("top-level JSON is not an object")
                 for k in list(userconfigurable.keys()):
                     if k in userconf:
                         conf[k] = userconf[k]

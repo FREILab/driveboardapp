@@ -4,7 +4,7 @@ import json
 
 from config import conf
 
-from . import pathoptimizer
+from . import issues, pathoptimizer
 from .dba import resolve_image_data
 from .dedupe import dedupe_job
 from .dxf_parser import DXFParser
@@ -12,6 +12,11 @@ from .gcode_reader import GcodeReader
 from .imagedata import normalize_image_data, preview_image_data
 from .svg_reader import SVGReader
 from .utilities import matrixApply
+
+
+class UnknownFileType(TypeError):
+    """The job is none of the kinds convert reads, as opposed to a TypeError
+    from inside a reader, which is a bug."""
 
 
 def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
@@ -43,10 +48,13 @@ def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
     elif type_ == "dxf":
         job = read_dxf(job, tolerance, optimize=optimize)
     elif type_ == "gcode":
+        if not conf["mill_mode"]:
+            # a laser would run the spindle S word as beam power, on during seeks
+            raise issues.ImportFailed("G-code not supported on laser", "Export as SVG or DXF")
         job = read_gcode(job, tolerance, optimize=optimize)
     else:
         print("ERROR: file type not recognized")
-        raise TypeError
+        raise UnknownFileType
     if matrix:
         apply_alignment_matrix(job, matrix)
     # whatever the source, hand the frontend a raster it can actually display
@@ -65,6 +73,12 @@ def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
         if data not in previews:
             previews[data] = preview_image_data(data)
         job["sources"][key] = previews[data]
+    # the mill frontend reads these from the job itself
+    rows = issues.snapshot()
+    if rows:
+        job["head"]["warnings"] = [
+            row["problem"] + (f" ({row['where']})" if row["where"] else "") for row in rows
+        ]
     return job
 
 
@@ -172,7 +186,7 @@ def read_svg(svg_string, tolerance, forced_dpi=None, optimize=True):
         for tag in res["lasertags"]:
             if len(tag) == 11:
                 idxs = []
-                for colidx in range(5, 10):
+                for colidx in range(5, 11):
                     idxs.extend(color_to_idxs.get(tag[colidx], []))
                 if "passes" not in job:
                     job["passes"] = []
@@ -182,10 +196,6 @@ def read_svg(svg_string, tolerance, forced_dpi=None, optimize=True):
     dedupe_job(job)
     if optimize:
         optimize_job(job, tolerance)
-
-    # Include any warnings from conversion
-    if "warnings" in res:
-        job["head"]["warnings"] = res["warnings"]
 
     return job
 
@@ -244,8 +254,8 @@ def get_type(job):
             type_ = "gcode"
         else:
             print("ERROR: Cannot figure out file type 1.")
-            raise TypeError
+            raise UnknownFileType
     else:
         print("ERROR: Cannot figure out file type 2.")
-        raise TypeError
+        raise UnknownFileType
     return type_

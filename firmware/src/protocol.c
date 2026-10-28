@@ -140,6 +140,9 @@ inline void protocol_loop() {
       // when stop, ignore serial chars
       // NOTE: A stop can happen any time during the protocol loop
       //       because both stepper and serial rx interrupt my trigger it.
+      //       A CMD_RESUME can clear it any time too, so this check alone
+      //       does not cover the read: a byte read while stopped comes back
+      //       as CMD_NONE (see serial_protocol_read).
       protocol_idle();
     } else {
       if(chr < 128) {  /////////////////////////////// marker
@@ -196,14 +199,17 @@ inline void on_cmd(uint8_t command) {
       st.ref_mode = st.ref_mode_store;
       break;
     case CMD_HOMING:
-      stepper_homing_cycle();
       clear_vector(st.offset);
-      // move head to table offset
-      st.target[X_AXIS] = CONFIG_X_ORIGIN_OFFSET;
-      st.target[Y_AXIS] = CONFIG_Y_ORIGIN_OFFSET;
-      st.target[Z_AXIS] = CONFIG_Z_ORIGIN_OFFSET;
-      planner_line( st.target[X_AXIS], st.target[Y_AXIS], st.target[Z_AXIS],
-                    st.feedrate, 0, 0.0 );
+      // an abandoned homing leaves its stop set and the head unhomed,
+      // so there is no origin to move to
+      if (stepper_homing_cycle()) {
+        // move head to table offset
+        st.target[X_AXIS] = CONFIG_X_ORIGIN_OFFSET;
+        st.target[Y_AXIS] = CONFIG_Y_ORIGIN_OFFSET;
+        st.target[Z_AXIS] = CONFIG_Z_ORIGIN_OFFSET;
+        planner_line( st.target[X_AXIS], st.target[Y_AXIS], st.target[Z_AXIS],
+                      st.feedrate, 0, 0.0 );
+      }
       break;
     case CMD_OFFSET_STORE:
       st.offset_store[X_AXIS] = st.offset[X_AXIS];
@@ -358,14 +364,6 @@ inline void protocol_idle() {
   //       For example calling it during serial write waits
   //       may cause a recursive regression.
 
-
-  // if (planner_blocks_available()) {
-  //   // DEBUG: turn on
-  //   ASSIST_PORT |= (1 << AIR_ASSIST_BIT);
-  // } else {
-  //   // DEBUG: turn off
-  //   ASSIST_PORT &= ~(1 << AIR_ASSIST_BIT);
-  // }
 
   #ifdef ENABLE_INTERLOCKS
     if (SENSE_DOOR_OPEN || SENSE_CHILLER_OFF) {
@@ -525,56 +523,3 @@ static uint16_t stack_clearance() {
   return c;
 }
 ///////////////////////////////////////////////////////////////////////////////
-
-
-
-
-
-// inline double num_from_chars(uint8_t char0, uint8_t char1, uint8_t char2, uint8_t char3) {
-//   // chars expected to be extended ascii [128,255]
-//   // 28bit total, three decimals are restored
-//   // number is in [-134217.728, 134217.727]
-//   return ((((char3-128)*2097152+(char2-128)*16384+(char1-128)*128+(char0-128))-134217728)/1000.0);
-// }
-
-// inline void chars_from_num(num, uint8_t* char0, uint8_t* char1, uint8_t* char2, uint8_t* char3) {
-//   // num to be [-134217.728, 134217.727]
-//   // three decimals are retained
-//   uint32_t num = lround(num*1000 + 134217728);
-//   char0 = (num&127)+128
-//   char1 = ((num&(127<<7))>>7)+128
-//   char2 = ((num&(127<<14))>>14)+128
-//   char3 = ((num&(127<<21))>>21)+128
-//   return char3, char2, char1, char0
-// }
-
-// IN PYTHON
-// def double_from_chars_4(char3, char2, char1, char0):
-//     # chars expected to be extended ascii [128,255]
-//     return ((((char3-128)*128*128*128 + (char2-128)*128*128 + (char1-128)*128 + (char0-128) )- 2**27)/1000.0)
-//
-// def chars4_from_double(num):
-//     # num to be [-134217.728, 134217.727]
-//     # three decimals are retained
-//     num = int(round( (num*1000) + (2**27)))
-//     char0 = (num&127)+128
-//     char1 = ((num&(127<<7))>>7)+128
-//     char2 = ((num&(127<<14))>>14)+128
-//     char3 = ((num&(127<<21))>>21)+128
-//     return char3, char2, char1, char0
-//
-// def check(val):
-//     char3, char2, char1, char0 = chars4_from_double(val)
-//     val2 = double_from_chars_4(char3, char2, char1, char0)
-//     print "assert %s == %s" % (val, val2)
-//     # assert val == val2
-//
-// check(13925.2443)
-
-
-
-// int freeRam () {
-//   extern int __heap_start, *__brkval;
-//   int v;
-//   return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
-// }
