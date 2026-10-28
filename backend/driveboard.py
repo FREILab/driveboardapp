@@ -1,5 +1,6 @@
 # -*- coding: UTF-8 -*-
 import base64
+import collections
 import contextlib
 import copy
 import datetime
@@ -8,6 +9,7 @@ import io
 import itertools
 import json
 import math
+import os
 import platform
 import sys
 import threading
@@ -239,6 +241,38 @@ markers_rx = {
     "k": "INFO_DEBUG",
 }
 
+# stop error marker -> (status stops key, what to print)
+STOP_MARKERS = {
+    ERROR_LIMIT_HIT_X1: ("x1", None),
+    ERROR_LIMIT_HIT_X2: ("x2", None),
+    ERROR_LIMIT_HIT_Y1: ("y1", None),
+    ERROR_LIMIT_HIT_Y2: ("y2", None),
+    ERROR_LIMIT_HIT_Z1: ("z1", None),
+    ERROR_LIMIT_HIT_Z2: ("z2", None),
+    ERROR_SERIAL_STOP_REQUEST: ("requested", "INFO firmware: stop request"),
+    ERROR_RX_BUFFER_OVERFLOW: ("buffer", "ERROR firmware: rx buffer overflow"),
+    ERROR_INVALID_MARKER: ("marker", "ERROR firmware: invalid marker"),
+    ERROR_INVALID_DATA: ("data", "ERROR firmware: invalid data"),
+    ERROR_INVALID_COMMAND: ("command", "ERROR firmware: invalid command"),
+    ERROR_INVALID_PARAMETER: ("parameter", "ERROR firmware: invalid parameter"),
+    ERROR_TRANSMISSION_ERROR: ("transmission", "ERROR firmware: transmission"),
+    ERROR_SERIAL_WATCHDOG: ("watchdog", "ERROR firmware: serial watchdog (host comms lost)"),
+}
+LIMIT_STOPS = {"x1", "x2", "y1", "y2", "z1", "z2"}
+# Stops with an obvious cause: someone asked for it, or the head ran into a
+# limit. Every other one is a fault worth a record.
+EXPLAINED_STOPS = {"requested"} | LIMIT_STOPS
+
+# Unexplained stops are logged here, in the config directory, the newest last.
+INCIDENTS_FILE = "incidents.jsonl"
+INCIDENTS_KEEP = 50
+
+
+def _hexlog(ring):
+    """Bytes as hex, control bytes bracketed so commands stand out."""
+    return " ".join(f"[{b:02x}]" if b < 32 else f"{b:02x}" for b in ring)
+
+
 SerialLoop = None
 fallback_msg_thread = None
 # One job goes onto the wire at a time, see job(). _dispatch_thread is the
@@ -306,6 +340,30 @@ class SerialLoopClass(threading.Thread):
         # Idle is reported only with an empty rx buffer, the one proof the
         # tally has drained.
         self.last_firmware_idle = 0.0
+        # Kept free on top of a chunk. A stall resync zeroes the tally while
+        # the controller may hold up to 15 bytes read but not yet acked (it
+        # acks every 16, firmware/src/serial.c), so the tally can later run
+        # that far low. The margin keeps such a drift from overflowing.
+        self.FIRMBUF_MARGIN = 16
+        # CMD_RESUME resets the controller's rx buffer when it arrives, not
+        # when sent: acks and status frames already in the pipe still describe
+        # the old buffer. Hold sends and ignore those for a little longer than
+        # the pipe takes to empty (255 doubled bytes ~90ms, plus USB latency).
+        self.RESUME_SETTLE = 0.25  # seconds
+        self.resume_settle_until = 0.0
+        # The controller rebooted under a live session, see _controller_reset.
+        # Stands as a stop until the machine is homed.
+        self.controller_reset = False
+        # What went over the wire last and the anomalies counted, for the
+        # incident record written when an unexplained stop shows up.
+        self.tx_log = collections.deque(maxlen=64)
+        self.rx_log = collections.deque(maxlen=64)
+        self.acks_after_resume = 0
+        self.hello_midsession = 0
+        self.negative_tally_clamps = 0
+        self.last_resume_t = 0.0
+        self.stop_episode = False  # a stop was seen since the last resume
+        self.incident = None  # summary of the latest incident
         # The controller stops itself when it hears nothing for this long
         # (its serial watchdog, firmware/src/serial.c). A gap past the stall
         # mark means it has stopped, or is about to.
@@ -522,19 +580,31 @@ class SerialLoopClass(threading.Thread):
         if conf["print_serial_data"] and chunk != b"":
             timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
             print(timestamp + " Receiving: " + prettify_serial(chunk, markers=markers_rx))
+        self.rx_log.extend(chunk)
+        # see RESUME_SETTLE: what arrives now was sent before the resume landed
+        settling = time.time() < self.resume_settle_until
         for data_num in chunk:
             data_char = chr(data_num)
             if data_num < 32:  ### flow
                 if data_char == CMD_CHUNK_PROCESSED:
+                    if settling:
+                        self.acks_after_resume += 1
+                        continue  # acks bytes the resume already discarded
                     self.firmbuf_used -= self.TX_CHUNK_SIZE
                     self.last_tx_progress = time.time()
                     if self.firmbuf_used < 0:
-                        print("ERROR: firmware buffer tracking too low")
+                        # more acked than sent: the tally drifted, and a low
+                        # tally is the one that overflows the controller
+                        self.negative_tally_clamps += 1
+                        print("ERROR: firmware buffer tracking too low, clamping to 0")
+                        self.firmbuf_used = 0
                 elif data_char == STATUS_END:
                     # status frame complete, compile status
                     self._status, self._s = self._s, self._status  # flip
                     self._status["paused"] = self._paused
                     self._status["serial"] = bool(self.device)
+                    if self.controller_reset:
+                        self._status["stops"]["reset"] = True  # until homed
                     if self.job_size == 0:
                         self._status["progress"] = 1.0
                         self._status["remaining"] = [0.0, 0.0]
@@ -554,55 +624,20 @@ class SerialLoopClass(threading.Thread):
                     self._s["underruns"] = self._status["underruns"]
                     self._s["stackclear"] = self._status["stackclear"]
             elif 31 < data_num < 65:  ### stop error markers
+                if settling:
+                    continue  # a frame from before the resume landed
                 # chr is in [!-@], process flag
-                if data_char == ERROR_LIMIT_HIT_X1:
-                    self._s["stops"]["x1"] = True
-                elif data_char == ERROR_LIMIT_HIT_X2:
-                    self._s["stops"]["x2"] = True
-                elif data_char == ERROR_LIMIT_HIT_Y1:
-                    self._s["stops"]["y1"] = True
-                elif data_char == ERROR_LIMIT_HIT_Y2:
-                    self._s["stops"]["y2"] = True
-                elif data_char == ERROR_LIMIT_HIT_Z1:
-                    self._s["stops"]["z1"] = True
-                elif data_char == ERROR_LIMIT_HIT_Z2:
-                    self._s["stops"]["z2"] = True
-                elif data_char == ERROR_SERIAL_STOP_REQUEST:
-                    self._s["stops"]["requested"] = True
-                    print("INFO firmware: stop request")
-                elif data_char == ERROR_RX_BUFFER_OVERFLOW:
-                    self._s["stops"]["buffer"] = True
-                    print("ERROR firmware: rx buffer overflow")
-                elif data_char == ERROR_INVALID_MARKER:
-                    self._s["stops"]["marker"] = True
-                    print("ERROR firmware: invalid marker")
-                elif data_char == ERROR_INVALID_DATA:
-                    self._s["stops"]["data"] = True
-                    print("ERROR firmware: invalid data")
-                elif data_char == ERROR_INVALID_COMMAND:
-                    self._s["stops"]["command"] = True
-                    print("ERROR firmware: invalid command")
-                elif data_char == ERROR_INVALID_PARAMETER:
-                    self._s["stops"]["parameter"] = True
-                    print("ERROR firmware: invalid parameter")
-                elif data_char == ERROR_TRANSMISSION_ERROR:
-                    self._s["stops"]["transmission"] = True
-                    print("ERROR firmware: transmission")
-                elif data_char == ERROR_SERIAL_WATCHDOG:
-                    self._s["stops"]["watchdog"] = True
-                    print("ERROR firmware: serial watchdog (host comms lost)")
-                else:
-                    print("ERROR: invalid stop error marker")
+                key, msg = STOP_MARKERS.get(data_char, (None, "ERROR: invalid stop error marker"))
+                if key:
+                    self._s["stops"][key] = True
+                if msg:
+                    print(msg)
+                if not self.stop_episode:
+                    self.stop_episode = True
+                    if key not in EXPLAINED_STOPS:
+                        self._record_incident(data_char, key or "unknown")
                 # in stop mode, print recent transmission, unless stop request, or limit
-                if (
-                    data_char != ERROR_SERIAL_STOP_REQUEST
-                    and data_char != ERROR_LIMIT_HIT_X1
-                    and data_char != ERROR_LIMIT_HIT_X2
-                    and data_char != ERROR_LIMIT_HIT_Y1
-                    and data_char != ERROR_LIMIT_HIT_Y2
-                    and data_char != ERROR_LIMIT_HIT_Z1
-                    and data_char != ERROR_LIMIT_HIT_Z2
-                ):
+                if key not in EXPLAINED_STOPS:
                     recent_data = self.tx_buffer[max(0, self.tx_pos - 128) : self.tx_pos]
                     print("RECENT TX BUFFER:")
                     for data_num in recent_data:
@@ -712,11 +747,87 @@ class SerialLoopClass(threading.Thread):
                     self.pdata_count += 1
                 else:
                     print("ERROR: invalid data")
+            elif data_char == INFO_HELLO:
+                self._controller_reset()
             else:
                 print(data_num)
                 print(data_char)
                 print("ERROR: invalid marker")
                 self.pdata_count = 0
+
+    def _controller_reset(self):
+        """The controller said hello again: it rebooted mid-session.
+
+        Brown-out, a reset button, a USB glitch toggling DTR. Whatever it was,
+        the controller lost its position, offsets and rx buffer, so the job on
+        the wire is gone and streaming the rest would run it at the wrong
+        place. Hold it in stop mode and stand a "reset" stop until homed.
+        """
+        print("ERROR: controller reset mid-session, job aborted, home the machine")
+        self.hello_midsession += 1
+        self.tx_buffer = bytearray()
+        self.tx_pos = 0
+        self.job_size = 0
+        self.timer.reset()
+        self.job_active = False
+        self._paused = False
+        self.firmbuf_used = 0  # a fresh controller has an empty rx buffer
+        self.pdata_count = 0
+        # cut off a job still being queued, as stop() does, until it exits
+        self.discard_writes = _dispatch_thread is not None
+        self.clear_discard_after_dispatch = self.discard_writes
+        self.request_stop = True
+        self.controller_reset = True
+        self._status["stops"]["reset"] = True
+        self.stop_episode = True
+        self._record_incident(INFO_HELLO, "reset")
+        self.incident = "Controller rebooted, home the machine. " + self.incident
+
+    def _record_incident(self, code, label):
+        """Keep a record of an unexplained stop for someone to look at later.
+
+        Goes to incidents.jsonl in the config directory, the newest last, and
+        as a one line summary into the status.
+        """
+        now = time.time()
+        pos = self.tx_pos
+        record = {
+            "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "stop": label,
+            "code": code,
+            "job_active": self.job_active,
+            "tx_pos": pos,
+            "job_size": self.job_size,
+            "firmbuf_used": self.firmbuf_used,
+            # sent a raster data start with no end after it yet
+            "mid_raster": self.tx_buffer.rfind(16, 0, pos) > self.tx_buffer.rfind(17, 0, pos),
+            "since_resume": round(now - self.last_resume_t, 3) if self.last_resume_t else None,
+            "acks_after_resume": self.acks_after_resume,
+            "hello_midsession": self.hello_midsession,
+            "negative_tally_clamps": self.negative_tally_clamps,
+            "tx": _hexlog(self.tx_log),
+            "rx": _hexlog(self.rx_log),
+        }
+        summary = f"{label} stop at {record['time'][11:]}"
+        if self.job_size:
+            summary += f", job byte {pos}/{self.job_size}"
+        summary += f", buffer {self.firmbuf_used}"
+        if record["mid_raster"]:
+            summary += ", mid raster"
+        if record["since_resume"] is not None:
+            summary += f", {record['since_resume']}s after resume"
+        self.incident = summary + ". Details: /incidents"
+        path = os.path.join(conf["confdir"], INCIDENTS_FILE)
+        try:
+            lines = []
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fp:
+                    lines = fp.readlines()
+            lines.append(json.dumps(record) + "\n")
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.writelines(lines[-INCIDENTS_KEEP:])
+        except (OSError, TypeError) as e:
+            print(f"WARN: could not write {path}: {e}")
 
     def _catch_watchdog_stall(self):
         """Pre-empt a serial-watchdog stop this host provoked by going quiet.
@@ -766,8 +877,7 @@ class SerialLoopClass(threading.Thread):
             self.request_stop = False
 
         if self.request_resume:
-            self._send_char(CMD_RESUME)
-            self.firmbuf_used = 0  # a resume resets the hardware's rx buffer
+            self._send_resume()
             self.request_resume = False
             self.reset_status()
             self.request_status = 2  # super request
@@ -776,8 +886,7 @@ class SerialLoopClass(threading.Thread):
             # Same command, but the machine kept position and settings through
             # the watchdog stop, so the cached status stays valid and is left
             # standing. Only the stop flag goes.
-            self._send_char(CMD_RESUME)
-            self.firmbuf_used = 0  # a resume resets the hardware's rx buffer
+            self._send_resume()
             self.request_watchdog_resume = False
             self._s["stops"].pop("watchdog", None)
             self._status["stops"].pop("watchdog", None)
@@ -796,8 +905,10 @@ class SerialLoopClass(threading.Thread):
             self.request_unpause = False
         ### send buffer chunk
         if self.tx_buffer and len(self.tx_buffer) > self.tx_pos:
-            if not self._paused:
-                if (self.FIRMBUF_SIZE - self.firmbuf_used) > self.TX_CHUNK_SIZE:
+            if not self._paused and time.time() >= self.resume_settle_until:
+                if (
+                    self.FIRMBUF_SIZE - self.firmbuf_used
+                ) > self.TX_CHUNK_SIZE + self.FIRMBUF_MARGIN:
                     self.last_tx_progress = time.time()
                     assumedSent = 0  # bytes that made it out; stays 0 on failure
                     try:
@@ -826,6 +937,7 @@ class SerialLoopClass(threading.Thread):
                             print("ERROR: write did not complete")
                         else:
                             assumedSent = expectedSent
+                            self.tx_log.extend(to_send[::2])  # undoubled
                             self.firmbuf_used += assumedSent
                             if self.firmbuf_used > self.FIRMBUF_SIZE:
                                 print("ERROR: firmware buffer tracking too high")
@@ -855,7 +967,15 @@ class SerialLoopClass(threading.Thread):
                 self.tx_pos = 0
                 self.timer.reset()
 
+    def _send_resume(self):
+        self._send_char(CMD_RESUME)
+        self.firmbuf_used = 0  # a resume resets the hardware's rx buffer
+        self.last_resume_t = time.time()
+        self.resume_settle_until = self.last_resume_t + self.RESUME_SETTLE
+        self.stop_episode = False
+
     def _send_char(self, char):
+        self.tx_log.append(ord(char))
         try:
             t_prewrite = time.time()
             self.last_tx_time = t_prewrite  # feeds the firmware watchdog
@@ -1226,6 +1346,8 @@ def status():
         with SerialLoop.lock:
             stats = copy.deepcopy(SerialLoop._status)
             stats["serial"] = connected()  # make sure serial flag is up-to-date
+            if SerialLoop.incident:
+                stats["incident"] = SerialLoop.incident
         return stats
     else:
         return {"serial": False, "ready": False}
@@ -1246,6 +1368,7 @@ def homing():
         # goes out ahead of it, to recover from a stop mode
         SerialLoop.send_command(CMD_HOMING)
         SerialLoop.request_resume = True
+        SerialLoop.controller_reset = False  # homing is what a reset asks for
 
 
 def _clamp_param(name, val, lo, hi):

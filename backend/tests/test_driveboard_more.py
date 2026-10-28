@@ -134,7 +134,8 @@ def test_rx_invalid_marker_resets_the_decoder(loop, capsys):
 def test_rx_chunk_processed_underflow_is_flagged(loop, capsys):
     loop.firmbuf_used = 0
     feed(loop, driveboard.CMD_CHUNK_PROCESSED.encode())
-    assert loop.firmbuf_used == -loop.TX_CHUNK_SIZE
+    assert loop.firmbuf_used == 0  # clamped, a low tally overflows the controller
+    assert loop.negative_tally_clamps == 1
     assert "firmware buffer tracking too low" in capsys.readouterr().out
 
 

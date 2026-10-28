@@ -211,6 +211,18 @@ def status():
     return json.dumps(driveboard.status())
 
 
+@bottle.route("/incidents")
+@bottle.auth_basic(checkuser)
+def incidents():
+    """The serial loop's record of unexplained stops, one json object a line."""
+    return bottle.static_file(
+        driveboard.INCIDENTS_FILE,
+        root=conf["confdir"],
+        mimetype="application/x-ndjson",
+        download=driveboard.INCIDENTS_FILE,
+    )
+
+
 @bottle.route("/homing")
 @bottle.auth_basic(checkuser)
 @checkserial
