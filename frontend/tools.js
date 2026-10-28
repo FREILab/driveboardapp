@@ -454,9 +454,6 @@ function tools_addfill_html(colors, fills, pxsize) {
     '" title="match this to laser focus size"></div>' +
     '<div class="addfill_row"><button type="button" id="addfill_selection" class="btn btn-default btn-sm">Fill selection</button></div>' +
     '<div class="addfill_row">';
-  if (colors.length == 0) {
-    html += "No job loaded.";
-  }
   colors.forEach(function (c) {
     html +=
       '<a href="#" class="addfill_color" data-idx="' +
@@ -469,9 +466,6 @@ function tools_addfill_html(colors, fills, pxsize) {
   });
   html +=
     '</div><div class="addfill_head">Added fills</div><div class="addfill_fills">';
-  if (fills.length == 0) {
-    html += "None yet.";
-  }
   fills.forEach(function (fill) {
     html +=
       '<div class="addfill_fill">' +
