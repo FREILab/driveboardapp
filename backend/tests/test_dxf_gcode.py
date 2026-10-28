@@ -13,7 +13,7 @@ import os
 import jobimport
 import pytest
 from config import conf
-from jobimport import converter, dedupe, imagedata
+from jobimport import converter, dedupe, imagedata, issues
 from jobimport.dxf_parser import DXFParser
 from jobimport.gcode_reader import GcodeReader
 from PIL import Image
@@ -139,13 +139,40 @@ def test_forced_unit_zero_or_none_falls_back_to_header(forced):
 
 @pytest.mark.parametrize("units", [3, 7, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
 def test_units_with_no_conversion_are_refused(units):
-    with pytest.raises(RuntimeError, match="convert INSUNIT"):
+    with pytest.raises(issues.ImportFailed) as err:
         _parse([_line(0, 0, 1, 0)], insunits=units)
+    assert err.value.issue["problem"] == "Unsupported DXF units"
+    assert err.value.issue["fix"] == "Set units to mm"
+    assert err.value.issue["where"]  # names the unit
 
 
 def test_unknown_unit_code_is_refused():
-    with pytest.raises(RuntimeError):
+    with pytest.raises(issues.ImportFailed) as err:
         _parse([_line(0, 0, 1, 0)], insunits=99)
+    assert err.value.issue == {
+        "problem": "Unsupported DXF units",
+        "where": "99",
+        "fix": "Set units to mm",
+    }
+
+
+@pytest.mark.parametrize("insunits", [None, 0])
+def test_unitless_drawing_reports_it_was_read_as_inches(insunits):
+    with issues.collecting() as c:
+        _parse([_line(0, 0, 1, 0)], insunits=insunits)
+    (row,) = c.issues()
+    assert (row["problem"], row["result"], row["kind"], row["fix"]) == (
+        "DXF has no units",
+        "READ AS INCHES",
+        "changed",
+        "Set units to mm",
+    )
+
+
+def test_drawing_with_units_reports_nothing():
+    with issues.collecting() as c:
+        _parse([_line(0, 0, 1, 0)], insunits=4)
+    assert c.issues() == []
 
 
 def test_layer_color_and_entity_color_decide_the_pass():
@@ -166,11 +193,22 @@ def test_layer_color_and_entity_color_decide_the_pass():
 
 
 def test_unrecognized_color_falls_back_to_cyan_alongside_real_cyan():
-    job = _parse(
-        [_line(0, 0, 5, 0, color=4), _line(0, 5, 5, 5, color=30)],
-    )
+    with issues.collecting() as c:
+        job = _parse(
+            [_line(0, 0, 5, 0, color=4), _line(0, 5, 5, 5, color=30, layer="Gravur")],
+            layers=(("0", 7), ("Gravur", 7)),
+        )
     assert [i["color"] for i in job["items"]] == ["#00FFFF"]
     assert len(job["defs"][0]["data"]) == 2
+    (row,) = c.issues()
+    assert row == {
+        "problem": "Unknown colour 30",
+        "where": 'layer "Gravur"',
+        "result": "CUT IN CYAN",
+        "kind": "changed",
+        "fix": "Use a standard colour",
+        "count": 1,
+    }
 
 
 def test_drawing_without_entities_is_an_empty_job():
@@ -207,10 +245,10 @@ def test_negative_coordinates_are_shifted_onto_the_bed():
         ((0, 0, 0, 700), "y1"),
     ],
 )
-def test_geometry_outside_the_bed_is_refused(line, where):
-    with pytest.raises(RuntimeError) as err:
-        _parse([_line(*line)])
-    assert f"bounds {where}" in str(err.value)
+def test_geometry_outside_the_bed_is_kept(line, where):
+    """The work-area check happens after conversion; the importer no longer refuses."""
+    job = _parse([_line(*line)])
+    assert len(_paths(job)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -322,27 +360,35 @@ def test_entity_on_a_layer_missing_from_the_table_is_still_imported():
 @pytest.mark.parametrize(
     "entity,message",
     [
-        (_pairs((0, "SPLINE"), (8, "0")), "TODO ADD"),
-        (_pairs((0, "POINT"), (8, "0"), (10, 1), (20, 1), (30, 0)), "unknown entity"),
+        (_pairs((0, "SPLINE"), (8, "0")), "SPLINE"),
+        (_pairs((0, "POINT"), (8, "0"), (10, 1), (20, 1), (30, 0)), "POINT"),
         (
             _pairs((0, "ELLIPSE"), (8, "0"), (10, 0), (20, 0), (30, 0), (11, 10), (21, 0), (31, 0))
             + _pairs((40, 0.5), (41, 0), (42, 6.28)),
-            "unknown entity",
+            "ELLIPSE",
         ),
         (
             _pairs((0, "POLYLINE"), (8, "0"), (66, 1), (70, 0))
             + _pairs((0, "VERTEX"), (8, "0"), (10, 0), (20, 0))
             + _pairs((0, "VERTEX"), (8, "0"), (10, 5), (20, 5))
             + _pairs((0, "SEQEND"), (8, "0")),
-            "unknown entity",
+            "POLYLINE",
         ),
     ],
 )
-def test_unsupported_entities_are_reported_and_skipped(entity, message, capsys):
-    parser = DXFParser(0.1, BED)  # verbose by default
-    job = parser.parse(_dxf([entity, _line(0, 0, 5, 5)]), None)
-    out = capsys.readouterr().out
-    assert message in out
+def test_unsupported_entities_are_reported_and_skipped(entity, message):
+    parser = DXFParser(0.1, BED)
+    with issues.collecting() as c:
+        job = parser.parse(_dxf([entity, _line(0, 0, 5, 5)], insunits=4), None)
+    (row,) = c.issues()
+    assert row == {
+        "problem": f"{message} unsupported",
+        "where": 'layer "0"',
+        "result": "NOT CUT",
+        "kind": "dropped",
+        "fix": "Convert to polyline",
+        "count": 1,
+    }
     assert len(_paths(job)) == 1  # only the LINE survived
     assert _flat(_paths(job)[0]) == pytest.approx([0, 5, 5, 0])
 
@@ -373,25 +419,13 @@ def test_flip_path_axis_tracks_the_extent():
     assert (parser.x_min, parser.x_max) == (3.0, 9.0)
 
 
-def test_complain_spline_raises(capsys):
-    with pytest.raises(RuntimeError):
-        DXFParser(0.1, BED).complain_spline()
-    assert "SPLINE" in capsys.readouterr().out
-
-
-def test_complain_invalid_names_the_line(capsys):
-    parser = DXFParser(0.1, BED)
-    parser.line, parser.linecount = "WHAT", 12
-    parser.complain_invalid()
-    assert "WHAT" in capsys.readouterr().out
-
-
 def test_unitize_before_parse_fails_cleanly():
     parser = DXFParser(0.1, BED)
     parser.units = 3
     parser.unitsString = "miles"
-    with pytest.raises(RuntimeError, match="miles"):
+    with pytest.raises(issues.ImportFailed) as err:
         parser.unitize(1)
+    assert err.value.issue["where"] == "miles"
 
 
 def test_dxf_fixture_through_the_converter(testjobs_dir):
@@ -497,16 +531,54 @@ def test_tool_selected_earlier_is_used_by_a_bare_m6():
     assert job["defs"][0]["toolinfo"] == ""
 
 
-def test_toolchange_line_with_other_words_is_rejected(capsys):
-    job = _gcode("G1 X5 M6\n")
-    assert job["defs"] == []
-    assert "cannot handle anything but T on M6" in capsys.readouterr().out
+def _gcode_rows(text):
+    with issues.collecting() as c:
+        job = _gcode(text)
+    return job, c.issues()
 
 
-def test_motion_before_any_tool_is_dropped(capsys):
-    job = _gcode("G1 X1 Y1\n")
+def test_toolchange_line_with_other_words_is_rejected():
+    job, rows = _gcode_rows("G1 X5 M6\n")
     assert job["defs"] == []
-    assert "no tool defined" in capsys.readouterr().out
+    assert rows == [
+        {
+            "problem": "Odd tool change line",
+            "where": "line 1",
+            "result": "IGNORED",
+            "kind": "changed",
+            "fix": "Only T on M6 line",
+            "count": 1,
+        }
+    ]
+
+
+def test_motion_before_any_tool_is_dropped():
+    job, rows = _gcode_rows("G1 X1 Y1\n")
+    assert job["defs"] == []
+    assert rows == [
+        {
+            "problem": "Move before tool set",
+            "where": "line 1",
+            "result": "NOT CUT",
+            "kind": "dropped",
+            "fix": "Set tool first",
+            "count": 1,
+        }
+    ]
+
+
+@pytest.mark.parametrize("line", ["N10 G1 X99", "O1234", "$H"])
+def test_unreadable_gcode_line_is_reported(line):
+    _, rows = _gcode_rows(f"; header\n%\nT1 M6\n{line}\n")
+    assert [(r["problem"], r["where"], r["kind"]) for r in rows] == [
+        ("Line not read", "line 4", "dropped")
+    ]
+
+
+@pytest.mark.parametrize("line", ["G17", "G54", "G94", "M2", "M30"])
+def test_default_and_end_codes_are_silent(line):
+    _, rows = _gcode_rows(f"T1 M6\n{line}\n")
+    assert rows == []
 
 
 def test_comments_blank_and_foreign_lines_are_ignored():
@@ -521,30 +593,44 @@ def test_head_marks_the_job_as_mill():
 
 
 @pytest.mark.parametrize(
-    "line,message",
+    "line,problem",
     [
-        ("G2 X1 Y1", "G2,G3 arc"),
-        ("G3 X1 Y1", "G2,G3 arc"),
-        ("G4 P1", "G4 dwell"),
-        ("G53 Z0", "G53"),
-        ("G57", "G55-G59"),
-        ("G92 X0", "G92"),
-        ("G93", "G93,G95"),
-        ("G95", "G93,G95"),
-        ("M0", "M0,M1"),
-        ("M1", "M0,M1"),
-        ("M4", "M4"),
+        ("G4 P1", "G4 unsupported"),
+        ("G53 Z0", "G53 unsupported"),
+        ("G57", "G55-G59 unsupported"),
+        ("G92 X0", "G92 unsupported"),
+        ("G93", "G93,G95 unsupported"),
+        ("G95", "G93,G95 unsupported"),
+        ("M0", "M0,M1 unsupported"),
+        ("M1", "M0,M1 unsupported"),
+        ("M4", "M4 unsupported"),
+        # not handled either, and not harmless: named as they are written
+        ("G28", "G28 unsupported"),
+        ("G38.2 Z-5", "G38.2 unsupported"),
+        ("G18", "G18 unsupported"),
     ],
 )
-def test_unsupported_codes_are_reported(line, message, capsys):
-    _gcode(f"T1 M6\n{line}\n")
-    assert message in capsys.readouterr().out
+def test_unsupported_codes_are_reported(line, problem):
+    _, rows = _gcode_rows(f"T1 M6\n{line}\n")
+    assert [(r["problem"], r["where"], r["result"], r["kind"], r["fix"]) for r in rows] == [
+        (problem, "line 2", "IGNORED", "changed", "Remove from G-code")
+    ]
 
 
-def test_unsupported_arc_is_flattened_to_a_straight_move(capsys):
-    job = _gcode("T1 M6\nG1 X0 Y0\nG2 X5 Y5 I2 J2\n")
+@pytest.mark.parametrize("code", ["G2", "G3"])
+def test_unsupported_arc_is_flattened_to_a_straight_move(code):
+    job, rows = _gcode_rows(f"T1 M6\nG1 X0 Y0\n{code} X5 Y5 I2 J2\n")
     assert _data(job)[-1] == ("G1", (5, 5, None))
-    assert "arc motions not supported" in capsys.readouterr().out
+    assert rows == [
+        {
+            "problem": "Arcs (G2/G3) unsupported",
+            "where": "line 3",
+            "result": "STRAIGHT LINE",
+            "kind": "changed",
+            "fix": "Export arcs as lines",
+            "count": 1,
+        }
+    ]
 
 
 def test_lowercase_gcode_is_read():

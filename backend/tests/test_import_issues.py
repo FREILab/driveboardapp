@@ -6,6 +6,7 @@ import threading
 import jobimport
 import pytest
 from jobimport import issues
+from test_dxf_gcode import _dxf, _line, _pairs
 
 
 def test_report_without_collector_is_noop():
@@ -262,3 +263,72 @@ def test_svg_text_fill_invalid_colour_row():
     doc = _svg('<text id="t" x="0" y="10" fill="#12">Hi</text>')
     _, rows = _import(doc)
     assert ('Invalid colour "#12"', 'text "t"') in [(r["problem"], r["where"]) for r in rows]
+
+
+# ---- DXF and G-code ----
+
+
+def _ellipse(layer):
+    return _pairs(
+        (0, "ELLIPSE"), (8, layer), (10, 0), (20, 0), (30, 0), (11, 10), (21, 0)
+    ) + _pairs((31, 0), (40, 0.5), (41, 0), (42, 6.28))
+
+
+def _dxf_import(entities, layers=(("0", 7),)):
+    with issues.collecting() as c:
+        job = jobimport.convert(_dxf(entities, layers=layers), optimize=False)
+    return job, c.issues()
+
+
+def test_dxf_ellipse_row():
+    _, rows = _dxf_import([_ellipse("Gravur")], layers=(("0", 7), ("Gravur", 7)))
+    assert rows == [
+        {
+            "problem": "ELLIPSE unsupported",
+            "where": 'layer "Gravur"',
+            "result": "NOT CUT",
+            "kind": "dropped",
+            "fix": "Convert to polyline",
+            "count": 1,
+        }
+    ]
+
+
+def test_dxf_two_ellipses_count_2():
+    _, rows = _dxf_import(
+        [_ellipse("Gravur"), _ellipse("Cut")], layers=(("0", 7), ("Gravur", 7), ("Cut", 1))
+    )
+    (row,) = rows
+    assert (row["problem"], row["count"], row["where"]) == (
+        "ELLIPSE unsupported",
+        2,
+        'layer "Gravur"',
+    )
+
+
+def test_dxf_garbage_is_fatal():
+    with pytest.raises(issues.ImportFailed) as err:
+        jobimport.read_dxf("garbage", 0.1)
+    assert err.value.issue == {
+        "problem": "Not a readable DXF",
+        "where": None,
+        "fix": "Export as DXF R12",
+    }
+
+
+def test_dxf_outside_bed_no_longer_raises():
+    job, rows = _dxf_import([_line(5000, 0, 5010, 0)])
+    assert rows == []
+    assert max(x for d in job["defs"] for p in d["data"] for x, _ in p) > 4000
+
+
+def test_gcode_arc_row():
+    with issues.collecting() as c:
+        jobimport.read_gcode("G2 X10 Y10 I5 J0\n", 0.1)
+    row = next(r for r in c.issues() if r["problem"] == "Arcs (G2/G3) unsupported")
+    assert row["where"] == "line 1"
+    assert (row["result"], row["kind"], row["fix"]) == (
+        "STRAIGHT LINE",
+        "changed",
+        "Export arcs as lines",
+    )

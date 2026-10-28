@@ -4,7 +4,15 @@ __author__ = "Stefan Hechenberger <stefan@nortd.com>"
 import re
 import sys
 
+from . import issues
+
 debug = True
+
+# unsupported codes are reported under one label per group
+LABELS = {("G", n): "G55-G59" for n in (55, 56, 57, 58, 59)}
+LABELS.update({("G", 93): "G93,G95", ("G", 95): "G93,G95", ("M", 0): "M0,M1", ("M", 1): "M0,M1"})
+# defaults and program end: nothing to report
+QUIET = {("G", 17), ("G", 54), ("G", 94), ("M", 2), ("M", 30)}
 
 
 class GcodeReader:
@@ -119,6 +127,7 @@ class GcodeReader:
     def __init__(self):
         # flags
         self.bTool = False
+        self.where = None  # source line being read
 
         # modal state
         self.G_motion = "G0"
@@ -179,7 +188,9 @@ class GcodeReader:
             nParts = 1
         # commit tool change
         if len(self.re_parts(line)) != nParts:
-            print("ERROR: cannot handle anything but T on M6 toolchange line")
+            issues.report(
+                "Odd tool change line", "IGNORED", "changed", "Only T on M6 line", self.where
+            )
         else:
             self.finalize_pass()
             self.next_pass()
@@ -192,7 +203,9 @@ class GcodeReader:
 
     def on_action(self, action):
         if not self.bTool:
-            print("ERROR: no tool defined at: {}:{}".format(*action))
+            issues.report(
+                "Move before tool set", "NOT CUT", "dropped", "Set tool first", self.where
+            )
             return
         self.path.append(action)
 
@@ -206,7 +219,8 @@ class GcodeReader:
 
     def parse(self, gcodestring):
         """Convert gcode to a job file."""
-        for rawline in gcodestring.splitlines():
+        for lineno, rawline in enumerate(gcodestring.splitlines(), 1):
+            self.where = f"line {lineno}"
             # words are case-insensitive, inline (comments) are not code
             line = re.sub(r"\(.*?\)", "", rawline.upper())
             # reject line condition
@@ -225,8 +239,12 @@ class GcodeReader:
                     toolinfo = self.re_toolinfo(rawline)
                     if toolinfo:
                         self.toolinfo[toolinfo[0][0]] = toolinfo[0][1]
-                # reject
+                # reject: comments and program delimiters are fine, anything else is lost
                 else:
+                    if line.strip() and line[0] not in (";", "%"):
+                        issues.report(
+                            "Line not read", "NOT CUT", "dropped", "Remove from G-code", self.where
+                        )
                     continue
 
             # on tool change action (M6)
@@ -298,21 +316,22 @@ class GcodeReader:
                     self.G_absolute = code[1] == 90
                 # handle reporting of unsupported gcode
                 elif code[0] == "G" and code[1] in (2, 3):
-                    print("ERROR: G2,G3 arc motions not supported")
-                elif code[0] == "G" and code[1] in (4,):
-                    print("ERROR: G4 dwell motions not supported")
-                elif code[0] == "G" and code[1] in (53,):
-                    print("ERROR: G53 machine CS motion not supported")
-                elif code[0] == "G" and code[1] in (55, 56, 57, 58, 59):
-                    print("ERROR: G55-G59 CS not supported")
-                elif code[0] == "G" and code[1] in (92,):
-                    print("ERROR: G92 shift CS not supported")
-                elif code[0] == "G" and code[1] in (93, 95):
-                    print("ERROR: G93,G95 alternative distance modes not supported")
-                elif code[0] == "M" and code[1] in (0, 1):
-                    print("ERROR: M0,M1 pause not supported")
-                elif code[0] == "M" and code[1] in (4,):
-                    print("ERROR: M4 reverse spindle not supported")
+                    issues.report(
+                        "Arcs (G2/G3) unsupported",
+                        "STRAIGHT LINE",
+                        "changed",
+                        "Export arcs as lines",
+                        self.where,
+                    )
+                elif (code[0], code[1]) not in QUIET:
+                    label = LABELS.get((code[0], code[1]), f"{code[0]}{code[1]}")
+                    issues.report(
+                        f"{label} unsupported",
+                        "IGNORED",
+                        "changed",
+                        "Remove from G-code",
+                        self.where,
+                    )
 
             ### commit actions in right order
             # commit coolant
