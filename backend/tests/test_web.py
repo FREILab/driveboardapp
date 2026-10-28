@@ -526,7 +526,7 @@ def test_convert_matches_an_in_process_convert(as_text, testjobs_dir):
     expected = jobimport.dumps(
         jobimport.share_image_data(jobimport.convert(job, optimize=True, matrix=None))
     )
-    assert web._convert_job(job, True, None) == (expected, None)
+    assert web._convert_job(job, True, None) == (expected, None, [])
 
 
 def test_convert_reports_an_unusable_file_as_a_type_error():
@@ -763,7 +763,7 @@ def test_load_stores_an_unchanged_dba_without_reconverting(auth_app, isolated_co
     # converting it again would copy tens of megabytes through the import
     # worker to arrive at the same bytes
     called = []
-    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: called.append(a) or ("{}", None))
+    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: called.append(a) or ("{}", None, []))
     body = {
         "load_request": json.dumps(
             {"job": MINIMAL_DBA, "name": "asis", "optimize": False, "overwrite": True}
@@ -1395,7 +1395,7 @@ def test_load_value_error_from_converter_is_422(queue, monkeypatch):
 
 def test_load_progressive_returns_pending_token_and_names_the_entry(queue, monkeypatch):
     app, d = queue
-    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: (MINIMAL_DBA, "tok"))
+    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: (MINIMAL_DBA, "tok", []))
     entry = {"event": threading.Event(), "name": None, "error": None, "stale": False}
     monkeypatch.setitem(web._load_pending, "tok", entry)
     try:
@@ -1409,7 +1409,7 @@ def test_load_progressive_returns_pending_token_and_names_the_entry(queue, monke
 
 def test_load_progressive_publishes_result_that_finished_before_name_known(queue, monkeypatch):
     app, d = queue
-    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: ("quick", "tok"))
+    monkeypatch.setattr(web, "_convert_job", lambda *a, **k: ("quick", "tok", []))
     entry = {"event": threading.Event(), "name": None, "error": None, "stale": False}
     entry["result"] = "optimized"
     entry["event"].set()
@@ -1560,7 +1560,7 @@ def test_convert_job_falls_back_in_process_when_pool_unavailable(monkeypatch):
         raise OSError("cannot spawn")
 
     monkeypatch.setattr(web, "_convert_pool_get", broken)
-    dba, token = web._convert_job(MINIMAL_DBA, optimize=False, matrix=None)
+    dba, token, _ = web._convert_job(MINIMAL_DBA, optimize=False, matrix=None)
     assert token is None
     assert json.loads(dba)["defs"][0]["kind"] == "path"
 
@@ -1583,7 +1583,7 @@ def test_convert_job_timeout_is_504_and_discards_worker(monkeypatch):
 
 def test_convert_job_progressive_hands_back_quick_parse_and_token(monkeypatch):
     monkeypatch.setattr(web, "_convert_pool_get", lambda: _FakePool(lambda: _Future(done=False)))
-    dba, token = web._convert_job(MINIMAL_DBA, optimize=True, matrix=None, progressive=True)
+    dba, token, _ = web._convert_job(MINIMAL_DBA, optimize=True, matrix=None, progressive=True)
     try:
         assert token in web._load_pending
         assert json.loads(dba)["defs"][0]["kind"] == "path"
@@ -1897,3 +1897,287 @@ def test_server_run_exits_on_keyboard_interrupt(monkeypatch):
     s.server = Srv()
     s.run()
     assert closed == [True]
+
+
+# ---------------------------------------------------------------------------
+# /load with review_issues: imports with issues are held until commit/cancel
+# ---------------------------------------------------------------------------
+
+ISSUE_SVG = (
+    '<?xml version="1.0"?>'
+    '<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" '
+    'viewBox="0 0 100 100"><path id="p" d="M 10,10 L 20,20" stroke="#12"/></svg>'
+)
+ISSUE_ROW = {
+    "problem": 'Invalid colour "#12"',
+    "where": 'path "p"',
+    "result": "DEFAULT COLOUR",
+    "kind": "changed",
+    "fix": "Set a valid colour",
+    "count": 1,
+}
+
+
+def _review(app, **req):
+    return _post_load(app, review_issues=True, **req)
+
+
+def _progressive_hold(app, monkeypatch, name):
+    """Review-load ISSUE_SVG progressively, optimize held until the future is set."""
+    import concurrent.futures
+
+    future = concurrent.futures.Future()
+    monkeypatch.setattr(web, "_convert_pool_get", lambda: _FakePool(lambda: future))
+    data = json.loads(_review(app, job=ISSUE_SVG, name=name, progressive=True).body)
+    pending = web._load_held[data["hold"]]["pending"]
+    return data["hold"], pending, web._load_pending[pending], future
+
+
+def test_review_clean_import_queues_as_today(queue):
+    app, d = queue
+    resp = _review(app, job=MINIMAL_DBA, name="clean", optimize=True)
+    assert resp.status_int == 200
+    assert json.loads(resp.body) == "clean"
+    assert os.listdir(d) == ["clean.dba"]
+
+
+def test_review_issues_hold_not_queue(queue, monkeypatch):
+    app, d = queue
+    _put(d, "old.dba")
+    monkeypatch.setitem(conf, "max_jobs_in_list", 1)  # any _add would trim old.dba
+    resp = _review(app, job=ISSUE_SVG, name="held")
+    data = json.loads(resp.body)
+    try:
+        assert resp.status_int == 200
+        assert data["name"] == "held"
+        assert data["issues"] == [ISSUE_ROW]
+        assert data["hold"] in web._load_held
+        assert os.listdir(d) == ["old.dba"]
+    finally:
+        web._load_held.pop(data["hold"], None)
+
+
+def test_review_commit_queues_job(queue):
+    app, d = queue
+    hold = json.loads(_review(app, job=ISSUE_SVG, name="go").body)["hold"]
+    assert json.loads(app.get(f"/load_commit/{hold}").body) == "go"
+    assert os.listdir(d) == ["go.dba"]
+    assert hold not in web._load_held
+    # a second commit finds nothing
+    assert app.get(f"/load_commit/{hold}", expect_errors=True).status_int == 404
+
+
+def test_review_cancel_leaves_queue_untouched(queue):
+    app, d = queue
+    hold = json.loads(_review(app, job=ISSUE_SVG, name="no").body)["hold"]
+    assert app.get(f"/load_cancel/{hold}").body == b"{}"
+    assert hold not in web._load_held
+    assert os.listdir(d) == []
+    assert app.get(f"/load_cancel/{hold}").body == b"{}"  # idempotent
+    assert app.get(f"/load_commit/{hold}", expect_errors=True).status_int == 404
+
+
+def test_review_cancel_during_progressive_optimize_never_queues(queue, monkeypatch):
+    app, d = queue
+    hold, pending, entry, future = _progressive_hold(app, monkeypatch, "late")
+    assert app.get(f"/load_cancel/{hold}").body == b"{}"
+    assert pending not in web._load_pending
+    assert entry["stale"] is True
+    future.set_result(None)  # the optimize finishes after the cancel
+    assert entry["event"].wait(5)
+    assert os.listdir(d) == []
+
+
+def test_review_commit_before_optimize_queues_quick_then_optimized(
+    queue, isolated_config, monkeypatch
+):
+    app, d = queue
+    hold, pending, entry, future = _progressive_hold(app, monkeypatch, "early")
+    try:
+        body = json.loads(app.get(f"/load_commit/{hold}").body)
+        assert body == {"name": "early", "pending": pending}
+        assert "optimized" not in _stored_job(isolated_config, "early")["head"]
+        future.set_result(None)
+        assert entry["event"].wait(5)
+        assert _stored_job(isolated_config, "early")["head"]["optimized"] == conf["tolerance"]
+    finally:
+        web._load_pending.pop(pending, None)
+
+
+def test_review_commit_after_optimize_queues_optimized_once(queue, isolated_config, monkeypatch):
+    app, d = queue
+    hold, pending, entry, future = _progressive_hold(app, monkeypatch, "done")
+    future.set_result(None)
+    assert entry["event"].wait(5)
+    added = []
+    real_add = web._add
+    monkeypatch.setattr(web, "_add", lambda job, name: added.append(job) or real_add(job, name))
+    try:
+        app.get(f"/load_commit/{hold}")
+        optimized = [json.loads(job)["head"].get("optimized") for job in added]
+        assert optimized == [None, conf["tolerance"]]  # quick, then optimized once
+        assert _stored_job(isolated_config, "done")["head"]["optimized"] == conf["tolerance"]
+    finally:
+        web._load_pending.pop(pending, None)
+
+
+def test_review_commit_unknown_or_expired_404(queue, monkeypatch):
+    app, d = queue
+    expired = {"fatal": {"problem": "Import expired", "where": None, "fix": "Open the file again"}}
+    resp = app.get("/load_commit/nope", expect_errors=True)
+    assert resp.status_int == 404
+    assert json.loads(resp.body) == expired
+    hold = json.loads(_review(app, job=ISSUE_SVG, name="slow").body)["hold"]
+    later = time.time() + web.CONVERT_TIMEOUT + 1
+    monkeypatch.setattr(time, "time", lambda: later)
+    resp = app.get(f"/load_commit/{hold}", expect_errors=True)
+    assert resp.status_int == 404
+    assert json.loads(resp.body) == expired
+    assert hold not in web._load_held
+    assert os.listdir(d) == []
+
+
+def test_review_expired_progressive_hold_stales_its_optimize(queue, monkeypatch):
+    app, d = queue
+    hold, pending, entry, future = _progressive_hold(app, monkeypatch, "gone")
+    later = time.time() + web.CONVERT_TIMEOUT + 1
+    monkeypatch.setattr(time, "time", lambda: later)
+    assert app.get("/load_cancel/other").body == b"{}"  # any review call purges
+    assert hold not in web._load_held
+    assert pending not in web._load_pending
+    assert entry["stale"] is True
+    future.set_result(None)
+    assert entry["event"].wait(5)
+    assert os.listdir(d) == []
+
+
+def test_review_outside_work_area_row(queue):
+    app, d = queue
+    svg = (
+        '<?xml version="1.0"?>'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="6000mm" height="100mm" '
+        'viewBox="0 0 6000 100"><rect x="5000" y="10" width="10" height="10" '
+        'stroke="#000" fill="none"/></svg>'
+    )
+    data = json.loads(_review(app, job=svg, name="far").body)
+    try:
+        (row,) = data["issues"]
+        assert row["problem"] == "Outside work area"
+        assert row["where"].startswith("x 5000 > ")
+        assert (row["result"], row["kind"], row["fix"], row["count"]) == (
+            "RUN REFUSED",
+            "dropped",
+            "Move origin or scale",
+            1,
+        )
+        assert os.listdir(d) == []
+    finally:
+        web._load_held.pop(data["hold"], None)
+
+
+def test_review_work_area_check_failure_is_no_row(queue, monkeypatch):
+    app, d = queue
+
+    def broken(jobdict):
+        raise KeyError("items")
+
+    monkeypatch.setattr(driveboard, "job_outside_work_area", broken)
+    resp = _review(app, job=MINIMAL_DBA, name="odd", optimize=True)
+    assert json.loads(resp.body) == "odd"
+    assert os.listdir(d) == ["odd.dba"]
+
+
+def _raises(exc):
+    def convert(*a, **k):
+        raise exc
+
+    return convert
+
+
+@pytest.mark.parametrize(
+    "job, convert, status, fatal",
+    [
+        (
+            '<?xml version="1.0"?><notsvg><svg/></notsvg>',
+            None,
+            422,
+            {"problem": "Not an SVG file", "where": None, "fix": "Export as SVG"},
+        ),
+        (
+            "this is not any job format",
+            None,
+            400,
+            {"problem": "Unknown file type", "where": None, "fix": "Use SVG, DXF, G-code or DBA"},
+        ),
+        (
+            MINIMAL_DBA,
+            _raises(ValueError("bad geometry")),
+            422,
+            {"problem": "Import failed", "where": "bad geometry", "fix": "Check the file"},
+        ),
+        (
+            MINIMAL_DBA,
+            _raises(bottle.HTTPResponse("Import timed out.", 504)),
+            504,
+            {"problem": "Import timed out", "where": None, "fix": "Simplify or split file"},
+        ),
+        (
+            MINIMAL_DBA,
+            _raises(RuntimeError("boom")),
+            500,
+            {
+                "problem": "Import crashed",
+                "where": "RuntimeError: boom",
+                "fix": "Report file to admin",
+            },
+        ),
+    ],
+    ids=["not-svg", "unknown-type", "value-error", "timeout", "crash"],
+)
+def test_review_fatal_bodies(queue, monkeypatch, job, convert, status, fatal):
+    app, d = queue
+    if convert:
+        monkeypatch.setattr(web, "_convert_job", convert)
+    resp = _review(app, job=job, name="bad", optimize=True)
+    assert resp.status_int == status
+    assert resp.content_type == "application/json"
+    assert json.loads(resp.body) == {"fatal": fatal}
+    assert os.listdir(d) == []
+
+
+def test_review_fatal_after_warnings_is_only_the_fatal(queue):
+    app, _ = queue
+    # an invalid colour is reported, then the odd point list stops the import
+    svg = (
+        '<?xml version="1.0"?>'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" '
+        'viewBox="0 0 100 100"><path d="M 1,1 L 2,2" stroke="#12"/>'
+        '<polyline points="1,2,3" stroke="#000"/></svg>'
+    )
+    resp = _review(app, job=svg, name="bad")
+    assert resp.status_int == 422
+    assert list(json.loads(resp.body)) == ["fatal"]
+    assert json.loads(resp.body)["fatal"]["problem"] == "Odd number of points"
+
+
+def test_plain_load_dxf_garbage_is_422(queue):
+    app, d = queue
+    resp = _post_load(app, job="0\nSECTION\n2\nHEADER\ngarbage", name="dxf")
+    assert resp.status_int == 422
+    assert "Not a readable DXF" in resp.text
+    assert os.listdir(d) == []
+
+
+def test_issues_cross_the_worker_process():
+    dba, token, found = web._convert_job(ISSUE_SVG, False, None)
+    assert token is None
+    assert found == [ISSUE_ROW]
+
+
+def test_issues_collected_on_in_process_fallback(monkeypatch):
+    def broken():
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr(web, "_convert_pool_get", broken)
+    _, _, found = web._convert_job(ISSUE_SVG, False, None)
+    assert found == [ISSUE_ROW]

@@ -22,7 +22,7 @@ import config as config_module
 import driveboard
 import jobimport
 from config import conf, conf_defaults, userconfigurable, write_config_fields
-from jobimport import pathoptimizer
+from jobimport import issues, pathoptimizer
 
 __author__ = "Stefan Hechenberger <stefan@nortd.com>"
 
@@ -644,18 +644,38 @@ def _convert_worker(in_path, out_path, quick_path, text, optimize, matrix, conf_
     if quick_path:
         # gcode is procedural, its order is never optimized (see read_gcode)
         optimize = optimize and jobimport.get_type(job) != "gcode"
-        job = jobimport.convert(job, optimize=False, tolerance=conf["tolerance"], matrix=matrix)
+        with issues.collecting() as found:
+            job = jobimport.convert(job, optimize=False, tolerance=conf["tolerance"], matrix=matrix)
+        _write_issues(out_path, found)
         with open(quick_path + ".tmp", "w") as fp:
             fp.write(jobimport.dumps(jobimport.share_image_data(job)))
         os.replace(quick_path + ".tmp", quick_path)  # appear only when complete
         if optimize:
             jobimport.optimize_job(job, conf["tolerance"])
     else:
-        job = jobimport.convert(job, optimize=optimize, tolerance=conf["tolerance"], matrix=matrix)
+        with issues.collecting() as found:
+            job = jobimport.convert(
+                job, optimize=optimize, tolerance=conf["tolerance"], matrix=matrix
+            )
+        _write_issues(out_path, found)
     # placements of one picture share its payload on the way to disk, see
     # jobimport.share_image_data
     with open(out_path, "w") as fp:
         fp.write(jobimport.dumps(jobimport.share_image_data(job)))
+
+
+def _write_issues(out_path, found):
+    """Leave the import's issues next to its result, for _convert_job."""
+    with open(out_path + ".issues", "w") as fp:
+        json.dump(found.issues(), fp)
+
+
+def _read_issues(out_path):
+    try:
+        with open(out_path + ".issues") as fp:
+            return json.load(fp)
+    except FileNotFoundError:
+        return []
 
 
 def _convert_pool_get():
@@ -694,13 +714,17 @@ def _pending_register(future, out_path, tmpdir):
         try:
             future.result(timeout=CONVERT_TIMEOUT)
             with open(out_path) as fp:
-                entry["result"] = fp.read()
+                result = fp.read()
             # the queue entry gets the optimized job under the same name,
             # unless that name has been written since (running a job saves it
             # back with its passes, and this optimize predates them)
             # Keep the staleness decision and publication indivisible from a
             # request that marks this result stale and saves a replacement.
+            # The result is recorded under the lock too, so a commit naming
+            # this entry either sees it (and publishes it) or comes first
+            # (and the name is seen here): never both, never neither.
             with _load_pending_lock:
+                entry["result"] = result
                 if entry["name"] and not entry["stale"]:
                     _add(entry["result"], entry["name"])
         except Exception as e:
@@ -716,8 +740,9 @@ def _pending_register(future, out_path, tmpdir):
 def _convert_job(job, optimize, matrix, progressive=False):
     """Convert a job to a .dba string, in a worker process where one can be had.
 
-    Returns (dba_string, token): token is None when the string is final, and
-    a /load_result handle when it is the quick parse of a progressive load.
+    Returns (dba_string, token, issues): token is None when the string is
+    final, and a /load_result handle when it is the quick parse of a
+    progressive load. issues are the import's rows (see jobimport.issues).
 
     Spawn rather than fork: this process has the serial and server threads
     running, and a forked child can inherit a held stdout or import lock and
@@ -751,9 +776,10 @@ def _convert_job(job, optimize, matrix, progressive=False):
                         if os.path.exists(quick_path):
                             with open(quick_path) as fp:
                                 quick = fp.read()
+                            found = _read_issues(args[1])
                             token = _pending_register(future, args[1], tmpdir)
                             tmpdir = None  # the watcher owns the cleanup now
-                            return quick, token
+                            return quick, token, found
                         time.sleep(0.05)
                 future.result(timeout=CONVERT_TIMEOUT)
             except concurrent.futures.TimeoutError:
@@ -764,7 +790,7 @@ def _convert_job(job, optimize, matrix, progressive=False):
             _convert_pool_drop()
             _convert_worker(*args)
         with open(args[1]) as fp:
-            return fp.read(), None
+            return fp.read(), None, _read_issues(args[1])
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -783,7 +809,12 @@ def load():
         optimize: flag whether to optimize (bool)
         overwrite: flag whether to overwite file if present (bool)
         matrix: alignment matrix to apply to dba (3x3 list of lists of float)
+        review_issues: flag to hold a job with import issues for review (bool),
+            answered {"hold", "name", "issues"} and decided via /load_commit
+            or /load_cancel; failures are answered {"fatal": {...}}
     """
+    with _load_pending_lock:
+        _held_purge()
     load_request = json.loads(bottle.request.forms.get("load_request"))
     job = load_request.get("job")  # always a string
     if job in ("upload", "upload_raw"):  # data was passed as a file upload
@@ -816,6 +847,7 @@ def load():
         raise bottle.HTTPResponse("Invalid request data.", 400)
     _job_base(name)  # reject unsafe names before any work is done
     progressive = bool(load_request.get("progressive"))
+    review = bool(load_request.get("review_issues"))
     # A dba posted back with nothing to do to it is already what convert()
     # would hand back, so it goes to the queue as it stands. This is the run
     # button's path, where the job is the one the frontend was given and can
@@ -823,18 +855,56 @@ def load():
     # back, re-encode every raster, and queue behind whatever that single
     # worker is still busy with, all to arrive at the same bytes.
     if not optimize and matrix is None and not progressive and jobimport.get_type(job) == "dba":
-        job, pending = (job.decode("utf-8") if isinstance(job, bytes) else job), None
+        job, pending, found = (job.decode("utf-8") if isinstance(job, bytes) else job), None, []
     else:
         # convert, off this process so the serial thread keeps its timing
         try:
-            job, pending = _convert_job(job, optimize, matrix, progressive)  # a .dba string
-        except TypeError:
-            if DEBUG:
-                traceback.print_exc()
-            raise bottle.HTTPResponse("Invalid file type.", 400) from None
-        except ValueError as e:
-            raise bottle.HTTPResponse(str(e), 422) from e
+            job, pending, found = _convert_job(job, optimize, matrix, progressive)  # a .dba
+        except Exception as e:
+            if review:
+                raise _load_fatal(e) from None
+            if isinstance(e, TypeError):
+                if DEBUG:
+                    traceback.print_exc()
+                raise bottle.HTTPResponse("Invalid file type.", 400) from None
+            if isinstance(e, ValueError):
+                raise bottle.HTTPResponse(str(e), 422) from e
+            raise
+        if review:
+            try:
+                outside = driveboard.job_outside_work_area(json.loads(job))
+            except Exception as e:  # a check, never the reason an import fails
+                print(f"WARN: work area check failed ({type(e).__name__}: {e})")
+                outside = None
+            if outside is not None:
+                found.append(
+                    {
+                        "problem": "Outside work area",
+                        "where": outside,
+                        "result": "RUN REFUSED",
+                        "kind": "dropped",
+                        "fix": "Move origin or scale",
+                        "count": 1,
+                    }
+                )
 
+    if review and found:
+        # nothing reaches the queue until the operator decides
+        hold = uuid.uuid4().hex
+        with _load_pending_lock:
+            _load_held[hold] = {
+                "job": job,
+                "name": name,
+                "overwrite": overwrite,
+                "pending": pending,
+                "expires": time.time() + CONVERT_TIMEOUT,
+            }
+        return json.dumps({"hold": hold, "name": name, "issues": found})
+    return _queue_loaded(job, name, overwrite, pending)
+
+
+def _queue_loaded(job, name, overwrite, pending):
+    """Save a converted job to the queue, return the JSON body /load answers."""
     # an optimize still running against this name would land on top of what is
     # about to be written, so it is told to stand down first
     with _load_pending_lock:
@@ -844,15 +914,35 @@ def load():
             if entry.get("name") == name:
                 entry["stale"] = True
         _add(job, name)
-    if pending:
-        with _load_pending_lock:
-            entry = _load_pending[pending]
-            entry["name"] = name
-            # the watcher may have finished before the name was known
-            if entry["event"].is_set() and entry.get("result") and not entry["error"]:
-                _add(entry["result"], name)
-        return json.dumps({"name": name, "pending": pending})
-    return json.dumps(name)
+        if not pending:
+            return json.dumps(name)
+        entry = _load_pending[pending]
+        entry["name"] = name
+        # the watcher may have finished before the name was known, it records
+        # its result under this lock (see _pending_register)
+        if entry.get("result") is not None:
+            _add(entry["result"], name)
+    return json.dumps({"name": name, "pending": pending})
+
+
+def _fatal(status, problem, where, fix):
+    """A {"fatal": issue} answer, for the frontend's fatal dialog."""
+    body = json.dumps({"fatal": {"problem": problem, "where": where, "fix": fix}})
+    return bottle.HTTPResponse(body, status, {"Content-Type": "application/json"})
+
+
+def _load_fatal(e):
+    """The answer for an import that cannot be loaded, from what it raised."""
+    if isinstance(e, issues.ImportFailed):
+        return _fatal(422, **e.issue)
+    if isinstance(e, ValueError):
+        return _fatal(422, "Import failed", str(e), "Check the file")
+    if isinstance(e, TypeError):
+        return _fatal(400, "Unknown file type", None, "Use SVG, DXF, G-code or DBA")
+    if isinstance(e, bottle.HTTPResponse) and e.status_code == 504:
+        return _fatal(504, "Import timed out", None, "Simplify or split file")
+    traceback.print_exception(type(e), e, e.__traceback__)
+    return _fatal(500, "Import crashed", f"{type(e).__name__}: {e}", "Report file to admin")
 
 
 @bottle.route("/load_result/<token>")
@@ -875,6 +965,49 @@ def load_result(token):
     if not entry["event"].is_set():
         raise bottle.HTTPResponse("Import timed out.", 504)
     return json.dumps({"name": entry["name"]})
+
+
+# imports with issues awaiting the operator, {hold: {"job", "name",
+# "overwrite", "pending", "expires"}}, guarded by _load_pending_lock
+_load_held = {}
+
+
+def _held_purge():
+    """Forget undecided holds past their time, caller holds _load_pending_lock."""
+    now = time.time()
+    for hold in [h for h, held in _load_held.items() if held["expires"] < now]:
+        _held_drop(_load_held.pop(hold))
+
+
+def _held_drop(held):
+    """Stand down a dropped hold's optimize, caller holds _load_pending_lock."""
+    entry = _load_pending.pop(held["pending"], None) if held["pending"] else None
+    if entry is not None:
+        entry["stale"] = True  # its name is never set either, belt and braces
+
+
+@bottle.route("/load_commit/<hold>")
+@bottle.auth_basic(checkuser)
+def load_commit(hold):
+    """Queue a held import, answer as /load would have."""
+    with _load_pending_lock:
+        _held_purge()
+        held = _load_held.pop(hold, None)
+    if held is None:
+        raise _fatal(404, "Import expired", None, "Open the file again")
+    return _queue_loaded(held["job"], held["name"], held["overwrite"], held["pending"])
+
+
+@bottle.route("/load_cancel/<hold>")
+@bottle.auth_basic(checkuser)
+def load_cancel(hold):
+    """Discard a held import and its pending optimize, unknown holds included."""
+    with _load_pending_lock:
+        _held_purge()
+        held = _load_held.pop(hold, None)
+        if held is not None:
+            _held_drop(held)
+    return "{}"
 
 
 @bottle.route("/listing")
