@@ -92,9 +92,8 @@ jobs:
       - name: Compile variants, boot in simavr, run firmware safety suite
         run: >
           uv run pytest -v
-          backend/tests/test_firmware.py
+          backend/tests/test_firmware*.py
           backend/tests/test_simavr.py
-          backend/tests/test_firmware_safety.py
 
   frontend:
     name: Frontend JS checks
