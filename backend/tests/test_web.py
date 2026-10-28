@@ -2120,8 +2120,9 @@ def test_review_outside_work_area_row(queue):
         web._load_held.pop(data["hold"], None)
 
 
-def test_review_gcode_outside_work_area_row(queue):
+def test_review_gcode_outside_work_area_row(queue, monkeypatch):
     app, d = queue
+    monkeypatch.setitem(conf, "mill_mode", True)  # the worker gets conf with the call
     data = json.loads(_review(app, job="T1 M6\nG0 X5000 Y10\n", name="farmill").body)
     try:
         (row,) = data["issues"]
@@ -2161,6 +2162,16 @@ def _raises(exc):
             {"problem": "Not an SVG file", "where": None, "fix": "Export as SVG"},
         ),
         (
+            "T1 M6\nG0 X5 Y10\n",
+            None,
+            422,
+            {
+                "problem": "G-code not supported on laser",
+                "where": None,
+                "fix": "Export as SVG or DXF",
+            },
+        ),
+        (
             "this is not any job format",
             None,
             400,
@@ -2189,7 +2200,7 @@ def _raises(exc):
             },
         ),
     ],
-    ids=["not-svg", "unknown-type", "value-error", "timeout", "crash"],
+    ids=["not-svg", "gcode-on-laser", "unknown-type", "value-error", "timeout", "crash"],
 )
 def test_review_fatal_bodies(queue, monkeypatch, job, convert, status, fatal):
     app, d = queue
@@ -2200,6 +2211,37 @@ def test_review_fatal_bodies(queue, monkeypatch, job, convert, status, fatal):
     assert resp.content_type == "application/json"
     assert json.loads(resp.body) == {"fatal": fatal}
     assert os.listdir(d) == []
+
+
+def test_gcode_on_a_laser_plain_load_is_422(queue):
+    app, d = queue
+    resp = _post_load(app, job="T1 M6\nG0 X5 Y10\n", name="mill", optimize=True)
+    assert resp.status_int == 422
+    assert "G-code not supported on laser" in resp.text
+    assert os.listdir(d) == []
+
+
+MILL_JOB = {"head": {"kind": "mill"}, "defs": [{"data": [["S", 1000], ["G0", [10.0, 10.0, 0.0]]]}]}
+
+
+def test_mill_job_is_refused_on_a_laser(loop):
+    # on a laser S would be beam power and stay on through the G0 seek
+    with pytest.raises(ValueError, match="mill job refused: mill_mode is off"):
+        driveboard.job(copy.deepcopy(MILL_JOB))
+    assert loop.tx_buffer == bytearray() and loop.job_active is False
+
+
+def test_mill_emitter_refuses_on_a_laser_too(loop):
+    with pytest.raises(ValueError, match="mill job refused: mill_mode is off"):
+        driveboard.job_mill(copy.deepcopy(MILL_JOB))
+    assert loop.tx_buffer == bytearray()
+
+
+def test_mill_job_runs_in_mill_mode(loop, monkeypatch):
+    monkeypatch.setitem(conf, "mill_mode", True)
+    loop._status["offset"] = [0.0, 0.0, 0.0]
+    driveboard.job(copy.deepcopy(MILL_JOB))
+    assert loop.job_active and loop.tx_buffer != bytearray()
 
 
 def test_review_fatal_after_warnings_is_only_the_fatal(queue):

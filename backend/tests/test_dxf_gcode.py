@@ -700,10 +700,23 @@ def test_g91_relative_moves_in_inches():
     assert _data(job) == [("G1", (25.4, None, None)), ("G1", (50.8, None, None))]
 
 
-def test_gcode_dispatch_returns_mill_job_without_optimizing():
+def test_gcode_dispatch_returns_mill_job_without_optimizing(monkeypatch):
+    monkeypatch.setitem(conf, "mill_mode", True)
     job = jobimport.convert("T1 M6\nG0 X0 Y0\nG1 X5 Y5 F800\n")
     assert job["head"] == {"kind": "mill"}
     assert _data(job) == [("G0", (0, 0, None)), ("F", 800), ("G1", (5, 5, None))]
+
+
+def test_gcode_is_refused_on_a_laser(monkeypatch):
+    # a laser would turn the spindle S word into beam power, on during seeks
+    monkeypatch.setitem(conf, "mill_mode", False)
+    with pytest.raises(issues.ImportFailed) as e:
+        jobimport.convert("T1 M6\nG0 X0 Y0\nG1 X5 Y5 F800\n")
+    assert e.value.issue == {
+        "problem": "G-code not supported on laser",
+        "where": None,
+        "fix": "Export as SVG or DXF",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -1597,6 +1597,9 @@ def job(jobdict):
             if "defs" not in jobdict:
                 print("ERROR: invalid job")
                 return
+            if not conf["mill_mode"]:
+                # a laser would fire the spindle S word as beam power, on during seeks
+                raise ValueError("mill job refused: mill_mode is off")
             job_mill_validate(jobdict)
         else:
             if "defs" not in jobdict or "items" not in jobdict:
@@ -3242,6 +3245,8 @@ def job_mill(jobdict):
     if "defs" not in jobdict:
         print("ERROR: invalid job")
         return
+    if not conf["mill_mode"]:
+        raise ValueError("mill job refused: mill_mode is off")
     # raises ValueError if any move falls outside the work area
     job_mill_validate(jobdict)
     # prime job

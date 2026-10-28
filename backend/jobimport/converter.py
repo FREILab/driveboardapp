@@ -48,6 +48,9 @@ def convert(job, optimize=True, tolerance=conf["tolerance"], matrix=None):
     elif type_ == "dxf":
         job = read_dxf(job, tolerance, optimize=optimize)
     elif type_ == "gcode":
+        if not conf["mill_mode"]:
+            # a laser would run the spindle S word as beam power, on during seeks
+            raise issues.ImportFailed("G-code not supported on laser", "Export as SVG or DXF")
         job = read_gcode(job, tolerance, optimize=optimize)
     else:
         print("ERROR: file type not recognized")

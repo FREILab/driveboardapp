@@ -865,7 +865,8 @@ def test_gcode_reader_minimal():
     assert job["defs"][0]["data"], "expected motion actions recorded"
 
 
-def test_convert_gcode_via_dispatch():
+def test_convert_gcode_via_dispatch(monkeypatch):
+    monkeypatch.setitem(jobimport.converter.conf, "mill_mode", True)
     gcode = "T1 M6\nG0 X0 Y0\nG1 X5 Y5 F800\n"
     job = jobimport.convert(gcode)
     assert "defs" in job
