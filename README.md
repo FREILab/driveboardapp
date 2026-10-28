@@ -1,59 +1,133 @@
-**Notes on this fork:**
+# DriveboardApp
 
-The original codebase at [nortd/driveboardapp](https://github.com/nortd/driveboardapp) is no longer maintained. Here are some of the highlights in this fork, see [this thread](https://groups.google.com/g/lasersaur/c/n54LNN86H-c), [this blog post](https://theshamblog.com/software-mods-to-the-lasersaur/), or the [changelog](./CHANGELOG.md) for more info:
-* Upgrade from Python 2 to Python 3
-* Rastering completely rewritten: skips over large whitespace for speed, option for inverting, can select number of gray levels (set to 2-3 for dithering, max of 128)
-* Rastering supports svg-embedded PNG, JPEG, GIF, BMP, WebP, ICO, TIFF, PPM, PCX, TGA, JPEG 2000, AVIF
-* Added a 'pulse' functionality for the laser (all safety interlocks still work)
-* Faster pathing algorithms, and new faster Bidirectional and NearestNeighbor fill modes for rasters and fills
-* SVG text and area fills are imported as paths
-* Fills of the same color are nested to make holes in fill areas, to support text
-* The UI has new modals for saving and loading material preset laser settings, editing the configuration, jogging in smaller 1mm increments, and many tweaks for showing the head coordinates and setting offsets
-* Option for the head to auto-home when the machine is booted
-* Many small bugfixes and safety improvements
-* Added an automated test suite (Python behavior, firmware compilation + behavior in a simulator, and a frontend smoke check) that runs in GitHub Actions
-* Tested on Windows and Linux
+[![CI](https://github.com/FREILab/driveboardapp/actions/workflows/ci.yml/badge.svg)](https://github.com/FREILab/driveboardapp/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 
-Outstanding issues:
-* Building a Windows executable isn’t currently working
-* Documentation needs to be updated
+Control software for Driveboard-based laser cutters like the [Lasersaur](http://lasersaur.com).
+Load SVG, DXF or DBA files in the browser, assign cut and engrave settings per
+colour, and run the job on the machine.
 
-Many thanks to scottshambaugh, FREILab, Johann150, makermusings, vanillasoap, and martinxyz for keeping this project alive. Below is the original documentation.
+This is a maintained fork of [nortd/driveboardapp](https://github.com/nortd/driveboardapp),
+which is no longer developed. See [History](#history) and the
+[changelog](./CHANGELOG.md) for what changed.
 
--------------
+The app has three parts:
 
-DriveboardApp
-=============
+| Part | Language | Runs on |
+|---|---|---|
+| Frontend | JavaScript | any web browser, also tablets |
+| Backend | Python 3 | the Driveboard itself or a computer attached to it |
+| Firmware | C (AVR) | the Driveboard controller |
 
-DriveboardApp is the official app to control Driveboard-based CNC machines like the [Lasersaur](http://lasersaur.com). Its aim is to provide a simple yet powerful way to control the machine. Its primary features are:
+## Features
 
-- load svg vector files and send them to the machine
-- display the status of the machine
-- pausing/continuing/stopping a job
-- firmware flashing
+- **Import** of SVG (including text, fills, clones, patterns and embedded
+  raster images), DXF and DBA jobs.
+- **Import issues dialog:** problems in a file are shown before the job is
+  queued. Each row says what the app does about the problem and how to fix
+  it in the source file. You choose *Load anyway* or *Cancel*. Jobs that fall
+  outside the work area are flagged too.
+- **Passes:** feed rate, intensity, pierce time and air/aux assist per pass,
+  with savable material presets.
+- **Fills** for closed paths, nested so text and holes come out right, with
+  Forward, Reverse, Bidirectional and NearestNeighbor modes.
+- **Raster engraving** with skipping of blank areas, inverting and selectable
+  grey levels (2-3 for dithering, up to 128).
+- **Path optimization** that minimises seek time, using the firmware's real
+  acceleration profile.
+- **Machine control:** status, pause, resume, stop, jog, offsets, homing and
+  a short *pulse* for alignment (all safety interlocks stay active).
+- **Safety checks** before anything moves: work area, power/speed limit,
+  stop handling, and a log of unexplained stops at `/incidents`.
+- **Firmware flashing** from the app.
 
-This software is written in Javascript (frontend), Python (backend) and C (firmware). The backend can either run directly on the Driveboard or on the client computer. The frontend runs in a web browser either on the same client computer or on a tablet computer.
+## Quick start
 
-- frontend
-- [backend](docs/backend.md)
-  - [Low-Level API](docs/api_low.md)
-  - [High-Level API](docs/api_high.md)
-- firmware
-  - [serial protocol](docs/protocol.md)
-- jobs
-  - [dba file format](docs/dba.md)
-- [configuration](docs/configure.md)
-- [testing](docs/testing.md)
+Requires Python 3.9 or newer and [uv](https://docs.astral.sh/uv/).
 
+```bash
+git clone https://github.com/FREILab/driveboardapp.git
+cd driveboardapp
+uv sync
+uv run python backend/app.py
+```
 
-Installation
-------------
-- [installation](docs/install.md)
+The app opens in your browser at `http://127.0.0.1:4444/`. Use
+`--nobrowser` to skip that and `--cli` to run without the server window.
+Other ways to install, including pip, are in [docs/install.md](docs/install.md).
 
-Hardware
---------
-- [Driveboard](https://github.com/nortd/lasersaur/wiki/driveboard) via [Lasersaur project](http://www.lasersaur.com)
+## Configuration
+
+Settings live in `config.json` in the config directory (`~/.driveboardapp`
+on Linux; the app prints its path on start). The app writes it with defaults
+on first start, and most settings can also be edited in the UI. Pass
+`--config NAME` to use `config.NAME.json` instead. Every option is
+described in [docs/configure.md](docs/configure.md).
+
+`mill_mode` switches to the separate mill frontend. With it off (the
+default for a laser), G-code files and mill jobs are refused, because a
+laser would run the spindle speed as beam power.
+
+## Development
+
+```bash
+uv sync --dev
+uv run pytest backend/tests                # Python backend
+node --test "frontend/tests/*.test.js"     # frontend logic
+uv run ruff check . && uv run ruff format --check .
+```
+
+The firmware tests compile the real firmware and run it in
+[simavr](https://github.com/buserror/simavr). They skip themselves when the
+AVR toolchain is missing. No Driveboard is needed for any test. Details are
+in [docs/testing.md](docs/testing.md).
+
+## Documentation
+
+- [Installation](docs/install.md)
+- [Configuration](docs/configure.md)
+- [Frontend](docs/frontend.md)
+- [Backend](docs/backend.md): [low-level API](docs/api_low.md),
+  [high-level API](docs/api_high.md)
+- [Firmware](docs/firmware.md): [serial protocol](docs/protocol.md)
+- [DBA job file format](docs/dba.md)
+- [Testing](docs/testing.md)
+
+## Hardware
+
+- [Driveboard](https://github.com/nortd/lasersaur/wiki/driveboard) from the
+  [Lasersaur project](http://www.lasersaur.com)
 - [MinimalDriveboard](docs/minimaldriveboard.md)
 
+## History
 
-**DISCLAIMER:** Please be aware that operating CNC machines can be dangerous and requires full awareness of the risks involved. NORTD Labs does not warrant for any code or documentation and does not assume any risks whatsoever with regard to using this software.
+The original DriveboardApp by NORTD Labs is no longer maintained. Main
+changes in this fork:
+
+- Ported from Python 2 to Python 3.
+- Raster engraving rewritten, with support for PNG, JPEG, GIF, BMP, WebP,
+  TIFF, AVIF and more embedded in SVG.
+- SVG text and area fills imported as paths.
+- Faster path and seek optimization.
+- UI for material presets, config editing, fine jogging and offsets.
+- Import issues dialog, work-area checks and many safety fixes in host and
+  firmware.
+- Automated test suite for backend, firmware (in a simulator) and frontend,
+  run in GitHub Actions.
+
+More background is in [this thread](https://groups.google.com/g/lasersaur/c/n54LNN86H-c)
+and [this blog post](https://theshamblog.com/software-mods-to-the-lasersaur/).
+
+Known issues:
+
+- Building a Windows executable does not work at the moment.
+- Parts of the documentation are out of date.
+
+Thanks to scottshambaugh, FREILab, Johann150, makermusings, vanillasoap and
+martinxyz for keeping this project alive.
+
+## Disclaimer
+
+Operating a laser cutter or other CNC machine is dangerous and requires full
+awareness of the risks involved. This software comes without any warranty,
+and neither NORTD Labs nor the contributors take on any risk from its use.
