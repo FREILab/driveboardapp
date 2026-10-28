@@ -113,3 +113,13 @@ def test_focus_files_renamed(client):
     files = json.loads(client.get("/listing_library").text)["files"]
     assert "Parts_FixFocus" in files and "Parts_FocusStairs_3-30mm" in files
     assert "Parts_Fokus9mm" not in files and "Parts_Fokushilfe_3-30mm" not in files
+
+
+def test_six_lines_instruction_layer_is_compact_and_unassigned():
+    job = _render("Test_6Linien")
+    assigned = {i for p in job["passes"] for i in p["items"]}
+    layer = [i for i, it in enumerate(job["items"]) if it["color"] in ("#000000", "#8f4300")]
+    assert layer and not assigned & set(layer)  # drawn, never cut
+    x0, y0, x1, y1 = _bbox(job, "#000000")
+    bx0, by0, bx1, by1 = _bbox(job, "#8f4300")  # workpiece outline
+    assert min(x0, bx0) >= 20 and max(x1, bx1) <= 210 and min(y0, by0) >= 0 and max(y1, by1) <= 125

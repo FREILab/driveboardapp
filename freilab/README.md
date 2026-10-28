@@ -22,7 +22,7 @@ Starten statt `backend/app.py`:
 | `web/freilab_modals.html` | Die Dialoge |
 | `web/freilab.css` | Styles dazu |
 | `web/img/material/` | Material-Icons |
-| `library/` | Unsere Jobs, zusätzlich zu `library/` von Upstream. `Test_PowerQuadrate` und `Test_6Linien` sind Vorlagen (Vorschub und Leistung beim Laden einstellbar); ihre SVG-Quellen liegen in `library/src/` |
+| `library/` | Unsere Jobs, zusätzlich zu `library/` von Upstream. `Test_PowerQuadrate` (nur Vorschub), `Test_6Linien` (Vorschub und Leistung) und `Parts_FixFocus` (Dicke) sind Vorlagen, deren Werte beim Laden einstellbar sind; ihre SVG-Quellen liegen in `library/src/`. `Parts_FocusStairs_3-30mm` ist ein fester Job |
 | `config.example.json` | Unsere Maschinen-Einstellungen |
 | `firmware-homing.patch` | Homing-Rückfahrstrecken, nur beim Firmware-Bau anwenden (siehe unten) |
 | `test_overlay.py` | `pytest freilab/test_overlay.py` (getrennt von `backend/tests`, das Overlay patcht das Backend global) |
