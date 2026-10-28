@@ -83,3 +83,33 @@ def test_six_lines_follow_feed_and_power():
         [(f, 80) for f in (1500, 1400, 1300, 1200, 1100, 1000)]
     first = job["defs"][job["items"][job["passes"][0]["items"][0]]["def"]]["data"][0]
     assert first == [[0, -2.5], [0, 2.5]]  # (0,0) still on the top edge
+
+
+def _bbox(job, color):
+    pts = [p for it in job["items"] if it.get("color") == color
+           for path in job["defs"][it["def"]]["data"] for p in path]
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+@pytest.mark.parametrize("d", [3, 9, 20])
+def test_fix_focus_strip_is_d_high_and_label_fits(d):
+    job = _render("Parts_FixFocus", {"d": d})
+    strip = [path for it in job["items"] if it.get("color") == "#000000"
+             for path in job["defs"][it["def"]]["data"]
+             if min(p[0] for p in path) > 35]  # right of the disc
+    ys = [p[1] for path in strip for p in path]
+    assert max(ys) - min(ys) == pytest.approx(d, abs=0.05)
+    x0, y0, x1, y1 = _bbox(job, "#e00000")
+    assert min(ys) < y0 and y1 < max(ys)  # label inside the strip
+
+
+def test_fix_focus_label_says_fix_focus():
+    svg = template.render(_lib("Parts_FixFocus")["template"]["svg"], {"d": 12})
+    assert "Fix Focus 12 mm" in svg
+
+
+def test_focus_files_renamed(client):
+    files = json.loads(client.get("/listing_library").text)["files"]
+    assert "Parts_FixFocus" in files and "Parts_FocusStairs_3-30mm" in files
+    assert "Parts_Fokus9mm" not in files and "Parts_Fokushilfe_3-30mm" not in files
