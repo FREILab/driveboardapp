@@ -1581,6 +1581,33 @@ def test_convert_job_timeout_is_504_and_discards_worker(monkeypatch):
     assert dropped == [True]
 
 
+class _HangingPool:
+    def submit(self, fn, *args):
+        import concurrent.futures
+
+        return concurrent.futures.Future()  # never runs, never finishes
+
+
+def test_convert_job_progressive_times_out_when_no_quick_parse_appears(monkeypatch):
+    dropped, raised = [], []
+    monkeypatch.setattr(web, "_convert_pool_get", lambda: _HangingPool())
+    monkeypatch.setattr(web, "_convert_pool_drop", lambda: dropped.append(True))
+    monkeypatch.setattr(web, "CONVERT_TIMEOUT", 0.2)
+
+    def convert():
+        try:
+            web._convert_job(MINIMAL_DBA, optimize=True, matrix=None, progressive=True)
+        except bottle.HTTPResponse as e:
+            raised.append(e.status_code)
+
+    t = threading.Thread(target=convert, daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive()
+    assert raised == [504]
+    assert dropped == [True]
+
+
 def test_convert_job_progressive_hands_back_quick_parse_and_token(monkeypatch):
     monkeypatch.setattr(web, "_convert_pool_get", lambda: _FakePool(lambda: _Future(done=False)))
     dba, token, _ = web._convert_job(MINIMAL_DBA, optimize=True, matrix=None, progressive=True)
@@ -2081,6 +2108,18 @@ def test_review_outside_work_area_row(queue):
             "Move origin or scale",
             1,
         )
+        assert os.listdir(d) == []
+    finally:
+        web._load_held.pop(data["hold"], None)
+
+
+def test_review_gcode_outside_work_area_row(queue):
+    app, d = queue
+    data = json.loads(_review(app, job="T1 M6\nG0 X5000 Y10\n", name="farmill").body)
+    try:
+        (row,) = data["issues"]
+        assert row["problem"] == "Outside work area"
+        assert row["where"].startswith("x 5000 > ")
         assert os.listdir(d) == []
     finally:
         web._load_held.pop(data["hold"], None)

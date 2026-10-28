@@ -767,12 +767,12 @@ def _convert_job(job, optimize, matrix, progressive=False):
         try:
             with _convert_pool_lock:
                 future = _convert_pool_get().submit(_convert_worker, *args)
+            deadline = time.monotonic() + CONVERT_TIMEOUT
             try:
                 if progressive:
                     # hand back the parsed job as soon as it appears, the
                     # optimized one follows via /load_result
-                    waited = 0.0
-                    while not future.done() and waited < CONVERT_TIMEOUT:
+                    while not future.done() and time.monotonic() < deadline:
                         if os.path.exists(quick_path):
                             with open(quick_path) as fp:
                                 quick = fp.read()
@@ -781,7 +781,7 @@ def _convert_job(job, optimize, matrix, progressive=False):
                             tmpdir = None  # the watcher owns the cleanup now
                             return quick, token, found
                         time.sleep(0.05)
-                future.result(timeout=CONVERT_TIMEOUT)
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
             except concurrent.futures.TimeoutError:
                 _convert_pool_drop()
                 raise bottle.HTTPResponse("Import timed out.", 504) from None

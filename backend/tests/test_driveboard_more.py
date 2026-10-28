@@ -1418,13 +1418,12 @@ def test_mill_job_without_a_machine_runs_nowhere_and_leaves_no_dispatch_state(mo
 # ---------------------------------------------------------------------------
 
 
-def _area_job(def_, translate=None):
-    item = {"def": 0} if translate is None else {"def": 0, "translate": translate}
-    return {"items": [item], "defs": [def_]}  # imports usually have no passes
+def _area_job(def_):
+    return {"items": [{"def": 0}], "defs": [def_]}  # imports usually have no passes
 
 
-def _area_path(*points, **item_kw):
-    return _area_job({"kind": "path", "data": [list(points)]}, **item_kw)
+def _area_path(*points):
+    return _area_job({"kind": "path", "data": [list(points)]})
 
 
 def test_outside_work_area_none_when_everything_fits(loop, monkeypatch):
@@ -1445,11 +1444,27 @@ def test_outside_work_area_names_the_first_excess(loop, monkeypatch):
     assert driveboard.job_outside_work_area(job) == "y 700 > 610 mm"
 
 
-def test_outside_work_area_applies_item_translate(loop, monkeypatch):
+def test_outside_work_area_ignores_item_translate(loop, monkeypatch):
+    # no run applies an item's translate, so neither does the check
     monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 0])
     loop._status["offset"] = [0.0, 0.0, 0.0]
-    job = _area_path([10, 10], translate=[1300, 0, 0])
-    assert driveboard.job_outside_work_area(job) == "x 1310 > 1220 mm"
+    job = _area_path([10, 10])
+    job["items"][0]["translate"] = [1300, 0, 0]
+    assert driveboard.job_outside_work_area(job) is None
+
+
+def _area_mill(*moves):
+    return {"head": {"kind": "mill"}, "defs": [{"data": list(moves)}]}
+
+
+def test_outside_work_area_checks_mill_moves_like_a_mill_run(loop, monkeypatch):
+    monkeypatch.setitem(conf, "workspace", [1220.0, 610.0, 50.0])
+    loop._status["offset"] = [300.0, 0.0, 0.0]  # a mill runs in machine coordinates
+    job = _area_mill(["G0", [10, 10, None]], ["F", 100], ["G1", [5000, 10, None]])
+    assert driveboard.job_outside_work_area(job) == "x 5000 > 1220 mm"
+    job = _area_mill(["G0", [10, None, None]], ["G1", [1220, 610, 50]])
+    assert driveboard.job_outside_work_area(job) is None
+    assert driveboard.job_outside_work_area(_area_mill(["G1", [10, 10, -1]])) == "z -1 < 0 mm"
 
 
 def test_outside_work_area_checks_image_corners(loop, monkeypatch):

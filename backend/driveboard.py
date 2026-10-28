@@ -1826,37 +1826,51 @@ def job_outside_work_area(jobdict):
 
     Returns None if all points fit, else a short description of the first
     excess like "x 1450 > 1220 mm". Limits are in offset coordinates, as in
-    job_laser_validate.
+    job_laser_validate; a mill job's moves are in machine coordinates, as in
+    job_mill_validate.
     """
     global SerialLoop
 
+    if jobdict.get("head", {}).get("kind") == "mill":
+        points = (
+            item[1] for def_ in jobdict["defs"] for item in def_["data"] if item[0] in ("G0", "G1")
+        )
+        limits = [(i, axis, 0, conf["workspace"][i]) for i, axis in enumerate("xyz")]
+        return _first_outside(points, limits)
     if SerialLoop is None:
         offsets = [0.0, 0.0, 0.0]  # no machine, no job origin
     else:
         with SerialLoop.lock:
             offsets = list(SerialLoop._status["offset"])
-    limits = []  # (axis, lo, hi)
+    limits = []  # (i, axis, lo, hi)
     for i, axis in enumerate("xyz"):
         if i < 2 or conf["workspace"][2]:
             limits.append((i, axis, -offsets[i], conf["workspace"][i] - offsets[i]))
 
-    for item in jobdict["items"]:
-        def_ = jobdict["defs"][item["def"]]
-        shift = item.get("translate", [0, 0, 0])
-        if def_["kind"] == "image":
-            pos, size = def_["pos"], def_["size"]
-            points = [pos[:2], [pos[0] + size[0], pos[1] + size[1]]]
-        else:
-            points = [pos for polyline in def_["data"] for pos in polyline]
-        for point in points:
-            for i, axis, lo, hi in limits:
-                if i >= len(point):
-                    continue
-                v = point[i] + (shift[i] if i < len(shift) else 0)
-                if v < lo:
-                    return f"{axis} {round(v)} < {round(lo)} mm"
-                if v > hi:
-                    return f"{axis} {round(v)} > {round(hi)} mm"
+    def points():
+        for item in jobdict["items"]:
+            def_ = jobdict["defs"][item["def"]]
+            if def_["kind"] == "image":
+                pos, size = def_["pos"], def_["size"]
+                yield from (pos[:2], [pos[0] + size[0], pos[1] + size[1]])
+            else:
+                yield from (pos for polyline in def_["data"] for pos in polyline)
+
+    return _first_outside(points(), limits)
+
+
+def _first_outside(points, limits):
+    """The first coordinate beyond its (i, axis, lo, hi) limit, or None.
+    Missing and None coordinates (an axis a move leaves alone) are skipped."""
+    for point in points:
+        for i, axis, lo, hi in limits:
+            v = point[i] if i < len(point) else None
+            if v is None:
+                continue
+            if v < lo:
+                return f"{axis} {round(v)} < {round(lo)} mm"
+            if v > hi:
+                return f"{axis} {round(v)} > {round(hi)} mm"
     return None
 
 
