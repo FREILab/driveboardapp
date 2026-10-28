@@ -54,6 +54,7 @@
     <script src="status.js"></script>
     <script src="fills.js"></script>
     <script src="presets.js"></script>
+    <script src="template.js"></script>
 
   </head>
 
@@ -343,6 +344,23 @@
               <h4 class="modal-title" id="presets_header">Preset Settings</h4>
             </div>
             <div id="presets_content" class="modal-body">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- template parameters modal -->
+      <div id="template_modal" class="modal fade" tabindex="-1" role="dialog" aria-hidden="true">
+        <div class="modal-dialog">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+              <h4 class="modal-title" id="template_title"></h4>
+            </div>
+            <div id="template_body" class="modal-body"></div>
+            <div class="modal-footer">
+              <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
+              <button type="button" class="btn btn-primary" id="template_ok_btn">OK</button>
             </div>
           </div>
         </div>

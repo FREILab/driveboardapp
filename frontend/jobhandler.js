@@ -46,6 +46,7 @@ jobhandler = {
   image_group: undefined,
   preview_seq: 0,
   duration: 0, // last modelled run time in seconds, 0 when unknown
+  template: null, // {params, svg} of a parametric library job
 
   clear: function () {
     this.passes = [];
@@ -58,6 +59,7 @@ jobhandler = {
     this.sources = {};
     this.name = "";
     this.duration = 0;
+    this.template = null;
     this.preview_seq++;
     jobview_clear();
     passes_clear();
@@ -137,6 +139,9 @@ jobhandler = {
       //passes
       if ("passes" in job && job.passes.length) {
         this.passes = job.passes;
+      }
+      if (job.template) {
+        this.template = job.template;
       }
       // items, defs
       this.defs = job.defs;
@@ -287,6 +292,9 @@ jobhandler = {
     }
     if (have_sources) {
       job_out.sources = sources_out;
+    }
+    if (this.template) {
+      job_out.template = this.template;
     }
     return job_out;
   },

@@ -231,6 +231,11 @@ function import_open(jobname, from_library) {
         jobhandler.draw();
       }
 
+      if (from_library === true && job.template) {
+        template_open(jobname, job.template);
+        return;
+      }
+
       jobhandler.set(job, jobname, jobhandler_done);
 
       // debug, show image, stats
