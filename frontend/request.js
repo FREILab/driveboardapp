@@ -221,7 +221,14 @@ function request_boundary(bounds, seekrate) {
   });
 }
 
+var request_jog_in_flight = false;
+
 function request_jog(x, y, z, success_msg) {
+  // a held key repeats faster than a jog round trip, those repeats are dropped
+  if (request_jog_in_flight) {
+    return;
+  }
+  request_jog_in_flight = true;
   request_get({
     url: "/jog/" + x + "/" + y + "/" + z,
     success: function (data) {
@@ -230,6 +237,16 @@ function request_jog(x, y, z, success_msg) {
       } else {
         $().uxmessage("notice", success_msg);
       }
+    },
+    error: function (data) {
+      // 409: the machine is not taking jogs right now (homing, or the last
+      // steps still running), and key repeat would only stack up popups
+      if (data.status != 409) {
+        $().uxmessage("error", data.responseText, false);
+      }
+    },
+    complete: function () {
+      request_jog_in_flight = false;
     },
   });
 }

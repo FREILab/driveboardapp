@@ -262,6 +262,11 @@ LIMIT_STOPS = {"x1", "x2", "y1", "y2", "z1", "z2"}
 # Stops with an obvious cause: someone asked for it, or the head ran into a
 # limit. Every other one is a fault worth a record.
 EXPLAINED_STOPS = {"requested"} | LIMIT_STOPS
+# Status the controller only reports in a super frame.
+SUPER_STATUS = ("offset", "firmver", "feedrate", "intensity", "duration", "pixelwidth")
+# How close to the origin a homing cycle leaves the head, in mm: the origin
+# move lands on a whole step, half a step off at most.
+HOMED_AT_ORIGIN = 0.1
 
 # Unexplained stops are logged here, in the config directory, the newest last.
 INCIDENTS_FILE = "incidents.jsonl"
@@ -354,6 +359,20 @@ class SerialLoopClass(threading.Thread):
         # The controller rebooted under a live session, see _controller_reset.
         # Stands as a stop until the machine is homed.
         self.controller_reset = False
+        # Whether the head position is known. Only a homing cycle seen through
+        # to its end proves it, see _track_frame. A limit hit loses it again,
+        # the gantry coasts on past the switch after the dead stop, and so does
+        # a controller reset. Unknown at start, the controller may have been
+        # running since before this app.
+        self.homed = False
+        self.homing_pending = False  # CMD_HOMING sent, the cycle not over yet
+        self.homing_ran = False  # a busy frame came from the cycle
+        # Status frames received since bytes last went out. The first may have
+        # left the controller before those bytes arrived, only from the second
+        # on does an idle frame prove they have been consumed.
+        self.frames_since_write = 0
+        self._frame_idle = False
+        self._frame_super = False
         # What went over the wire last and the anomalies counted, for the
         # incident record written when an unexplained stop shows up.
         self.tx_log = collections.deque(maxlen=64)
@@ -415,6 +434,8 @@ class SerialLoopClass(threading.Thread):
         self.lock = threading.Lock()
 
     def reset_status(self):
+        # the offset is back to 0.0 below until a super frame reports it
+        self.offset_stale = True
         self._status = {
             "ready": False,  # is hardware idle (and not stop mode)
             "serial": False,  # is serial connected
@@ -470,6 +491,8 @@ class SerialLoopClass(threading.Thread):
         if self.discard_writes:
             return  # stopped, see discard_writes
         self._guard_foreign_write()
+        if command in (CMD_OFFSET_RESTORE, CMD_HOMING):
+            self.offset_stale = True  # see _track_frame
         self.tx_buffer.append(ord(command))
         # Do not admit a job on the strength of a status frame from before
         # this command was queued. Firmware idle will set ready again after
@@ -491,6 +514,8 @@ class SerialLoopClass(threading.Thread):
         if num < 0 or num > (1 << 28) - 1:
             print(f"WARN: param {param} value {val} out of range, clamping")
             num = max(0, min(num, (1 << 28) - 1))
+        if param in (PARAM_OFFSET_X, PARAM_OFFSET_Y, PARAM_OFFSET_Z):
+            self.offset_stale = True  # see _track_frame
         char0 = (num & 127) + 128
         char1 = ((num & (127 << 7)) >> 7) + 128
         char2 = ((num & (127 << 14)) >> 14) + 128
@@ -623,6 +648,14 @@ class SerialLoopClass(threading.Thread):
                     self._s["ready"] = False
                     self._s["underruns"] = self._status["underruns"]
                     self._s["stackclear"] = self._status["stackclear"]
+                    # only a super frame writes these, so the buffer about to
+                    # assemble has to start from the newest, not from its own
+                    # copy two frames old
+                    for key in SUPER_STATUS:
+                        self._s[key] = copy.copy(self._status[key])
+                    self.frames_since_write += 1
+                    self._track_frame()
+                    self._frame_idle = self._frame_super = False
             elif 31 < data_num < 65:  ### stop error markers
                 if settling:
                     continue  # a frame from before the resume landed
@@ -665,6 +698,7 @@ class SerialLoopClass(threading.Thread):
                     # only claimed with an empty rx buffer, so this proves the
                     # firmware consumed everything sent
                     self.last_firmware_idle = time.time()
+                    self._frame_idle = True
                     if not self.tx_buffer:
                         self._s["ready"] = True
                         # Only firmware idle proves its rx buffer and planner
@@ -722,6 +756,7 @@ class SerialLoopClass(threading.Thread):
                 # super status
                 elif data_char == INFO_OFFSET_X:
                     self._s["offset"][0] = num
+                    self._frame_super = True
                 elif data_char == INFO_OFFSET_Y:
                     self._s["offset"][1] = num
                 elif data_char == INFO_OFFSET_Z:
@@ -778,10 +813,43 @@ class SerialLoopClass(threading.Thread):
         self.clear_discard_after_dispatch = self.discard_writes
         self.request_stop = True
         self.controller_reset = True
+        self.homed = self.homing_pending = False  # the position is gone too
         self._status["stops"]["reset"] = True
         self.stop_episode = True
         self._record_incident(INFO_HELLO, "reset")
         self.incident = "Controller rebooted, home the machine. " + self.incident
+
+    def _track_frame(self):
+        """Follow homing and the offset through the frame just completed.
+
+        Homed takes an idle, drained frame at the origin after a busy one. The
+        busy one has to come first because a frame from before CMD_HOMING
+        arrived can still be on its way in, idle wherever the head was. And
+        idle alone does not end the cycle: between two of its moves the
+        controller reports idle for the one stepper tick its planner is empty
+        while the stepper is still flagged as processing (homing_move in
+        firmware/src/stepper.c). The head then sits a back-off from a switch,
+        never on the origin, which only the origin move at the end reaches.
+
+        Limit stops are how every approach of the cycle ends, and a switch
+        still pressed during a back-off is reported as one too, so only other
+        stops abort it. Outside homing, a limit stop loses the position.
+        """
+        st = self._status
+        drained = st["ready"] and self.frames_since_write >= 2
+        if drained and self._frame_super:
+            self.offset_stale = False
+        if not self.homing_pending:
+            if LIMIT_STOPS & st["stops"].keys():
+                self.homed = False
+        elif st["stops"].keys() - LIMIT_STOPS:
+            self.homing_pending = False  # stopped, the cycle was abandoned
+        elif not self._frame_idle:
+            if not self.tx_buffer and self.frames_since_write >= 2:
+                self.homing_ran = True  # sent after CMD_HOMING went out
+        elif self.homing_ran and drained:
+            if max(abs(v) for v in st["pos"]) < HOMED_AT_ORIGIN:
+                self.homed, self.homing_pending = True, False
 
     def _record_incident(self, code, label):
         """Keep a record of an unexplained stop for someone to look at later.
@@ -937,6 +1005,7 @@ class SerialLoopClass(threading.Thread):
                             print("ERROR: write did not complete")
                         else:
                             assumedSent = expectedSent
+                            self.frames_since_write = 0
                             self.tx_log.extend(to_send[::2])  # undoubled
                             self.firmbuf_used += assumedSent
                             if self.firmbuf_used > self.FIRMBUF_SIZE:
@@ -1348,6 +1417,11 @@ def status():
             stats["serial"] = connected()  # make sure serial flag is up-to-date
             if SerialLoop.incident:
                 stats["incident"] = SerialLoop.incident
+            stats["homed"] = SerialLoop.homed
+            stats["homing"] = SerialLoop.homing_pending
+            stats["offset_settled"] = not SerialLoop.offset_stale
+            # ready, and from a frame sent after the last bytes went out
+            stats["drained"] = stats["ready"] and SerialLoop.frames_since_write >= 2
         return stats
     else:
         return {"serial": False, "ready": False}
@@ -1369,6 +1443,8 @@ def homing():
         SerialLoop.send_command(CMD_HOMING)
         SerialLoop.request_resume = True
         SerialLoop.controller_reset = False  # homing is what a reset asks for
+        SerialLoop.homed = SerialLoop.homing_ran = False
+        SerialLoop.homing_pending = True
 
 
 def _clamp_param(name, val, lo, hi):

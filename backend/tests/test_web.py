@@ -181,8 +181,11 @@ def jog(auth_app, monkeypatch):
     stats = {
         "serial": True,
         "ready": True,
+        "drained": True,
         "pos": [0.0, 0.0, 0.0],
         "offset": [0.0, 0.0, 0.0],
+        "homed": True,  # clamped seek jogs are a homed machine's
+        "offset_settled": True,
     }
     monkeypatch.setattr(driveboard, "connected", lambda: True)
     monkeypatch.setattr(driveboard, "status", lambda: stats)
@@ -243,26 +246,26 @@ def test_jog_clamps_to_workarea(jog, monkeypatch, workspace, pos, offset, delta,
 @pytest.mark.parametrize(
     "pos,expected",
     [
-        ([0.0, 0.0, 0.0], [(50, 0, 0), (100, 0, 0), (150, 0, 0)]),
-        ([1150.0, 0.0, 0.0], [(1200, 0, 0), (1220, 0, 0), (1220, 0, 0)]),
+        ([0.0, 0.0, 0.0], [(50, 0, 0), (100, 0, 0)]),
+        ([1150.0, 0.0, 0.0], [(1200, 0, 0), (1220, 0, 0)]),
     ],
 )
 def test_jog_burst_accumulates_while_moving(jog, pos, expected):
     # The reported position lags a move in flight, so successive jogs have to
     # build on the last target commanded rather than re-clamp against a stale
-    # position.
-    jog["stats"]["ready"] = False
+    # position. Two steps ahead of the head is as far as a burst gets.
+    jog["stats"]["ready"] = jog["stats"]["drained"] = False
     jog["stats"]["pos"] = pos
-    for _ in range(3):
-        jog["app"].get("/jog/50/0/0")
+    codes = [jog["app"].get("/jog/50/0/0", expect_errors=True).status_int for _ in range(3)]
+    assert codes == [200, 200, 409]
     assert _jog_moves(jog["calls"]) == expected
 
 
 def test_jog_reseeds_from_position_once_idle(jog):
-    jog["stats"]["ready"] = False
+    jog["stats"]["ready"] = jog["stats"]["drained"] = False
     jog["app"].get("/jog/50/0/0")
     # Machine settled somewhere else, e.g. after a job or a /move.
-    jog["stats"]["ready"] = True
+    jog["stats"]["ready"] = jog["stats"]["drained"] = True
     jog["stats"]["pos"] = [300.0, 0.0, 0.0]
     jog["app"].get("/jog/50/0/0")
     assert _jog_moves(jog["calls"])[-1] == (350.0, 0.0, 0.0)
@@ -280,13 +283,14 @@ def test_jog_tolerates_status_without_position(jog):
 
 def test_jog_soft_limits_off_restores_relative_passthrough(jog, monkeypatch):
     monkeypatch.setitem(conf, "jog_soft_limits", False)
-    jog["stats"]["ready"] = False
+    jog["stats"]["ready"] = jog["stats"]["drained"] = False
     jog["stats"]["pos"] = [1200.0, 600.0, 0.0]
     jog["app"].get("/jog/50/50/0")
     assert ("relative",) in jog["calls"]
     assert _jog_moves(jog["calls"]) == [(50.0, 50.0, 0.0)]
     # Turning it back on must not build on what the relative jog left behind.
     monkeypatch.setitem(conf, "jog_soft_limits", True)
+    jog["stats"]["ready"] = jog["stats"]["drained"] = True
     jog["stats"]["pos"] = [400.0, 0.0, 0.0]
     jog["app"].get("/jog/50/0/0")
     assert _jog_moves(jog["calls"])[-1] == (450.0, 0.0, 0.0)

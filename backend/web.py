@@ -4,6 +4,7 @@ import glob
 import gzip
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import shutil
@@ -32,6 +33,7 @@ time_reconnect_last = 0
 _reconnect_lock = threading.Lock()
 _presets_lock = threading.RLock()
 jog_target_last = None  # last jog target commanded, in offset coordinates
+JOG_SLACK = 0.01  # mm, over one step still queued that is not yet a second
 
 # error text that comes from a file or a job is never served as html
 PLAIN = {"Content-Type": "text/plain"}
@@ -275,32 +277,36 @@ def retract():
     return "{}"
 
 
-def _jog_target(dx, dy, dz):
-    """Absolute target for a jog step, held inside the work area.
+def _jog_target(stats, delta, clamp):
+    """Target for a jog step in offset coordinates, and whether it was clamped.
 
     Positions and move() targets share the same offset coordinates, in which
     the work area spans [-offset, workspace - offset] on each axis. Z is only
     bounded when the config gives it a non-zero work area, matching
     target_in_workarea, since a machine with no Z axis still has to be able to
     jog the focus.
+
+    A machine that has drained everything sent reports where the next move
+    starts from. While it is still moving the position lags behind, and a
+    burst of jogs has to accumulate onto the last target commanded or every
+    step of the burst clamps against the same stale position. The distance
+    still to that target is the travel queued: past one step, a held key would
+    keep the head running long after it is released, so the step is refused.
     """
     global jog_target_last
-    stats = driveboard.status()
     pos = stats.get("pos") or [0.0, 0.0, 0.0]
     offset = stats.get("offset") or [0.0, 0.0, 0.0]
-    # An idle machine has drained both buffers, so its reported position has
-    # settled and is what the next move starts from. While it is still moving
-    # the position lags behind, and a burst of jogs has to accumulate onto the
-    # last target commanded or every step of the burst clamps against the same
-    # stale position.
-    if stats.get("ready") or jog_target_last is None:
+    # drained also covers a stop, which empties the controller's queue
+    if stats.get("drained") or jog_target_last is None:
         base = pos
     else:
         base = jog_target_last
-    requested = [base[i] + d for i, d in enumerate((dx, dy, dz))]
+        if math.dist(pos, base) > math.hypot(*delta) + JOG_SLACK:
+            raise driveboard.MachineBusy("the previous jog is still running")
+    requested = [base[i] + d for i, d in enumerate(delta)]
     target = list(requested)
     for i in range(3):
-        if i == 2 and not conf["workspace"][2]:
+        if not clamp or (i == 2 and not conf["workspace"][2]):
             continue
         target[i] = max(-offset[i], min(target[i], conf["workspace"][i] - offset[i]))
     jog_target_last = target
@@ -311,19 +317,39 @@ def _jog_target(dx, dy, dz):
 @bottle.auth_basic(checkuser)
 @checkserial
 def jog(x, y, z):
-    global jog_target_last
+    """One jog step.
+
+    Homed, the step is held inside the work area and runs at the seek rate.
+    Unhomed, the reported position is wherever the controller started, so
+    there is no edge to hold it against: it goes out relative, so no
+    direction is refused, and at jog_unhomed_feedrate, slower than the homing
+    approach that runs into the switches by design. jog_soft_limits off jogs
+    a homed machine relative too, at the seek rate.
+    """
     with driveboard.machine_operation():
+        stats = driveboard.status()
+        if stats.get("homing"):
+            # it would be queued behind the cycle and computed in the frame
+            # from before it, which homing clears
+            raise driveboard.MachineBusy("homing in progress")
+        homed = stats.get("homed", False)
+        clamp = homed and conf["jog_soft_limits"]
+        if clamp and not stats.get("offset_settled", True):
+            # a clamp against the reported offset would be in the wrong frame
+            raise driveboard.MachineBusy("waiting for the machine to report its new offset")
+        target, clamped = _jog_target(stats, (x, y, z), clamp)
         driveboard.intensity(0)
-        driveboard.feedrate(conf["seekrate"])
-        if not conf["jog_soft_limits"]:
-            jog_target_last = None  # a relative jog leaves the tracked target behind
+        if homed:
+            driveboard.feedrate(conf["seekrate"])
+        else:
+            driveboard.feedrate(min(conf["seekrate"], conf["jog_unhomed_feedrate"]))
+        if not clamp:
             driveboard.relative()
             driveboard.move(x, y, z)
             driveboard.absolute()
             return "{}"
         # Sent absolute, so the commanded target is inside the work area by
         # construction even if the position it was derived from was stale.
-        target, clamped = _jog_target(x, y, z)
         driveboard.absolute()
         driveboard.move(*target)
     return json.dumps({"clamped": clamped})
