@@ -186,3 +186,50 @@ test("a failure that is not a fatal answer stays a toast", () => {
   assert.equal(app.dom.messages.length, 2);
   assert.equal(app.dom.messages[1].text, "Invalid file type.");
 });
+
+function rows_of(html) {
+  return html.split("<tr>").length - 1;
+}
+
+test("more than 20 rows are cut to 20 plus one +N more row", () => {
+  const app = loadFrontend(["issues.js"]);
+  const issues = [];
+  for (let i = 0; i < 25; i++) issues.push(row({ problem: "Invalid colour #" + i }));
+  const html = app.issues_rows_html(issues);
+  assert.equal(rows_of(html), 21);
+  assert.ok(html.includes("+5 more"));
+  assert.ok(html.includes('colspan="3"'));
+  assert.ok(html.includes("Invalid colour #19"));
+  assert.ok(!html.includes("Invalid colour #20<"));
+});
+
+test("20 rows or fewer have no more row", () => {
+  const app = loadFrontend(["issues.js"]);
+  const issues = [];
+  for (let i = 0; i < 20; i++) issues.push(row());
+  const html = app.issues_rows_html(issues);
+  assert.equal(rows_of(html), 20);
+  assert.ok(!html.includes("more"));
+});
+
+test("dropped rows come first, then replaced, then changed, so none hide behind more", () => {
+  const app = loadFrontend(["issues.js"]);
+  const issues = [];
+  for (let i = 0; i < 22; i++) issues.push(row({ problem: "C" + i, kind: "changed", where: null }));
+  issues.push(row({ problem: "R", kind: "replaced", where: null }));
+  issues.push(row({ problem: "D", kind: "dropped", where: null }));
+  const html = app.issues_rows_html(issues);
+  assert.ok(html.indexOf(">D<") < html.indexOf(">R<"));
+  assert.ok(html.indexOf(">R<") < html.indexOf(">C0<"));
+  assert.ok(html.includes("+4 more"));
+  assert.ok(!html.includes(">C19<"));
+});
+
+test("the dialog title counts every row, not the shown ones", () => {
+  const app = loadFrontend(["issues.js"]);
+  const issues = [];
+  for (let i = 0; i < 220; i++) issues.push(row());
+  app.issues_show("f.svg", issues, () => {}, () => {});
+  assert.ok(app.dom.el("#import_issues_title").html.includes("220 problems"));
+  assert.ok(app.dom.el("#import_issues_rows").html.includes("+200 more"));
+});

@@ -12,9 +12,28 @@ function issues_escape(s) {
     .replace(/'/g, "&#39;");
 }
 
+var ISSUES_MAX_ROWS = 20;
+
 function issues_rows_html(issues) {
   var kinds = { changed: 1, replaced: 1, dropped: 1 };
-  return issues
+  // what the laser will not cut first, so the cap never hides it; the sort
+  // is stable, so rows keep their order within a kind
+  function rank_of(issue) {
+    return issue.kind == "dropped" ? 0 : issue.kind == "replaced" ? 1 : 2;
+  }
+  var ordered = issues
+    .map(function (issue, i) {
+      return [rank_of(issue), i, issue];
+    })
+    .sort(function (a, b) {
+      return a[0] - b[0] || a[1] - b[1];
+    })
+    .map(function (t) {
+      return t[2];
+    });
+  var more = ordered.length - ISSUES_MAX_ROWS;
+  var rows = ordered
+    .slice(0, ISSUES_MAX_ROWS)
     .map(function (issue) {
       var kind = kinds[issue.kind] ? issue.kind : "changed";
       var count = issue.count > 1 ? " ×" + Number(issue.count) : "";
@@ -36,6 +55,10 @@ function issues_rows_html(issues) {
       );
     })
     .join("");
+  if (more > 0) {
+    rows += '<tr><td colspan="3">+' + more + " more</td></tr>";
+  }
+  return rows;
 }
 
 function issues_title(name, rest) {
