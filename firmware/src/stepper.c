@@ -385,6 +385,10 @@ ISR(TIMER1_COMPA_vect) {
     return;
   }
   STEPPING_PORT = (STEPPING_PORT & ~STEPPING_MASK) | out_bits;
+  // each step is pulsed once. Only line blocks set new step bits, so a
+  // dwell or assist block after a line would otherwise repeat its last step
+  // on every tick. The direction bits stay, so no spurious direction change.
+  out_bits &= ~STEPPING_MASK;
   // prime for reset pulse in CONFIG_PULSE_MICROSECONDS
   TCNT2 = -(((CONFIG_PULSE_MICROSECONDS-2)*CYCLES_PER_MICROSECOND) >> 3); // Reload timer counter
   TCCR2B = (1<<CS21); // Begin timer2. Full speed, 1/8 prescaler
