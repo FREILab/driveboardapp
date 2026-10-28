@@ -123,8 +123,8 @@ only, `svg_tag_reader.py:46`) must not be dropped silently either.
 
 | Old | New | Parameters |
 |---|---|---|
-| `Test_PowerQuadrate.dba` | `Test_PowerQuadrate.dba` with template | Feed from–to |
-| `Test_6Linien.dba` | `Test_6Linien.dba` with template | Speed from–to, power |
+| `Test_PowerQuadrate.dba` | `Test_PowerQuadrate.dba` with template | One feed per square (6) |
+| `Test_6Linien.dba` | `Test_6Linien.dba` with template | One feed per line (6), power |
 | `Parts_Fokus9mm.dba` | `Parts_FixFocus.dba` with template | Thickness `d` |
 | `Parts_Fokushilfe_3-30mm.dba` | `Parts_FocusStairs_3-30mm.dba` | None, renamed only |
 
@@ -132,12 +132,12 @@ The old files are removed. Source SVGs go into `freilab/library/src/`.
 
 - **Test_PowerQuadrate:** the same layout as today: one row of 6 squares of
   10 mm at 100 % power, each labelled with its feed rate, inside and below
-  (today 2000 to 1500). Parameters: feed min/max only, spread evenly over the 6
-  squares, with defaults 1500–2000. Power stays fixed at 100 %. The labels are
+  (today 2000 to 1500). Parameters: one feed per square (6 values, defaults 2000,
+  1900, …, 1500). Power stays fixed at 100 %. The labels are
   engraved at 2000/15 as today, also fixed.
 - **Test_6Linien:** 6 lines of 5 mm, 3 mm apart, cut across the workpiece
   edge. The instruction text stays as an unassigned layer, as today, but now
-  also lists the value for each colour. Parameters: feed min/max and power.
+  also lists the value for each colour. Parameters: one feed per line (6 values) and one power.
 - **Parts_FixFocus:** the disc (Ø 32 mm, hole, slot) is unchanged, and so is
   the slot length. The label strip is `d` mm high (today 9 mm) and reads
   `Fix Focus {{d}} mm`. `d` ranges from 3 to 20 mm, default 9. The text size

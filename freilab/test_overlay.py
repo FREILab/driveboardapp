@@ -70,15 +70,15 @@ def test_power_squares_defaults_match_todays_job():
         [(2000, 15)] + [(f, 100) for f in (2000, 1900, 1800, 1700, 1600, 1500)]
 
 
-def test_power_squares_follow_feed_range():
-    job = _render("Test_PowerQuadrate", {"vmin": 1000, "vmax": 1500})
+def test_power_squares_take_one_feed_per_square():
+    job = _render("Test_PowerQuadrate", {"v1": 1500, "v2": 1400, "v3": 1300, "v4": 1200, "v5": 1100, "v6": 1000})
     assert [p["feedrate"] for p in job["passes"][1:]] == [1500, 1400, 1300, 1200, 1100, 1000]
-    svg = template.render(_lib("Test_PowerQuadrate")["template"]["svg"], {"vmin": 1000, "vmax": 1500})
+    svg = template.render(_lib("Test_PowerQuadrate")["template"]["svg"], {"v1": 1500, "v2": 1400, "v3": 1300, "v4": 1200, "v5": 1100, "v6": 1000})
     assert svg.count(">1400<") == 2  # inside and below the square
 
 
-def test_six_lines_follow_feed_and_power():
-    job = _render("Test_6Linien", {"vmin": 1000, "vmax": 1500, "p": 80})
+def test_six_lines_take_one_feed_per_line_and_power():
+    job = _render("Test_6Linien", dict({"v1": 1500, "v2": 1400, "v3": 1300, "v4": 1200, "v5": 1100, "v6": 1000}, p=80))
     assert [(p["feedrate"], p["intensity"]) for p in job["passes"]] == \
         [(f, 80) for f in (1500, 1400, 1300, 1200, 1100, 1000)]
     first = job["defs"][job["items"][job["passes"][0]["items"][0]]["def"]]["data"][0]

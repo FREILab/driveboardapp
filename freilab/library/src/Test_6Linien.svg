@@ -1,15 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="125mm" viewBox="0 0 210 125">
   <!-- Test_6Linien: 6 lines of 5 mm, 3 mm apart, centred on y=0 so (0,0) is the workpiece top edge -->
-  <text x="0" y="1" font-size="2">=param:vmin:1500:100:6000:Vorschub min=</text>
-  <text x="0" y="1" font-size="2">=param:vmax:2000:100:6000:Vorschub max=</text>
+  <text x="0" y="1" font-size="2">=param:v1:2000:100:6000:Vorschub Türkis=</text>
+  <text x="0" y="1" font-size="2">=param:v2:1900:100:6000:Vorschub Rot=</text>
+  <text x="0" y="1" font-size="2">=param:v3:1800:100:6000:Vorschub Grün=</text>
+  <text x="0" y="1" font-size="2">=param:v4:1700:100:6000:Vorschub Blau=</text>
+  <text x="0" y="1" font-size="2">=param:v5:1600:100:6000:Vorschub Gelb=</text>
+  <text x="0" y="1" font-size="2">=param:v6:1500:100:6000:Vorschub Pink=</text>
   <text x="0" y="1" font-size="2">=param:p:100:1:100:Leistung %=</text>
-  <text x="0" y="1" font-size="2">=pass1:{{round(vmax - (vmax - vmin) * 0 / 5)}}:{{round(p)}}:#00ffff=</text>
-  <text x="0" y="1" font-size="2">=pass2:{{round(vmax - (vmax - vmin) * 1 / 5)}}:{{round(p)}}:#e50000=</text>
-  <text x="0" y="1" font-size="2">=pass3:{{round(vmax - (vmax - vmin) * 2 / 5)}}:{{round(p)}}:#00e500=</text>
-  <text x="0" y="1" font-size="2">=pass4:{{round(vmax - (vmax - vmin) * 3 / 5)}}:{{round(p)}}:#0000e3=</text>
-  <text x="0" y="1" font-size="2">=pass5:{{round(vmax - (vmax - vmin) * 4 / 5)}}:{{round(p)}}:#ffff00=</text>
-  <text x="0" y="1" font-size="2">=pass6:{{round(vmax - (vmax - vmin) * 5 / 5)}}:{{round(p)}}:#e21fc3=</text>
+  <text x="0" y="1" font-size="2">=pass1:{{round(v1)}}:{{round(p)}}:#00ffff=</text>
+  <text x="0" y="1" font-size="2">=pass2:{{round(v2)}}:{{round(p)}}:#e50000=</text>
+  <text x="0" y="1" font-size="2">=pass3:{{round(v3)}}:{{round(p)}}:#00e500=</text>
+  <text x="0" y="1" font-size="2">=pass4:{{round(v4)}}:{{round(p)}}:#0000e3=</text>
+  <text x="0" y="1" font-size="2">=pass5:{{round(v5)}}:{{round(p)}}:#ffff00=</text>
+  <text x="0" y="1" font-size="2">=pass6:{{round(v6)}}:{{round(p)}}:#e21fc3=</text>
   <g fill="none" stroke-width="0.1">
     <line x1="0" y1="-2.5" x2="0" y2="2.5" stroke="#00ffff"/>
     <line x1="3" y1="-2.5" x2="3" y2="2.5" stroke="#e50000"/>
@@ -24,8 +28,8 @@
   <text x="25" y="7.5" fill="#000000" font-family="DejaVu Sans" font-size="5.5">Materialtest:</text>
   <text x="25" y="15.4" fill="#000000" font-family="DejaVu Sans" font-size="5.5">Zum testen des Strahlprofils im Material. Schneidet 6 vertikale</text>
   <text x="25" y="23.3" fill="#000000" font-family="DejaVu Sans" font-size="5.5">Linien (Länge: 5 mm, horizontaler Abstand: 3 mm)</text>
-  <text x="25" y="31.2" fill="#000000" font-family="DejaVu Sans" font-size="5.5">Türkis {{round(vmax - (vmax - vmin) * 0 / 5)}}, Rot {{round(vmax - (vmax - vmin) * 1 / 5)}}, Grün {{round(vmax - (vmax - vmin) * 2 / 5)}},</text>
-  <text x="25" y="39.2" fill="#000000" font-family="DejaVu Sans" font-size="5.5">Blau {{round(vmax - (vmax - vmin) * 3 / 5)}}, Gelb {{round(vmax - (vmax - vmin) * 4 / 5)}}, Pink {{round(vmax - (vmax - vmin) * 5 / 5)}} mm/min bei {{round(p)}} %</text>
+  <text x="25" y="31.2" fill="#000000" font-family="DejaVu Sans" font-size="5.5">Türkis {{round(v1)}}, Rot {{round(v2)}}, Grün {{round(v3)}},</text>
+  <text x="25" y="39.2" fill="#000000" font-family="DejaVu Sans" font-size="5.5">Blau {{round(v4)}}, Gelb {{round(v5)}}, Pink {{round(v6)}} mm/min bei {{round(p)}} %</text>
   <text x="25" y="47.1" fill="#000000" font-family="DejaVu Sans" font-size="5.5">(0,0) muss auf der horizontalen Oberkante liegen:</text>
   <g fill="none" stroke="#000000" stroke-width="0.1">
     <path d="M94.17,59.4 L94.17,75.0"/>
