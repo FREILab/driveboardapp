@@ -25,7 +25,8 @@ function template_check_values(params, raw) {
     var text = String(raw[p.name] === undefined ? "" : raw[p.name]).trim();
     var v = text === "" ? NaN : Number(text);
     if (!isFinite(v) || v < p.min || v > p.max) {
-      return { error: p.label + ": use " + p.min + "–" + p.max };
+      // uxmessage inserts its text as html, so the untrusted label is escaped here
+      return { error: issues_escape(p.label) + ": use " + p.min + "–" + p.max };
     }
     values[p.name] = v;
   }

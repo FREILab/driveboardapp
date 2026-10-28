@@ -29,3 +29,9 @@ test("values are numbers within range", () => {
   assert.deepStrictEqual(plain(app.template_check_values(P, { vmin: "99" })), { error: "Vorschub min: use 100–6000" });
   assert.deepStrictEqual(plain(app.template_check_values(P, { vmin: "" })), { error: "Vorschub min: use 100–6000" });
 });
+
+test("the error text escapes the label", () => {
+  const bad = [{ ...P[0], label: '<img src=x onerror="alert(1)">' }];
+  const { error } = app.template_check_values(bad, { vmin: "1" });
+  assert.ok(error && !error.includes("<img"));
+});
