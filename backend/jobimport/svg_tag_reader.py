@@ -24,6 +24,8 @@ class SVGTagReader:
 
         self._handlers = {
             "g": self.g,
+            "a": self.g,  # a link is a group to a cutter
+            "switch": self.g,  # draws one child, see SVGReader.parse_element
             "path": self.path,
             "polygon": self.polygon,
             "polyline": self.polyline,

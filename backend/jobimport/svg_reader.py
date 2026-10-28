@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from PIL import Image
 
 from . import issues
+from .svg_attribute_reader import element_label
 from .svg_tag_reader import SVGTagReader
 from .svg_text_converter import convert_text_to_paths
 from .utilities import (
@@ -27,6 +28,16 @@ log = logging.getLogger("svg_reader")
 # log.setLevel(logging.DEBUG)
 log.setLevel(logging.INFO)
 # log.setLevel(logging.WARN)
+
+# SVG tags without a handler that draw nothing themselves, or only through
+# what references them (tspan and textPath are read with their text)
+NON_RENDERING = {
+    "title", "desc", "metadata", "clipPath", "mask", "marker", "linearGradient",
+    "radialGradient", "meshgradient", "pattern", "filter", "script", "foreignObject",
+    "tspan", "textPath", "animate", "animateMotion", "animateTransform", "set", "mpath",
+    "view", "cursor", "font", "font-face", "glyph", "missing-glyph", "hkern", "vkern",
+    "color-profile", "solidcolor",
+}  # fmt: skip
 
 # SVG parser for the Lasersaur.
 # Converts SVG DOM to a flat collection of paths.
@@ -1055,6 +1066,18 @@ class SVGReader:
     def parse_element(self, child, parentNode, use_depth=0, from_use=False):
         # log.debug("considering tag: " + child.tag)
         if not self._tagReader.has_handler(child):
+            tag = child.tag
+            name = self._tagReader._get_tag(child)
+            # other namespaces are editor metadata (sodipodi, inkscape, ...)
+            is_svg = "}" not in tag or tag.startswith("{http://www.w3.org/2000/svg}")
+            if is_svg and name not in NON_RENDERING:
+                issues.report(
+                    f'"{name}" unsupported',
+                    "NOT CUT",
+                    "dropped",
+                    "Convert to path",
+                    element_label(name, child.get("id")),
+                )
             return
 
         tagName = self._tagReader._get_tag(child)
@@ -1082,6 +1105,8 @@ class SVGReader:
             # (clip-path is not an inherited property, but the clipped
             # region still constrains descendants)
             "clips": list(parentNode.get("clips", [])),
+            # nearest ancestor with a clip-path, for the issue row
+            "clip_owner": parentNode.get("clip_owner"),
         }
 
         # 2. parse child
@@ -1093,6 +1118,11 @@ class SVGReader:
         # own frame (xformToWorld now includes the element's transform)
         own_clip = node.get("clip-path")
         if own_clip:
+            node["clip_owner"] = {
+                "where": node.get("where"),
+                "rect": own_clip in self._clip_rects,
+                "reported": False,
+            }
             if own_clip in self._clip_rects:
                 node["clips"].append(
                     {
@@ -1109,6 +1139,7 @@ class SVGReader:
             path = path_entry["data"]
             hexcolor = path_entry["color"]
             if path:  # skip if empty subpath
+                self._report_clip(node, vector=True)
                 # 3a.) convert to world coordinates and then to mm units
                 for vert in path:
                     # print isinstance(vert[0],float) and isinstance(vert[1],float)
@@ -1135,6 +1166,7 @@ class SVGReader:
             # the normalized top-left + positive extent in mm)
             if node["clips"] and not self._apply_clips(raster, node["clips"]):
                 continue  # fully clipped away -> drop the image
+            self._report_clip(node, vector=False)
 
             self._render_raster(raster)
             self.rasters.append(raster)
@@ -1147,8 +1179,25 @@ class SVGReader:
         # its own children
         if tagName == "use":
             self.parse_use(node, use_depth)
+        elif tagName == "switch":
+            # ponytail: the first child this reader can draw, conditions
+            # (systemLanguage, requiredFeatures, ...) are not evaluated
+            drawn = next((c for c in child if self._tagReader.has_handler(c)), None)
+            if drawn is not None:
+                self.parse_element(drawn, node, use_depth)
         else:
             self.parse_children(child, node, use_depth)
+
+    @staticmethod
+    def _report_clip(node, vector):
+        """Report, once per clipping element, content its clip-path leaves
+        whole: vector paths always, rasters where the clip is not a rect."""
+        owner = node["clip_owner"]
+        if owner and not owner["reported"] and (vector or not owner["rect"]):
+            owner["reported"] = True
+            issues.report(
+                "Clip path ignored", "CUT UNCLIPPED", "changed", "Release the clip", owner["where"]
+            )
 
     def parse_use(self, node, use_depth):
         """Draw the element a 'use' tag references, in the frame of the tag.

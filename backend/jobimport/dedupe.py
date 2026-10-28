@@ -1,5 +1,6 @@
 """Dropping geometry a job draws twice in the same place."""
 
+from . import issues
 from .dba import COORD_DECIMALS
 
 
@@ -44,6 +45,7 @@ def dedupe_job(job, log_dropped=True):
     seen_draws = set()  # (def index, color) already drawn
     dropped_items = set()
     dropped_segments = 0
+    dropped_copies = {"path": 0, "image": 0}  # what the issue rows count
 
     for i, item in enumerate(items):
         idx = item.get("def")
@@ -58,6 +60,7 @@ def dedupe_job(job, log_dropped=True):
         # data is shared, so it is dropped without touching what it points at
         if (idx, color) in seen_draws:
             dropped_items.add(i)
+            dropped_copies["image" if kind == "image" else "path"] += 1
             continue
         seen_draws.add((idx, color))
         if kind == "image":
@@ -67,6 +70,7 @@ def dedupe_job(job, log_dropped=True):
             key = (data, _placement_key(def_.get("pos")), _placement_key(def_.get("size")))
             if key in seen_images:
                 dropped_items.add(i)
+                dropped_copies["image"] += 1
             else:
                 seen_images.add(key)
         else:
@@ -79,6 +83,7 @@ def dedupe_job(job, log_dropped=True):
                 key = _segment_key(segment)
                 if key in seen:
                     dropped_segments += 1
+                    dropped_copies["path"] += 1
                     continue
                 seen.add(key)
                 kept.append(segment)
@@ -90,6 +95,22 @@ def dedupe_job(job, log_dropped=True):
         _drop_items(job, items, dropped_items)
     _drop_unused_defs(job)
 
+    if dropped_copies["path"]:
+        issues.report(
+            "Duplicate paths",
+            "CUT ONCE",
+            "changed",
+            "Use passes instead",
+            count=dropped_copies["path"],
+        )
+    if dropped_copies["image"]:
+        issues.report(
+            "Duplicate images",
+            "ENGRAVED ONCE",
+            "changed",
+            "Use passes instead",
+            count=dropped_copies["image"],
+        )
     if log_dropped and (dropped_items or dropped_segments):
         print(
             f"INFO: dropped {dropped_segments} duplicate path(s) and {len(dropped_items)} duplicate item(s)"

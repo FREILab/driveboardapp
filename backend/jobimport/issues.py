@@ -15,7 +15,7 @@ class Collector:
     def __init__(self):
         self._rows = {}  # (problem, result, kind, fix) -> row, insertion ordered
 
-    def add(self, problem, result, kind, fix, where):
+    def add(self, problem, result, kind, fix, where, count=1):
         key = (problem, result, kind, fix)
         row = self._rows.get(key)
         if row is None:
@@ -25,10 +25,10 @@ class Collector:
                 "result": result,
                 "kind": kind,
                 "fix": fix,
-                "count": 1,
+                "count": count,
             }
         else:
-            row["count"] += 1
+            row["count"] += count
 
     def issues(self):
         return [dict(r) for r in self._rows.values()]
@@ -44,13 +44,13 @@ def collecting():
         _active.reset(token)
 
 
-def report(problem, result, kind, fix, where=None):
+def report(problem, result, kind, fix, where=None, count=1):
     if kind not in KINDS:
         raise ValueError(f"unknown issue kind: {kind!r}")
     log.warning("%s%s", problem, f" ({where})" if where else "")
     collector = _active.get()
     if collector is not None:
-        collector.add(problem, result, kind, fix, where)
+        collector.add(problem, result, kind, fix, where, count)
 
 
 def snapshot():

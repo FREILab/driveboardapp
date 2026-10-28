@@ -265,6 +265,70 @@ def test_svg_text_fill_invalid_colour_row():
     assert ('Invalid colour "#12"', 'text "t"') in [(r["problem"], r["where"]) for r in rows]
 
 
+_BOX = '<rect x="%s" y="10" width="20" height="20" stroke="#000" fill="none"/>'
+
+
+def test_svg_vector_clip_path_row_once_per_element():
+    clip = '<clipPath id="c"><rect width="10" height="10"/></clipPath>'
+    group = '<g id="%s" clip-path="url(#c)">%s</g>'
+    g1 = group % ("g1", _BOX % 10 + _BOX % 40)  # two paths, one row
+    _, rows = _import(_svg(clip + g1 + group % ("g2", _BOX % 70)))
+    (row,) = rows
+    assert (row["problem"], row["result"], row["kind"], row["fix"]) == (
+        "Clip path ignored",
+        "CUT UNCLIPPED",
+        "changed",
+        "Release the clip",
+    )
+    assert (row["where"], row["count"]) == ('g "g1"', 2)
+
+
+def test_svg_children_of_a_are_cut():
+    job, rows = _import(_svg("<a href='https://x'>" + _BOX % 10 + "</a>"))
+    assert rows == []
+    assert [d["kind"] for d in job["defs"]] == ["path"]
+
+
+def test_svg_switch_cuts_its_first_renderable_child():
+    body = "<switch><foreignObject/><g>" + _BOX % 10 + "</g><g>" + _BOX % 50 + "</g></switch>"
+    job, rows = _import(_svg(body))
+    assert rows == []
+    ((first, *_),) = job["defs"][0]["data"]
+    assert first[0] == 10
+
+
+def test_svg_unknown_renderable_tag_row():
+    _, rows = _import(_svg('<hatch id="h"/>' + _BOX % 10))
+    (row,) = rows
+    assert (row["problem"], row["result"], row["kind"], row["where"]) == (
+        '"hatch" unsupported',
+        "NOT CUT",
+        "dropped",
+        'hatch "h"',
+    )
+
+
+def test_svg_non_rendering_and_editor_tags_are_silent():
+    body = (
+        "<title>t</title><desc>d</desc><metadata/><linearGradient id='l'/>"
+        '<sodipodi:namedview xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/'
+        'sodipodi-0.dtd"/>' + _BOX % 10
+    )
+    assert _import(_svg(body))[1] == []
+
+
+def test_svg_stacked_duplicate_paths_row():
+    job, rows = _import(_svg(_BOX % 10 + _BOX % 10 + _BOX % 10))
+    (row,) = rows
+    assert (row["problem"], row["result"], row["kind"], row["fix"], row["count"]) == (
+        "Duplicate paths",
+        "CUT ONCE",
+        "changed",
+        "Use passes instead",
+        2,
+    )
+
+
 # ---- DXF and G-code ----
 
 
@@ -332,3 +396,9 @@ def test_gcode_arc_row():
         "changed",
         "Export arcs as lines",
     )
+
+
+def test_svg_fill_in_stroke_colour_is_one_path_not_a_duplicate():
+    job, rows = _import(_svg('<rect width="20" height="20" stroke="#000" fill="#000"/>'))
+    assert rows == []
+    assert len(job["defs"][0]["data"]) == 1

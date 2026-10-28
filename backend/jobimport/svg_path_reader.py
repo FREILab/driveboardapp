@@ -35,6 +35,12 @@ class SVGPathReader:
         # http://www.w3.org/TR/SVG11/paths.html#PathData
         # Store the color to use for paths added during this call
         self._current_color = color if color else node.get("stroke")
+        # a fill in its stroke's colour traces the same outline: one cut, and
+        # not a stacked copy for dedupe to report
+        drawn = node.setdefault("drawn", set())
+        if (id(d), self._current_color) in drawn:
+            return
+        drawn.add((id(d), self._current_color))
         self._current_node = node
 
         def _matrixExtractScale(mat):
