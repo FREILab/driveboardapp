@@ -297,6 +297,52 @@ def test_svg_switch_cuts_its_first_renderable_child():
     assert first[0] == 10
 
 
+def test_svg_switch_skips_non_rendering_children():
+    body = "<switch><defs/><style/><g>" + _BOX % 10 + "</g></switch>"
+    job, rows = _import(_svg(body))
+    assert rows == []
+    assert [d["kind"] for d in job["defs"]] == ["path"]
+
+
+def test_svg_switch_unhandled_renderable_child_gets_its_row():
+    _, rows = _import(_svg('<switch><hatch id="h"/>' + "<g>" + _BOX % 10 + "</g></switch>"))
+    (row,) = rows
+    assert (row["problem"], row["result"], row["where"]) == (
+        '"hatch" unsupported',
+        "NOT CUT",
+        'hatch "h"',
+    )
+
+
+def test_svg_switch_of_only_non_rendering_children_is_silent():
+    _, rows = _import(_svg("<switch><defs/><title>t</title></switch>" + _BOX % 10))
+    assert rows == []
+
+
+def test_svg_raster_under_supported_clip_in_unsupported_clip_gets_a_row():
+    import base64
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("L", (4, 4), 0).save(buf, "PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    defs = (
+        '<clipPath id="ok"><rect width="50" height="50"/></clipPath>'
+        '<clipPath id="bad"><circle r="40" cx="50" cy="50"/></clipPath>'
+    )
+    img = f'<image x="0" y="0" width="30" height="30" href="{uri}"/>'
+    body = (
+        defs
+        + f'<g id="outer" clip-path="url(#bad)"><g id="inner" clip-path="url(#ok)">{img}</g></g>'
+    )
+    _, rows = _import(_svg(body))
+    (row,) = rows
+    assert (row["problem"], row["result"]) == ("Clip path ignored", "CUT UNCLIPPED")
+    assert row["where"] == 'g "inner"'
+
+
 def test_svg_unknown_renderable_tag_row():
     _, rows = _import(_svg('<hatch id="h"/>' + _BOX % 10))
     (row,) = rows

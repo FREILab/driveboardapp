@@ -954,6 +954,16 @@ def test_convert_text_stroke_only_is_cut_in_its_stroke_colour(font):
     assert c.issues() == []
 
 
+def test_convert_text_tspan_stroke_does_not_override_inherited_fill(font):
+    out = convert_text_to_paths(
+        _text_doc(
+            '<text x="0" y="10" fill="#0000ff">A<tspan stroke="#ffff00">D</tspan></text>'
+            '<text x="0" y="30">B<tspan stroke="#ffff00">E</tspan></text>'
+        )
+    )
+    assert [p.get("fill") for p in _paths(out)] == ["#0000ff", "#000000", "#ffff00"]
+
+
 def test_convert_text_tspan_uses_its_own_position(font):
     out = convert_text_to_paths(
         _text_doc('<text x="10" y="50" font-size="20"><tspan x="60" y="70">B</tspan></text>')

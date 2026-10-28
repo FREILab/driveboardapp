@@ -1063,14 +1063,25 @@ class SVGReader:
         for child in domNode:
             self.parse_element(child, parentNode, use_depth)
 
+    def _renders(self, elem):
+        """Whether an element draws: a handled container or shape, or an SVG
+        tag without a handler that is not on the non-rendering list (that one
+        gets its 'unsupported' row from parse_element)."""
+        name = self._tagReader._get_tag(elem)
+        if self._tagReader.has_handler(elem):
+            return name not in ("defs", "symbol", "style")
+        # other namespaces are editor metadata (sodipodi, inkscape, ...)
+        return self._is_svg_tag(elem) and name not in NON_RENDERING
+
+    @staticmethod
+    def _is_svg_tag(elem):
+        return "}" not in elem.tag or elem.tag.startswith("{http://www.w3.org/2000/svg}")
+
     def parse_element(self, child, parentNode, use_depth=0, from_use=False):
         # log.debug("considering tag: " + child.tag)
         if not self._tagReader.has_handler(child):
-            tag = child.tag
             name = self._tagReader._get_tag(child)
-            # other namespaces are editor metadata (sodipodi, inkscape, ...)
-            is_svg = "}" not in tag or tag.startswith("{http://www.w3.org/2000/svg}")
-            if is_svg and name not in NON_RENDERING:
+            if self._is_svg_tag(child) and name not in NON_RENDERING:
                 issues.report(
                     f'"{name}" unsupported',
                     "NOT CUT",
@@ -1120,7 +1131,9 @@ class SVGReader:
         if own_clip:
             node["clip_owner"] = {
                 "where": node.get("where"),
-                "rect": own_clip in self._clip_rects,
+                # rasters are only left whole where no clip in the chain is applied
+                "rect": own_clip in self._clip_rects
+                and (parentNode.get("clip_owner") or {"rect": True})["rect"],
                 "reported": False,
             }
             if own_clip in self._clip_rects:
@@ -1180,9 +1193,9 @@ class SVGReader:
         if tagName == "use":
             self.parse_use(node, use_depth)
         elif tagName == "switch":
-            # ponytail: the first child this reader can draw, conditions
+            # ponytail: the first child that renders, conditions
             # (systemLanguage, requiredFeatures, ...) are not evaluated
-            drawn = next((c for c in child if self._tagReader.has_handler(c)), None)
+            drawn = next((c for c in child if self._renders(c)), None)
             if drawn is not None:
                 self.parse_element(drawn, node, use_depth)
         else:

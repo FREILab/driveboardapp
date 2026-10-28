@@ -691,7 +691,7 @@ def convert_text_to_paths(svg_string):
                             tspan_font_size = font_size
 
                         # Get tspan-specific color (falls back to parent's color)
-                        tspan_color = _text_color(child, text_where) or default_color
+                        tspan_color = _text_color(child, text_where, text_elem) or default_color
 
                         # Get tspan text content
                         tspan_text = child.text or ""
@@ -808,11 +808,16 @@ def normalize_color(color, where=None):
     return color if color and color.startswith("#") else "#000000"
 
 
-def _text_color(elem, where):
+def _text_color(elem, where, parent=None):
     """The colour an element's text is cut in: its fill, or its stroke when it
-    has no fill (stroke-only text); None when it sets neither."""
+    has no fill (stroke-only text); None when it sets neither. A tspan that
+    sets no fill of its own (`parent` is its text) keeps the fill it inherits."""
     fill = get_style_attr(elem, "fill")
     stroke = get_style_attr(elem, "stroke")
+    if fill is None and parent is not None:
+        parent_fill = get_style_attr(parent, "fill")
+        if parent_fill and parent_fill.strip().lower() != "none":
+            stroke = None
     if (not fill or fill.strip().lower() == "none") and stroke and stroke.strip().lower() != "none":
         return normalize_color(stroke, where)
     return normalize_color(fill, where) if fill else None
