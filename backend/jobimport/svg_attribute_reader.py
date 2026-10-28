@@ -17,6 +17,24 @@ def element_label(tag, node_id=None):
     return f'{tag} "{node_id}"' if node_id else tag
 
 
+def report_alpha(val, where=None):
+    """Report a colour whose alpha is below 1, which cutting ignores."""
+    val = val.strip().lower()
+    alpha = None
+    if val.startswith("rgba"):
+        chans = re.findall(rf"({NUMBER})(%?)", val[5:-1])
+        if len(chans) == 4:
+            num, pct = chans[3]
+            alpha = float(num) / (100 if pct else 1)
+    elif val.startswith("#") and len(val) in (5, 9):
+        digits = 1 if len(val) == 5 else 2
+        alpha = int(val[-digits:], 16) / (16**digits - 1)
+    if alpha is not None and alpha < 1:
+        issues.report(
+            "Colour alpha ignored", "CUT AT FULL OPACITY", "changed", "Use opacity", where
+        )
+
+
 def _hex(rgb):
     return "#{:02x}{:02x}{:02x}".format(*map(int, rgb[:3]))
 
@@ -52,7 +70,6 @@ def parse_color(val):
     elif val.startswith("rgba"):
         floats = _rgb_channels(val[5:-1])
         if len(floats) == 4:
-            # the alpha is ignored, which cutting has no use for anyway
             return _hex(floats)
     elif val.startswith("rgb"):
         floats = _rgb_channels(val[4:-1])
@@ -194,6 +211,8 @@ class SVGAttributeReader:
                 "Set a valid colour",
                 where,
             )
+        else:
+            report_alpha(value, where)
         if col != "inherit":
             node[attr] = col
 

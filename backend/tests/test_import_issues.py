@@ -216,3 +216,49 @@ def test_svg_use_target_missing_row():
     assert row["problem"] == '"use" target missing'
     assert row["where"] == 'use "u"'
     assert row["kind"] == "dropped"
+
+
+def test_svg_rgba_alpha_row():
+    _, rows = _import(
+        _svg('<rect id="r" width="5" height="5" stroke="rgba(1,2,3,0)" fill="none"/>')
+    )
+    (row,) = rows
+    assert (row["problem"], row["result"], row["kind"], row["fix"], row["where"]) == (
+        "Colour alpha ignored",
+        "CUT AT FULL OPACITY",
+        "changed",
+        "Use opacity",
+        'rect "r"',
+    )
+
+
+@pytest.mark.parametrize("val", ["#f008", "#11223380", "rgba(1,2,3,50%)"])
+def test_svg_alpha_forms_report(val):
+    _, rows = _import(_svg(f'<rect width="5" height="5" stroke="{val}" fill="none"/>'))
+    assert [r["problem"] for r in rows] == ["Colour alpha ignored"]
+
+
+@pytest.mark.parametrize("val", ["#f00f", "#112233ff", "rgba(1,2,3,1)", "rgba(1,2,3,100%)"])
+def test_svg_opaque_alpha_is_silent(val):
+    _, rows = _import(_svg(f'<rect width="5" height="5" stroke="{val}" fill="none"/>'))
+    assert rows == []
+
+
+def test_svg_text_invalid_and_alpha_colour_rows():
+    from jobimport.svg_text_converter import normalize_color
+
+    with issues.collecting() as c:
+        assert normalize_color("#12", 'text "t"') == "#000000"
+        assert normalize_color("rgba(1,2,3,0)", 'text "t"') == "#010203"
+        assert normalize_color("none", 'text "t"') == "#000000"
+        assert normalize_color("currentColor", 'text "t"') == "#000000"
+    assert [(r["problem"], r["where"]) for r in c.issues()] == [
+        ('Invalid colour "#12"', 'text "t"'),
+        ("Colour alpha ignored", 'text "t"'),
+    ]
+
+
+def test_svg_text_fill_invalid_colour_row():
+    doc = _svg('<text id="t" x="0" y="10" fill="#12">Hi</text>')
+    _, rows = _import(doc)
+    assert ('Invalid colour "#12"', 'text "t"') in [(r["problem"], r["where"]) for r in rows]

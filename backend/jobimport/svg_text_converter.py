@@ -15,7 +15,7 @@ import re
 import xml.etree.ElementTree as ET
 
 from . import issues
-from .svg_attribute_reader import element_label, parse_color
+from .svg_attribute_reader import element_label, parse_color, report_alpha
 
 log = logging.getLogger("svg_text_converter")
 
@@ -664,7 +664,7 @@ def convert_text_to_paths(svg_string):
 
                 # Default color from text element
                 default_color = get_style_attr(text_elem, "fill", "#000000")
-                default_color = normalize_color(default_color)
+                default_color = normalize_color(default_color, text_where)
 
                 # Process direct text content of the text element
                 if text_elem.text and text_elem.text.strip():
@@ -694,7 +694,7 @@ def convert_text_to_paths(svg_string):
                         # Get tspan-specific color (falls back to parent's color)
                         tspan_color = get_style_attr(child, "fill")
                         if tspan_color:
-                            tspan_color = normalize_color(tspan_color)
+                            tspan_color = normalize_color(tspan_color, text_where)
                         else:
                             tspan_color = default_color
 
@@ -792,17 +792,24 @@ def get_text_content(elem):
     return text
 
 
-def normalize_color(color):
+def normalize_color(color, where=None):
     """Convert a color value to a hex color code.
 
     Returns:
-        Hex color code (e.g., '#ff0000') or '#000000' if conversion fails
+        Hex color code (e.g., '#ff0000') or '#000000' if conversion fails;
+        a color that is invalid or unsupported is reported against `where`.
     """
-    color = (color or "").strip().lower()
+    raw = (color or "").strip().lower()
     try:
-        color = parse_color(color) if color else None
+        color = parse_color(raw) if raw else None
     except ValueError:
         color = None
+    if raw and (color is None or (color == "inherit" and raw not in ("inherit", "currentcolor"))):
+        issues.report(
+            f'Invalid colour "{raw}"', "DEFAULT COLOUR", "changed", "Set a valid colour", where
+        )
+    elif raw:
+        report_alpha(raw, where)
     return color if color and color.startswith("#") else "#000000"
 
 
