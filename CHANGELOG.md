@@ -10,6 +10,7 @@
 - New `jog_unhomed_feedrate` option (2000 mm/min): until the machine is homed, jogs run relative at this slower rate instead of being clamped to a work area edge the app cannot know
 - Unexplained stops are now recorded with the last bytes sent and received in `incidents.jsonl` in the config directory (newest 50), downloadable from the status menu, and summarised in the tooltip of the red stop label
 - Library jobs can now take parameters: a .dba with a `template` asks for its values when opened from the library, checks each against its range, and generates the job with labels, cut settings and dimensions to match. Templates are SVGs with `=param:...=` tags and `{{expression}}` placeholders, see `docs/dba.md`. Expressions are limited to numbers, parameter names, arithmetic and `round`, `min`, `max`, `abs`
+- FREILab library: `Test_PowerQuadrate` and `Test_6Linien` ask for the feed of each square or line (`Test_6Linien` also for the power), `Parts_Fokus9mm` is now `Parts_FixFocus` with the thickness as a parameter (3-20 mm), and `Parts_Fokushilfe_3-30mm` is renamed to `Parts_FocusStairs_3-30mm`
 
 ### Bug Fixes
 - SVG import now reports or handles text colours and colour alpha, stroke-only text, `<switch>` (first renderable child), `<a>` links, nested clip paths on raster images, and unsupported elements, instead of silently dropping or changing them
