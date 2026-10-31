@@ -1,5 +1,6 @@
 {
     "power_speed_limit": 0.5,
-    "homing_reset_offset": true,
-    "raster_mode": "Forward"
+    "raster_mode": "Forward",
+    "pxsize": 0.4,
+    "raster_leadin": 20
 }

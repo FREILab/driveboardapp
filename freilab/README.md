@@ -33,8 +33,12 @@ Starten statt `backend/app.py`:
 Werte aus `config.example.json` in `~/.driveboardapp/config.json` eintragen (oder im UI unter Config):
 
 - `power_speed_limit: 0.5`: Run wird abgelehnt, wenn bei einem Pass Intensität (%) / Vorschub (mm/min) ≥ 0,5 ist. Die Prüfung läuft vor der Abrechnung.
-- `homing_reset_offset: true`: Offset wird beim Homing sofort zurückgesetzt.
 - `raster_mode: "Forward"` (Upstream-Default ist `Bidirectional`).
+- `pxsize: 0.4` (Upstream-Default ist `0.2`) und `raster_leadin: 20` (Upstream-Default ist `10`): die Werte unserer Maschine.
+
+`homing_reset_offset` bleibt auf dem Default `false`. Mit `true` sendet der Home-Knopf erst den Offset-Reset und gleich danach das Homing mit seinem Resume. Das Resume kann zwischen zwei Teilen eines Parameters ankommen, die Firmware verwirft dann dessen Daten und stoppt mit `invalid data`. Die Firmware löscht den Offset beim Homing selbst, der Reset ist nicht nötig.
+
+Nicht in der `config.json` einstellbar, weil die App sie von dort nicht liest: `network_port`, `serial_port`, `firmware`, `users` und `kerf`. Die App hört dann auf Port 4444, sucht den seriellen Port selbst und flasht das Profil, das zur Hardware-Erkennung passt (siehe Firmware).
 
 ## Firmware
 
