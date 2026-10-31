@@ -170,7 +170,10 @@ conf["confdir"] = directory
 ### auto-check hardware
 #
 conf["hardware"] = "standard"
-if sys.platform.startswith("linux"):
+# DRIVEBOARD_HARDWARE=standard|raspberrypi|beaglebone skips auto-detection (e.g. a Pi without RPi.GPIO)
+if os.environ.get("DRIVEBOARD_HARDWARE") in ("standard", "raspberrypi", "beaglebone"):
+    conf["hardware"] = os.environ["DRIVEBOARD_HARDWARE"]
+elif sys.platform.startswith("linux"):
     try:
         if importlib.util.find_spec("RPi.GPIO") is not None:
             conf["hardware"] = "raspberrypi"
