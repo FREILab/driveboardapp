@@ -17,12 +17,12 @@ Starten statt `backend/app.py`:
 
 | Datei | Zweck |
 |---|---|
-| `run.py` | Startet die App und hängt `web/` und `library/` ein (Dateien in `web/` gewinnen, `app.html` bekommt Skript, CSS und Dialoge; die Library-Liste enthält auch `freilab/library/`) |
+| `run.py` | Startet die App und hängt `web/` und `library/` ein (Dateien in `web/` gewinnen, `app.html` bekommt Skript, CSS und Dialoge; die Library-Liste zeigt nur `freilab/library/`) |
 | `web/freilab.js` | Material-/Billing-Dialoge, Kontostand. Hängt sich vor den Run-Button: erst Prüfungen, Material, Abrechnung, dann startet Upstreams eigener Handler den Job |
 | `web/freilab_modals.html` | Die Dialoge |
 | `web/freilab.css` | Styles dazu |
 | `web/img/material/` | Material-Icons |
-| `library/` | Unsere Jobs, zusätzlich zu `library/` von Upstream. `Test_PowerQuadrate` (nur Vorschub), `Test_6Linien` (Vorschub und Leistung) und `Parts_FixFocus` (Dicke) sind Vorlagen, deren Werte beim Laden einstellbar sind; ihre SVG-Quellen liegen in `library/src/`. `Parts_FocusStairs_3-30mm` ist ein fester Job |
+| `library/` | Unsere Jobs. Nur diese bietet die App an, die Demo-Jobs aus `library/` von Upstream nicht. `Test_PowerQuadrate` (nur Vorschub), `Test_6Linien` (Vorschub und Leistung) und `Parts_FixFocus` (Dicke) sind Vorlagen, deren Werte beim Laden einstellbar sind; ihre SVG-Quellen liegen in `library/src/`. `Parts_FocusStairs_3-30mm` ist ein fester Job |
 | `config.example.json` | Unsere Maschinen-Einstellungen |
 | `firmware-homing.patch` | FREILab-Homing-Rückfahrstrecken für `firmware/src/stepper.c`, nur beim Firmware-Bau anwenden (siehe Firmware) |
 | `firmware.driveboardusb.hex` | Fertige FREILab-Firmware, so wie sie auf der Maschine läuft: Profil **`driveboardusb`** plus `firmware-homing.patch` (siehe Firmware) |

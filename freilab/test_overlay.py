@@ -43,13 +43,16 @@ def test_overlay_files_win_and_upstream_files_still_served(client):
     assert client.get("/css/style.css").status_int == 200  # upstream
 
 
-def test_library_lists_and_loads_our_jobs_next_to_upstream_ones(client):
+def test_library_offers_only_our_jobs(client):
     files = json.loads(client.get("/listing_library").text)["files"]
-    assert "Test_6Linien" in files and "lines" in files  # ours and upstream's
+    ours = sorted(n[:-4] for n in os.listdir(os.path.join(HERE, "library")) if n.endswith(".dba"))
+    assert files == ours and "Test_6Linien" in files
+    assert "lines" not in files  # upstream's demo jobs in library/ are not offered
     assert client.get("/get_library/Test_6Linien").status_int == 200
-    assert client.get("/get_library/lines").status_int == 200
     assert client.get("/load_library/Test_6Linien").status_int == 200
+    assert client.get("/get_library/lines", expect_errors=True).status_int == 400
     assert client.get("/get_library/gibtsnicht", expect_errors=True).status_int == 400
+    assert client.get("/get_library/..", expect_errors=True).status_int == 400
 
 
 def _lib(name):

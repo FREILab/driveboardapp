@@ -4,7 +4,7 @@
 Nothing upstream is modified: this wraps web._frontend_file, which serves every UI file, so that
   - files in freilab/web/ win over files of the same name in frontend/ (freilab.js, img/material/...)
   - app.html gets freilab.css/freilab.js and the dialogs of freilab_modals.html injected
-  - the job library also lists and loads the jobs in freilab/library/
+  - the job library lists and loads only the jobs in freilab/library/, not upstream's demo jobs in library/
 """
 
 import glob
@@ -35,29 +35,26 @@ def install(web):
 
     web._frontend_file = frontend_file
 
-    # Library: upstream's library/ first, then ours.
+    # Library: only ours. Upstream's library/ holds demo jobs the machine does not need.
     get_sorted, get_path = web._get_sorted, web._get_path
 
     def library_sorted(globpattern, library=False, stripext=False):
-        files = get_sorted(globpattern, library, stripext)
-        if library:
-            with web._queue_lock:
-                mine = glob.glob(os.path.join(LIBRARY, globpattern))
-            names = {os.path.basename(p) for p in mine if os.path.isfile(p)}
-            names = {n[:-4] if stripext and n.endswith(".dba") else n for n in names}
-            files = sorted(set(files) | names)
-        return files
+        if not library:
+            return get_sorted(globpattern, library, stripext)
+        with web._queue_lock:
+            mine = glob.glob(os.path.join(LIBRARY, globpattern))
+        names = {os.path.basename(p) for p in mine if os.path.isfile(p)}
+        return sorted(n[:-4] if stripext and n.endswith(".dba") else n for n in names)
 
     def library_path(jobname, library=False):
-        try:
+        if not library:
             return get_path(jobname, library)
-        except bottle.HTTPResponse:
-            if not library:
-                raise
-            mine = os.path.join(LIBRARY, jobname.strip("/\\"))
-            if os.path.exists(mine + ".dba"):
-                return mine + ".dba"
-            raise
+        web._job_base(jobname, library)  # refuses names that are not plain file names
+        mine = os.path.join(LIBRARY, jobname)
+        for ext in (".dba", ".dba.starred"):
+            if os.path.exists(mine + ext):
+                return mine + ext
+        raise bottle.HTTPResponse("No such file.", 400)
 
     def library_get(jobname, library=False):
         with web._queue_lock, open(library_path(jobname, library)) as fp:
