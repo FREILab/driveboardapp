@@ -575,6 +575,10 @@ var status_handlers = {
       jobview_feedLayer.position = new paper.Point(x, y);
       // redraw
       paper.view.draw();
+      // The head marker is drawn at pos + offset. pos can change a poll before
+      // offset does, and the pos handler only runs when pos changes, so place
+      // the marker again with the offset that has arrived.
+      status_handlers.pos(status);
     }
   },
   feedrate: function (status) {},
