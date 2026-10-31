@@ -373,7 +373,9 @@ function controls_ready() {
       url: "/homing",
       success: function (data) {
         $().uxmessage("notice", "Homing ...");
-        $("#offset_reset_btn").trigger("click");
+        // No offset reset here: homing is under way, so the backend refuses it
+        // as "Machine not ready" (shown twice), and the firmware clears the
+        // offset itself on CMD_HOMING.
       },
     });
     return false;

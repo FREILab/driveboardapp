@@ -167,6 +167,12 @@ function status_set_waiting(waiting) {
     $("#run_btn span.ladda-label").html("Waiting");
   } else {
     $("#run_btn span.ladda-label").html("Run");
+    // A job that is over before a poll ever saw the machine busy leaves
+    // status_cache.ready at true, so no change is seen and the ready handler
+    // never stops the run button or re-enables the controls. Forget the cached
+    // value so the next poll runs the handler. undefined, not null: null is not
+    // seen as a change by status_check_new.
+    status_cache.ready = undefined;
   }
   status_set_refresh(); // waiting polls at the busy rate, to catch the start
 }
@@ -575,6 +581,10 @@ var status_handlers = {
       jobview_feedLayer.position = new paper.Point(x, y);
       // redraw
       paper.view.draw();
+      // The head marker is drawn at pos + offset. pos can change a poll before
+      // offset does, and the pos handler only runs when pos changes, so place
+      // the marker again with the offset that has arrived.
+      status_handlers.pos(status);
     }
   },
   feedrate: function (status) {},
